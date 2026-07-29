@@ -1342,9 +1342,11 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 	if modelID == "" {
 		modelID = parsed.Model
 	}
+	modelID, maxMode := normalizeCursorModel(modelID)
 
 	params := &cursorproto.RunRequestParams{
 		ModelId:        modelID,
+		MaxMode:        maxMode,
 		SystemPrompt:   parsed.SystemPrompt,
 		UserText:       parsed.UserText,
 		MessageId:      uuid.New().String(),
@@ -1365,6 +1367,29 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 	}
 
 	return params
+}
+
+// normalizeCursorModel returns the upstream model id and whether Max Mode is required.
+// Default max_mode is off so Normal-mode models can use the slow pool after fast
+// quota exhaustion. cursor-grok-* currently requires Max Mode (ERROR_MAX_MODE_REQUIRED
+// when false). Clients may force Max Mode with a "-maxmode" suffix (stripped upstream).
+func normalizeCursorModel(modelID string) (string, bool) {
+	id := strings.TrimSpace(modelID)
+	if id == "" {
+		return id, false
+	}
+	lower := strings.ToLower(id)
+	maxMode := false
+	if strings.HasSuffix(lower, "-maxmode") {
+		id = strings.TrimSpace(id[:len(id)-len("-maxmode")])
+		lower = strings.ToLower(id)
+		maxMode = true
+	}
+	// Cursor-hosted Grok models currently require Max Mode on the Agent API.
+	if strings.HasPrefix(lower, "cursor-grok-") || strings.HasPrefix(lower, "grok-") {
+		maxMode = true
+	}
+	return id, maxMode
 }
 
 // --- Helpers ---

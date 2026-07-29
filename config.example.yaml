@@ -416,6 +416,17 @@ nonstream-keepalive-interval: 0
 #   kilo:
 #     - "kilo-claude-opus-4-6"  # exclude specific models (exact match)
 #     - "*:free"                # wildcard matching suffix (e.g. all free models)
+#   cursor:
+#     # Max-tier models often fail with ERROR_SLOW_POOL once included fast quota is exhausted.
+#     - "*-max"
+#     - "*-max-fast"
+#     - "*-max-thinking"
+#     - "*-max-thinking-fast"
+#     - "*-thinking-max"
+#     - "*-thinking-max-fast"
+#     # Cursor-hosted Grok requires Max Mode; without usage-based pricing it returns
+#     # ERROR_USAGE_PRICING_REQUIRED_CHANGEABLE after free fast quota is gone.
+#     - "cursor-grok-*"
 
 # OpenAI compatibility providers
 # openai-compatibility:

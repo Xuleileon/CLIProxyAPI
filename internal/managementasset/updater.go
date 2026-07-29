@@ -256,6 +256,8 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 		if remoteHash != "" && localHash != "" && strings.EqualFold(remoteHash, localHash) {
 			log.Debug("management asset is already up to date")
+			// Upstream panel may still lack Plus-only Cursor OAuth UI.
+			ensureCursorOAuthOnDisk(localPath)
 			return nil, nil
 		}
 
@@ -277,6 +279,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			return nil, nil
 		}
 
+		data = patchManagementHTMLForCursorOAuth(data)
 		if err = atomicWriteFile(localPath, data); err != nil {
 			log.WithError(err).Warn("failed to update management asset on disk")
 			return nil, nil
@@ -286,8 +289,11 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		return nil, nil
 	})
 
-	_, err := os.Stat(localPath)
-	return err == nil
+	if _, err := os.Stat(localPath); err == nil {
+		ensureCursorOAuthOnDisk(localPath)
+		return true
+	}
+	return false
 }
 
 func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, localPath string) bool {
@@ -300,6 +306,7 @@ func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, loca
 	log.Warnf("management asset downloaded from fallback URL without digest verification (hash=%s) — "+
 		"enable verified GitHub updates by keeping disable-auto-update-panel set to false", downloadedHash)
 
+	data = patchManagementHTMLForCursorOAuth(data)
 	if err = atomicWriteFile(localPath, data); err != nil {
 		log.WithError(err).Warn("failed to persist fallback management control panel page")
 		return false

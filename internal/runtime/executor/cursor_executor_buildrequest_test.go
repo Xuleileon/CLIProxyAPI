@@ -8,6 +8,7 @@ func TestBuildRunRequestParams_ModelOverride(t *testing.T) {
 		parsedModel string
 		override    string
 		wantModelID string
+		wantMaxMode bool
 	}{
 		{
 			name:        "alias override preserves client model",
@@ -31,6 +32,18 @@ func TestBuildRunRequestParams_ModelOverride(t *testing.T) {
 			override:    "composer-2.5",
 			wantModelID: "composer-2.5",
 		},
+		{
+			name:        "maxmode suffix stripped and enables max mode",
+			override:    "composer-2.5-maxmode",
+			wantModelID: "composer-2.5",
+			wantMaxMode: true,
+		},
+		{
+			name:        "cursor grok requires max mode",
+			override:    "cursor-grok-4.5-medium",
+			wantModelID: "cursor-grok-4.5-medium",
+			wantMaxMode: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -40,6 +53,9 @@ func TestBuildRunRequestParams_ModelOverride(t *testing.T) {
 
 			if params.ModelId != tc.wantModelID {
 				t.Errorf("ModelId = %q, want %q", params.ModelId, tc.wantModelID)
+			}
+			if params.MaxMode != tc.wantMaxMode {
+				t.Errorf("MaxMode = %v, want %v", params.MaxMode, tc.wantMaxMode)
 			}
 			if params.ConversationId != "conv-123" {
 				t.Errorf("ConversationId = %q, want %q", params.ConversationId, "conv-123")

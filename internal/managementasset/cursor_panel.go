@@ -1,0 +1,92 @@
+package managementasset
+
+import (
+	"os"
+	"strings"
+
+	log "github.com/sirupsen/logrus"
+)
+
+// patchManagementHTMLForCursorOAuth injects the Cursor OAuth login card into the
+// management control panel when the upstream panel build omits it.
+// Backend already exposes GET /v0/management/cursor-auth-url; the stock panel
+// only lists kimi/codex/anthropic/antigravity/qoder/xai.
+func patchManagementHTMLForCursorOAuth(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	s := string(data)
+	if strings.Contains(s, "id:`cursor`") || strings.Contains(s, `id:"cursor"`) {
+		return data
+	}
+
+	// Provider card list (Vk)
+	oldVk := "{kind:`builtin`,id:`xai`,titleKey:`auth_login.xai_oauth_title`,icon:{light:$b,dark:ex}}"
+	newVk := oldVk + ",{kind:`builtin`,id:`cursor`,titleKey:`auth_login.cursor_oauth_title`,icon:{light:$b,dark:ex}}"
+	if !strings.Contains(s, oldVk) {
+		log.Debug("management panel cursor OAuth patch skipped: Vk xai entry not found")
+		return data
+	}
+	s = strings.Replace(s, oldVk, newVk, 1)
+
+	// WebUI OAuth provider set used by startAuth()
+	oldBv := "bv=new Set([`codex`,`anthropic`,`antigravity`,`qoder`,`xai`])"
+	newBv := "bv=new Set([`codex`,`anthropic`,`antigravity`,`qoder`,`xai`,`cursor`])"
+	if strings.Contains(s, oldBv) {
+		s = strings.Replace(s, oldBv, newBv, 1)
+	}
+
+	// Callback-style OAuth provider set
+	oldUk := "Uk=new Set([`codex`,`anthropic`,`antigravity`,`xai`])"
+	newUk := "Uk=new Set([`codex`,`anthropic`,`antigravity`,`xai`,`cursor`])"
+	if strings.Contains(s, oldUk) {
+		s = strings.Replace(s, oldUk, newUk, 1)
+	}
+
+	// i18n strings (zh-CN / zh-TW / en / ru) — insert before plugin_oauth_title
+	localePatches := [][2]string{
+		{
+			"xai_oauth_polling_error:`检查认证状态失败:`,plugin_oauth_title:",
+			"xai_oauth_polling_error:`检查认证状态失败:`,cursor_oauth_title:`Cursor OAuth`,cursor_oauth_button:`开始 Cursor 登录`,cursor_oauth_hint:`通过 OAuth 流程登录 Cursor 服务，自动获取并保存认证文件。登录后以 IDE 模式请求上游。`,cursor_oauth_url_label:`授权链接:`,cursor_open_link:`打开链接`,cursor_copy_link:`复制链接`,cursor_oauth_status_waiting:`等待认证中...`,cursor_oauth_status_success:`认证成功！`,cursor_oauth_status_error:`认证失败:`,cursor_oauth_start_error:`启动 Cursor OAuth 失败:`,cursor_oauth_polling_error:`检查认证状态失败:`,plugin_oauth_title:",
+		},
+		{
+			"xai_oauth_polling_error:`檢查驗證狀態失敗:`,plugin_oauth_title:",
+			"xai_oauth_polling_error:`檢查驗證狀態失敗:`,cursor_oauth_title:`Cursor OAuth`,cursor_oauth_button:`開始 Cursor 登入`,cursor_oauth_hint:`透過 OAuth 流程登入 Cursor 服務，自動取得並儲存驗證檔案。登入後以 IDE 模式請求上游。`,cursor_oauth_url_label:`授權連結:`,cursor_open_link:`開啟連結`,cursor_copy_link:`複製連結`,cursor_oauth_status_waiting:`等待驗證中...`,cursor_oauth_status_success:`驗證成功！`,cursor_oauth_status_error:`驗證失敗:`,cursor_oauth_start_error:`啟動 Cursor OAuth 失敗:`,cursor_oauth_polling_error:`檢查驗證狀態失敗:`,plugin_oauth_title:",
+		},
+		{
+			"xai_oauth_polling_error:`Failed to check authentication status:`,plugin_oauth_title:",
+			"xai_oauth_polling_error:`Failed to check authentication status:`,cursor_oauth_title:`Cursor OAuth`,cursor_oauth_button:`Start Cursor Login`,cursor_oauth_hint:`Login to Cursor through OAuth flow, automatically obtain and save authentication files. Requests use IDE client mode.`,cursor_oauth_url_label:`Authorization URL:`,cursor_open_link:`Open Link`,cursor_copy_link:`Copy Link`,cursor_oauth_status_waiting:`Waiting for authentication...`,cursor_oauth_status_success:`Authentication successful!`,cursor_oauth_status_error:`Authentication failed:`,cursor_oauth_start_error:`Failed to start Cursor OAuth:`,cursor_oauth_polling_error:`Failed to check authentication status:`,plugin_oauth_title:",
+		},
+		{
+			"xai_oauth_polling_error:`Не удалось проверить статус аутентификации:`,plugin_oauth_title:",
+			"xai_oauth_polling_error:`Не удалось проверить статус аутентификации:`,cursor_oauth_title:`Cursor OAuth`,cursor_oauth_button:`Начать вход Cursor`,cursor_oauth_hint:`Выполните вход в Cursor через OAuth и автоматически получите/сохраните файлы авторизации. Запросы идут в режиме IDE.`,cursor_oauth_url_label:`URL авторизации:`,cursor_open_link:`Открыть ссылку`,cursor_copy_link:`Скопировать ссылку`,cursor_oauth_status_waiting:`Ожидание аутентификации...`,cursor_oauth_status_success:`Аутентификация успешна!`,cursor_oauth_status_error:`Ошибка аутентификации:`,cursor_oauth_start_error:`Не удалось запустить Cursor OAuth:`,cursor_oauth_polling_error:`Не удалось проверить статус аутентификации:`,plugin_oauth_title:",
+		},
+	}
+	for _, p := range localePatches {
+		if strings.Contains(s, p[0]) {
+			s = strings.Replace(s, p[0], p[1], 1)
+		}
+	}
+
+	if !strings.Contains(s, "id:`cursor`") {
+		log.Debug("management panel cursor OAuth patch did not apply cleanly")
+		return data
+	}
+	log.Info("management panel: injected Cursor OAuth login card")
+	return []byte(s)
+}
+
+// ensureCursorOAuthOnDisk patches an existing management.html if Cursor is missing.
+func ensureCursorOAuthOnDisk(localPath string) {
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return
+	}
+	patched := patchManagementHTMLForCursorOAuth(data)
+	if string(patched) == string(data) {
+		return
+	}
+	if err = atomicWriteFile(localPath, patched); err != nil {
+		log.WithError(err).Warn("failed to write management panel cursor OAuth patch")
+	}
+}
