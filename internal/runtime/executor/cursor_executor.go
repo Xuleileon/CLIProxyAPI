@@ -30,10 +30,14 @@ import (
 )
 
 const (
-	cursorAPIURL            = "https://api2.cursor.sh"
-	cursorRunPath           = "/agent.v1.AgentService/Run"
-	cursorModelsPath        = "/agent.v1.AgentService/GetUsableModels"
-	cursorClientVersion     = "cli-2026.02.13-41ac335"
+	cursorAPIURL     = "https://api2.cursor.sh"
+	cursorRunPath    = "/agent.v1.AgentService/Run"
+	cursorModelsPath = "/agent.v1.AgentService/GetUsableModels"
+	// Match Cursor IDE client identity. "cli" is a separate product surface that
+	// often only has the fast-request pool (no IDE-style slow fallback).
+	cursorClientVersion     = "3.13.25"
+	cursorClientCommit      = "31e8d61c448c7472e371505838a0fe34083dad50"
+	cursorClientType        = "ide"
 	cursorAuthType          = "cursor"
 	cursorHeartbeatInterval = 5 * time.Second
 	cursorSessionTTL        = 5 * time.Minute
@@ -317,27 +321,30 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	defer sessionCancel()
 	go cursorH2Heartbeat(sessionCtx, stream)
 
-	// Collect full text from streaming response
-	var fullText strings.Builder
+	// Collect content and reasoning separately (Codex-compatible split).
+	var contentText, reasoningText strings.Builder
 	if streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, nil,
 		func(text string, isThinking bool) {
-			fullText.WriteString(text)
+			if isThinking {
+				reasoningText.WriteString(text)
+			} else {
+				contentText.WriteString(text)
+			}
 		},
 		nil,
 		nil,
 		nil, // tokenUsage - non-streaming
 		nil, // onCheckpoint - non-streaming doesn't persist
-	); streamErr != nil && fullText.Len() == 0 {
+	); streamErr != nil && contentText.Len() == 0 && reasoningText.Len() == 0 {
 		return resp, classifyCursorError(fmt.Errorf("cursor: stream error: %w", streamErr))
 	}
 
 	id := "chatcmpl-" + uuid.New().String()[:28]
 	created := time.Now().Unix()
-	openaiResp := fmt.Sprintf(`{"id":"%s","object":"chat.completion","created":%d,"model":"%s","choices":[{"index":0,"message":{"role":"assistant","content":%s},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`,
-		id, created, parsed.Model, jsonString(fullText.String()))
+	openaiResp := buildCursorOpenAIChatCompletion(id, created, parsed.Model, contentText.String(), reasoningText.String(), 0, 0)
 
 	// Translate response back to source format if needed
-	result := []byte(openaiResp)
+	result := openaiResp
 	if from.String() != "" && from.String() != "openai" {
 		var param any
 		result = sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), payload, result, &param)
@@ -583,36 +590,43 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	go func() {
 		var resumeOutCh chan cliproxyexecutor.StreamChunk
 		_ = resumeOutCh
-		thinkingActive := false
+		roleSent := false
 		toolCallIndex := 0
 		usage := &cursorTokenUsage{}
 		usage.setInputEstimate(len(payload))
 
 		streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, params.McpTools,
 			func(text string, isThinking bool) {
+				// Split thinking into reasoning_content (Codex/OpenAI-compat style).
+				// Do not wrap thinking in <think> tags inside content.
 				if isThinking {
-					if !thinkingActive {
-						thinkingActive = true
-						sendChunkSwitchable(`{"role":"assistant","content":"<think>"}`, "")
+					if !roleSent {
+						roleSent = true
+						sendChunkSwitchable(fmt.Sprintf(`{"role":"assistant","reasoning_content":%s}`, jsonString(text)), "")
+					} else {
+						sendChunkSwitchable(fmt.Sprintf(`{"reasoning_content":%s}`, jsonString(text)), "")
 					}
-					sendChunkSwitchable(fmt.Sprintf(`{"content":%s}`, jsonString(text)), "")
+					return
+				}
+				if !roleSent {
+					roleSent = true
+					sendChunkSwitchable(fmt.Sprintf(`{"role":"assistant","content":%s}`, jsonString(text)), "")
 				} else {
-					if thinkingActive {
-						thinkingActive = false
-						sendChunkSwitchable(`{"content":"</think>"}`, "")
-					}
 					sendChunkSwitchable(fmt.Sprintf(`{"content":%s}`, jsonString(text)), "")
 				}
 			},
 			func(exec pendingMcpExec) {
-				if thinkingActive {
-					thinkingActive = false
-					sendChunkSwitchable(`{"content":"</think>"}`, "")
-				}
 				toolCallJSON := fmt.Sprintf(`{"tool_calls":[{"index":%d,"id":"%s","type":"function","function":{"name":"%s","arguments":%s}}]}`,
 					toolCallIndex, exec.ToolCallId, exec.ToolName, jsonString(exec.Args))
 				toolCallIndex++
-				sendChunkSwitchable(toolCallJSON, "")
+				if !roleSent {
+					roleSent = true
+					// Tool-only first emission still needs an assistant role.
+					sendChunkSwitchable(fmt.Sprintf(`{"role":"assistant","tool_calls":[{"index":%d,"id":"%s","type":"function","function":{"name":"%s","arguments":%s}}]}`,
+						toolCallIndex-1, exec.ToolCallId, exec.ToolName, jsonString(exec.Args)), "")
+				} else {
+					sendChunkSwitchable(toolCallJSON, "")
+				}
 				sendChunkSwitchable(`{}`, `"tool_calls"`)
 				sendDoneSwitchable()
 
@@ -696,13 +710,8 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 
-		if thinkingActive {
-			sendChunkSwitchable(`{"content":"</think>"}`, "")
-		}
 		// Include token usage in the final stop chunk
 		inputTok, outputTok := usage.get()
-		stopDelta := fmt.Sprintf(`{},"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}`,
-			inputTok, outputTok, inputTok+outputTok)
 		// Build the stop chunk with usage embedded in the choices array level
 		fr := `"stop"`
 		openaiJSON := fmt.Sprintf(`{"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":%s}],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
@@ -717,7 +726,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			emitToOut(cliproxyexecutor.StreamChunk{Payload: []byte(openaiJSON)})
 		}
 		sendDoneSwitchable()
-		_ = stopDelta // unused
 
 		// Close whatever output channel is still active
 		outMu.Lock()
@@ -784,18 +792,56 @@ func (e *CursorExecutor) resumeWithToolResults(
 // --- H2Stream helpers ---
 
 func openCursorH2Stream(accessToken string) (*cursorproto.H2Stream, error) {
-	headers := map[string]string{
-		":path":                    cursorRunPath,
-		"content-type":             "application/connect+proto",
-		"connect-protocol-version": "1",
-		"te":                       "trailers",
-		"authorization":            "Bearer " + accessToken,
-		"x-ghost-mode":             "true",
-		"x-cursor-client-version":  cursorClientVersion,
-		"x-cursor-client-type":     "cli",
-		"x-request-id":             uuid.New().String(),
-	}
+	headers := cursorRequestHeaders(accessToken, cursorRunPath)
 	return cursorproto.DialH2Stream("api2.cursor.sh", headers)
+}
+
+// cursorRequestHeaders mirrors Cursor IDE transport headers (not the CLI surface).
+// IDE uses client-type "ide" and can fall back to the slow request pool; "cli"
+// is often limited to the fast-request pool after quota exhaustion.
+func cursorRequestHeaders(accessToken, path string) map[string]string {
+	reqID := uuid.New().String()
+	h := map[string]string{
+		"content-type":                "application/connect+proto",
+		"connect-protocol-version":    "1",
+		"te":                          "trailers",
+		"authorization":               "Bearer " + accessToken,
+		"x-ghost-mode":                "true",
+		"x-cursor-client-version":     cursorClientVersion,
+		"x-cursor-client-commit":      cursorClientCommit,
+		"x-cursor-client-type":        cursorClientType,
+		"x-cursor-client-device-type": "desktop",
+		"x-cursor-client-os":          "win32",
+		"x-cursor-client-arch":        "x64",
+		"x-cursor-checksum":           cursorChecksumHeader(),
+		"x-request-id":                reqID,
+		"x-amzn-trace-id":             "Root=" + reqID,
+	}
+	if path != "" {
+		h[":path"] = path
+	}
+	return h
+}
+
+// cursorChecksumHeader builds the IDE-style x-cursor-checksum value:
+// base64(time-obfuscated 6-byte timestamp) + machineId [/ macMachineId].
+// Algorithm mirrors Cursor's alwaysLocalSingleton transport header helper.
+func cursorChecksumHeader() string {
+	// Stable synthetic IDs keep the header well-formed without binding to a host install.
+	machineID := "cliproxy-cursor-machine"
+	macMachineID := "cliproxy-cursor-mac-machine"
+	ts := time.Now().UnixMilli() / 1_000_000
+	raw := []byte{
+		byte(ts >> 40), byte(ts >> 32), byte(ts >> 24),
+		byte(ts >> 16), byte(ts >> 8), byte(ts),
+	}
+	n := byte(165)
+	for i := 0; i < len(raw); i++ {
+		raw[i] = (raw[i] ^ n) + byte(i%256)
+		n = raw[i]
+	}
+	prefix := base64.StdEncoding.EncodeToString(raw)
+	return prefix + machineID + "/" + macMachineID
 }
 
 func cursorH2Heartbeat(ctx context.Context, stream *cursorproto.H2Stream) {
@@ -1344,14 +1390,25 @@ func cursorRefreshToken(auth *cliproxyauth.Auth) string {
 }
 
 func applyCursorHeaders(req *http.Request, accessToken string) {
-	req.Header.Set("Content-Type", "application/connect+proto")
-	req.Header.Set("Connect-Protocol-Version", "1")
-	req.Header.Set("Te", "trailers")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("X-Ghost-Mode", "true")
-	req.Header.Set("X-Cursor-Client-Version", cursorClientVersion)
-	req.Header.Set("X-Cursor-Client-Type", "cli")
-	req.Header.Set("X-Request-Id", uuid.New().String())
+	for k, v := range cursorRequestHeaders(accessToken, "") {
+		if strings.HasPrefix(k, ":") {
+			continue
+		}
+		// HTTP headers are canonicalized; keep standard names.
+		switch strings.ToLower(k) {
+		case "authorization":
+			req.Header.Set("Authorization", v)
+		case "content-type":
+			req.Header.Set("Content-Type", v)
+		case "connect-protocol-version":
+			req.Header.Set("Connect-Protocol-Version", v)
+		case "te":
+			req.Header.Set("Te", v)
+		default:
+			// Preserve x-cursor-* casing style used by IDE.
+			req.Header.Set(k, v)
+		}
+	}
 }
 
 func newH2Client() *http.Client {
@@ -1454,6 +1511,60 @@ func sseChunk(id string, created int64, model string, delta string, finishReason
 	return cliproxyexecutor.StreamChunk{
 		Payload: []byte(data),
 	}
+}
+
+// buildCursorOpenAIChatCompletion builds a non-stream OpenAI chat.completion
+// payload with content and reasoning_content split (Codex-compatible).
+func buildCursorOpenAIChatCompletion(id string, created int64, model, content, reasoning string, promptTokens, completionTokens int64) []byte {
+	type message struct {
+		Role             string `json:"role"`
+		Content          string `json:"content"`
+		ReasoningContent string `json:"reasoning_content,omitempty"`
+	}
+	type choice struct {
+		Index        int     `json:"index"`
+		Message      message `json:"message"`
+		FinishReason string  `json:"finish_reason"`
+	}
+	type usage struct {
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+		TotalTokens      int64 `json:"total_tokens"`
+	}
+	type resp struct {
+		ID      string   `json:"id"`
+		Object  string   `json:"object"`
+		Created int64    `json:"created"`
+		Model   string   `json:"model"`
+		Choices []choice `json:"choices"`
+		Usage   usage    `json:"usage"`
+	}
+	out := resp{
+		ID:      id,
+		Object:  "chat.completion",
+		Created: created,
+		Model:   model,
+		Choices: []choice{{
+			Index: 0,
+			Message: message{
+				Role:             "assistant",
+				Content:          content,
+				ReasoningContent: reasoning,
+			},
+			FinishReason: "stop",
+		}},
+		Usage: usage{
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
+		},
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		// Fallback should never happen for this shape; keep empty content response.
+		return []byte(`{"id":"","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}]}`)
+	}
+	return b
 }
 
 func jsonString(s string) string {
@@ -1595,12 +1706,9 @@ func fetchCursorModels(ctx context.Context, authID, accessToken string, client *
 		return cursorModelsOrFallback(authID)
 	}
 
+	// GetUsableModels is unary proto (not connect+proto framing).
+	applyCursorHeaders(h2Req, accessToken)
 	h2Req.Header.Set("Content-Type", "application/proto")
-	h2Req.Header.Set("Te", "trailers")
-	h2Req.Header.Set("Authorization", "Bearer "+accessToken)
-	h2Req.Header.Set("X-Ghost-Mode", "true")
-	h2Req.Header.Set("X-Cursor-Client-Version", cursorClientVersion)
-	h2Req.Header.Set("X-Cursor-Client-Type", "cli")
 
 	resp, err := client.Do(h2Req)
 	if err != nil {

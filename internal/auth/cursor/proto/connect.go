@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 const (
@@ -64,6 +65,15 @@ func ParseConnectEndStream(data []byte) error {
 		Error *struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
+			Details []struct {
+				Debug *struct {
+					Error   string `json:"error"`
+					Details *struct {
+						Title  string `json:"title"`
+						Detail string `json:"detail"`
+					} `json:"details"`
+				} `json:"debug"`
+			} `json:"details"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(data, &trailer); err != nil {
@@ -77,6 +87,33 @@ func ParseConnectEndStream(data []byte) error {
 		msg := trailer.Error.Message
 		if msg == "" {
 			msg = "Unknown error"
+		}
+		// Cursor often returns a generic message with the real reason in details[].debug.
+		for _, d := range trailer.Error.Details {
+			if d.Debug == nil {
+				continue
+			}
+			parts := make([]string, 0, 3)
+			if d.Debug.Error != "" {
+				parts = append(parts, d.Debug.Error)
+			}
+			if d.Debug.Details != nil {
+				if d.Debug.Details.Title != "" {
+					parts = append(parts, d.Debug.Details.Title)
+				}
+				if d.Debug.Details.Detail != "" {
+					parts = append(parts, d.Debug.Details.Detail)
+				}
+			}
+			if len(parts) > 0 {
+				detail := strings.Join(parts, ": ")
+				if msg == "" || msg == "Error" || msg == "Unknown error" {
+					msg = detail
+				} else {
+					msg = msg + " (" + detail + ")"
+				}
+				break
+			}
 		}
 		return &ConnectError{Code: code, Message: msg}
 	}

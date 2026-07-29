@@ -21,7 +21,10 @@ import (
 
 // RunRequestParams holds all data needed to build an AgentRunRequest.
 type RunRequestParams struct {
-	ModelId        string
+	ModelId string
+	// MaxMode maps to ModelDetails.max_mode / RequestedModel.max_mode.
+	// Default false: do not force Cursor Max Mode (which burns fast-request quota).
+	MaxMode        bool
 	SystemPrompt   string
 	UserText       string
 	MessageId      string
@@ -203,17 +206,16 @@ func EncodeRunRequest(p *RunRequestParams) []byte {
 	ca := newMsg("ConversationAction")
 	setMsg(ca, "user_message_action", uma)
 
-	// --- ModelDetails ---
-	md := newMsg("ModelDetails")
-	setStr(md, "model_id", p.ModelId)
-	setStr(md, "display_model_id", p.ModelId)
-	setStr(md, "display_name", p.ModelId)
+	// --- ModelDetails + RequestedModel (explicit max_mode; default off) ---
+	md := buildModelDetails(p.ModelId, p.MaxMode)
+	rm := buildRequestedModel(p.ModelId, p.MaxMode)
 
 	// --- AgentRunRequest ---
 	arr := newMsg("AgentRunRequest")
 	setMsg(arr, "conversation_state", css)
 	setMsg(arr, "action", ca)
 	setMsg(arr, "model_details", md)
+	setMsg(arr, "requested_model", rm)
 	setStr(arr, "conversation_id", p.ConversationId)
 
 	// McpTools
@@ -240,6 +242,25 @@ func EncodeRunRequest(p *RunRequestParams) []byte {
 	setMsg(acm, "run_request", arr)
 
 	return marshal(acm)
+}
+
+// buildModelDetails constructs ModelDetails with an explicit max_mode value.
+// Leaving max_mode unset lets some Cursor server paths treat CLI traffic as Max Mode.
+func buildModelDetails(modelID string, maxMode bool) *dynamicpb.Message {
+	md := newMsg("ModelDetails")
+	setStr(md, "model_id", modelID)
+	setStr(md, "display_model_id", modelID)
+	setStr(md, "display_name", modelID)
+	setBool(md, "max_mode", maxMode)
+	return md
+}
+
+// buildRequestedModel constructs RequestedModel (AgentRunRequest field 9).
+func buildRequestedModel(modelID string, maxMode bool) *dynamicpb.Message {
+	rm := newMsg("RequestedModel")
+	setStr(rm, "model_id", modelID)
+	setBool(rm, "max_mode", maxMode)
+	return rm
 }
 
 // encodeRunRequestWithCheckpoint builds an AgentClientMessage using a raw checkpoint
@@ -270,12 +291,9 @@ func encodeRunRequestWithCheckpoint(p *RunRequestParams) []byte {
 	setMsg(ca, "user_message_action", uma)
 	caBytes := marshal(ca)
 
-	// Build ModelDetails
-	md := newMsg("ModelDetails")
-	setStr(md, "model_id", p.ModelId)
-	setStr(md, "display_model_id", p.ModelId)
-	setStr(md, "display_name", p.ModelId)
-	mdBytes := marshal(md)
+	// Build ModelDetails + RequestedModel (explicit max_mode)
+	mdBytes := marshal(buildModelDetails(p.ModelId, p.MaxMode))
+	rmBytes := marshal(buildRequestedModel(p.ModelId, p.MaxMode))
 
 	// Build McpTools
 	var mcpToolsBytes []byte
@@ -318,6 +336,9 @@ func encodeRunRequestWithCheckpoint(p *RunRequestParams) []byte {
 		arrBuf = protowire.AppendTag(arrBuf, ARR_ConversationId, protowire.BytesType)
 		arrBuf = protowire.AppendString(arrBuf, p.ConversationId)
 	}
+	// field 9: requested_model = RequestedModel
+	arrBuf = protowire.AppendTag(arrBuf, ARR_RequestedModel, protowire.BytesType)
+	arrBuf = protowire.AppendBytes(arrBuf, rmBytes)
 
 	// Wrap in AgentClientMessage field 1 (run_request)
 	var acmBuf []byte
@@ -331,6 +352,7 @@ func encodeRunRequestWithCheckpoint(p *RunRequestParams) []byte {
 // ResumeRequestParams holds data for a ResumeAction request.
 type ResumeRequestParams struct {
 	ModelId        string
+	MaxMode        bool
 	ConversationId string
 	McpTools       []McpToolDef
 }
@@ -364,16 +386,15 @@ func EncodeResumeRequest(p *ResumeRequestParams) []byte {
 	ca := newMsg("ConversationAction")
 	setMsg(ca, "resume_action", ra)
 
-	// ModelDetails
-	md := newMsg("ModelDetails")
-	setStr(md, "model_id", p.ModelId)
-	setStr(md, "display_model_id", p.ModelId)
-	setStr(md, "display_name", p.ModelId)
+	// ModelDetails + RequestedModel (explicit max_mode; default off)
+	md := buildModelDetails(p.ModelId, p.MaxMode)
+	rm := buildRequestedModel(p.ModelId, p.MaxMode)
 
 	// AgentRunRequest — no conversation_state needed for resume
 	arr := newMsg("AgentRunRequest")
 	setMsg(arr, "action", ca)
 	setMsg(arr, "model_details", md)
+	setMsg(arr, "requested_model", rm)
 	setStr(arr, "conversation_id", p.ConversationId)
 
 	// McpTools at top level

@@ -30,6 +30,8 @@ const (
 	ARR_ModelDetails      = 3 // ModelDetails
 	ARR_McpTools          = 4 // McpTools
 	ARR_ConversationId    = 5 // string (optional)
+	// field 6: mcp_file_system_options, field 7: skill_options, field 8: custom_system_prompt
+	ARR_RequestedModel = 9 // RequestedModel (optional)
 )
 
 // ConversationStateStructure (msg 83)
@@ -77,10 +79,20 @@ const (
 
 // ModelDetails (msg 88)
 const (
-	MD_ModelId         = 1 // string
-	MD_ThinkingDetails = 2 // ThinkingDetails (optional)
-	MD_DisplayModelId  = 3 // string
-	MD_DisplayName     = 4 // string
+	MD_ModelId          = 1 // string
+	MD_ThinkingDetails  = 2 // ThinkingDetails (optional)
+	MD_DisplayModelId   = 3 // string
+	MD_DisplayName      = 4 // string
+	MD_DisplayNameShort = 5 // string
+	MD_Aliases          = 6 // repeated string
+	MD_MaxMode          = 7 // bool (optional) — Cursor Max Mode; false uses normal/non-max path
+)
+
+// RequestedModel (msg in agent.v1)
+const (
+	RM_ModelId    = 1 // string
+	RM_MaxMode    = 2 // bool
+	RM_Parameters = 3 // repeated ModelParameterbytes
 )
 
 // McpTools (msg 307)
