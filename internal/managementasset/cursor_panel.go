@@ -76,6 +76,12 @@ func patchManagementHTMLForCursorOAuth(data []byte) []byte {
 	return []byte(s)
 }
 
+// EnsureCursorOAuthOnDisk patches an existing management.html if Cursor is missing.
+// Exported so the HTTP server can apply the patch on every panel request.
+func EnsureCursorOAuthOnDisk(localPath string) {
+	ensureCursorOAuthOnDisk(localPath)
+}
+
 // ensureCursorOAuthOnDisk patches an existing management.html if Cursor is missing.
 func ensureCursorOAuthOnDisk(localPath string) {
 	data, err := os.ReadFile(localPath)

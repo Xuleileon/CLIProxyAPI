@@ -120,6 +120,9 @@ func autoUpdateSkipReason(cfg *config.Config) (string, bool) {
 	return "", false
 }
 
+// Note: Cursor OAuth injection still runs on panel serve via EnsureCursorOAuthOnDisk,
+// even when automatic panel updates are disabled.
+
 func newHTTPClient(proxyURL string) *http.Client {
 	client := &http.Client{Timeout: 15 * time.Second}
 

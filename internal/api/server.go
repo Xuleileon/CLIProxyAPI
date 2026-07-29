@@ -1217,6 +1217,11 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
+	// Stock CPAMC builds omit Cursor OAuth. Always inject before serving so an
+	// existing unpatched management.html (or auto-update-disabled installs)
+	// still shows the Cursor login card.
+	managementasset.EnsureCursorOAuthOnDisk(filePath)
+
 	c.File(filePath)
 }
 

@@ -300,6 +300,12 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	parsed := parseOpenAIRequest(payload)
 	ccSessId := extractClaudeCodeSessionId(req.Payload)
 	conversationId := deriveConversationId(apiKeyFromContext(ctx), ccSessId, parsed.SystemPrompt)
+	// Non-stream OpenAI chat is request-scoped: Cursor ignores structured turns and
+	// reusing a conversation_id without server checkpoint causes "missing blob" errors
+	// on multi-turn payloads. Flatten history into UserText when present.
+	if len(parsed.Turns) > 0 || len(parsed.ToolResults) > 0 {
+		flattenConversationIntoUserText(parsed)
+	}
 	params := buildRunRequestParams(parsed, conversationId, req.Model)
 
 	requestBytes := cursorproto.EncodeRunRequest(params)
@@ -323,6 +329,8 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Collect content and reasoning separately (Codex-compatible split).
 	var contentText, reasoningText strings.Builder
+	usage := &cursorTokenUsage{}
+	usage.setInputEstimate(len(payload))
 	if streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, nil,
 		func(text string, isThinking bool) {
 			if isThinking {
@@ -333,7 +341,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		},
 		nil,
 		nil,
-		nil, // tokenUsage - non-streaming
+		usage,
 		nil, // onCheckpoint - non-streaming doesn't persist
 	); streamErr != nil && contentText.Len() == 0 && reasoningText.Len() == 0 {
 		return resp, classifyCursorError(fmt.Errorf("cursor: stream error: %w", streamErr))
@@ -341,7 +349,8 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	id := "chatcmpl-" + uuid.New().String()[:28]
 	created := time.Now().Unix()
-	openaiResp := buildCursorOpenAIChatCompletion(id, created, parsed.Model, contentText.String(), reasoningText.String(), 0, 0)
+	inTok, outTok := usage.get()
+	openaiResp := buildCursorOpenAIChatCompletion(id, created, parsed.Model, contentText.String(), reasoningText.String(), inTok, outTok)
 
 	// Translate response back to source format if needed
 	result := openaiResp
@@ -1470,30 +1479,21 @@ func extractClaudeCodeSessionId(payload []byte) string {
 	return sid
 }
 
-// deriveConversationId generates a deterministic conversation_id.
-// Priority: session_id (stable across resume) > system prompt hash (fallback).
+// deriveConversationId generates a conversation_id for Cursor AgentService.
+// Priority:
+//  1. Claude Code / client session_id — stable so checkpoints and tool resume work
+//  2. Fresh UUID — OpenAI-style requests must not reuse a server conversation without
+//     checkpoint blobs (same system prompt previously caused multi-turn "missing blob")
 func deriveConversationId(apiKey, sessionId, systemPrompt string) string {
-	var input string
+	_ = systemPrompt // retained for call-site compatibility; no longer used without session
 	if sessionId != "" {
-		// Best: use Claude Code's session_id — stable even across resume
-		input = "cursor-conv:" + apiKey + ":" + sessionId
-	} else {
-		// Fallback: use system prompt content minus volatile cch
-		stable := systemPrompt
-		if idx := strings.Index(stable, "cch="); idx >= 0 {
-			end := strings.IndexAny(stable[idx:], "; \n")
-			if end > 0 {
-				stable = stable[:idx] + stable[idx+end:]
-			}
-		}
-		if len(stable) > 500 {
-			stable = stable[:500]
-		}
-		input = "cursor-conv:" + apiKey + ":" + stable
+		input := "cursor-conv:" + apiKey + ":" + sessionId
+		h := sha256.Sum256([]byte(input))
+		s := hex.EncodeToString(h[:16])
+		return fmt.Sprintf("%s-%s-%s-%s-%s", s[:8], s[8:12], s[12:16], s[16:20], s[20:32])
 	}
-	h := sha256.Sum256([]byte(input))
-	s := hex.EncodeToString(h[:16])
-	return fmt.Sprintf("%s-%s-%s-%s-%s", s[:8], s[8:12], s[12:16], s[16:20], s[20:32])
+	// New conversation per request for stateless OpenAI chat completions.
+	return uuid.New().String()
 }
 
 func deriveSessionKey(clientKey string, model string, messages []gjson.Result) string {
