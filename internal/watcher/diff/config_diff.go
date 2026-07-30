@@ -54,6 +54,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.DisableClaudeCloakMode != newCfg.DisableClaudeCloakMode {
 		changes = append(changes, fmt.Sprintf("disable-claude-cloak-mode: %t -> %t", oldCfg.DisableClaudeCloakMode, newCfg.DisableClaudeCloakMode))
 	}
+	if !reflect.DeepEqual(oldCfg.ClaudeCloakDefaultSensitiveWords, newCfg.ClaudeCloakDefaultSensitiveWords) {
+		changes = append(changes, fmt.Sprintf("claude-cloak-default-sensitive-words: %v -> %v", oldCfg.ClaudeCloakDefaultSensitiveWords, newCfg.ClaudeCloakDefaultSensitiveWords))
+	}
 	if oldCfg.DisableImageGeneration != newCfg.DisableImageGeneration {
 		changes = append(changes, fmt.Sprintf("disable-image-generation: %v -> %v", oldCfg.DisableImageGeneration, newCfg.DisableImageGeneration))
 	}

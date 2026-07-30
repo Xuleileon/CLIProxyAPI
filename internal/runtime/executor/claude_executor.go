@@ -2166,6 +2166,13 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		}
 	}
 
+	// Fall back to global default sensitive words when the credential did not
+	// configure its own list. This ensures newly registered OAuth accounts get
+	// baseline obfuscation without requiring manual auth-file patches.
+	if len(sensitiveWords) == 0 && cfg != nil && len(cfg.ClaudeCloakDefaultSensitiveWords) > 0 {
+		sensitiveWords = cfg.ClaudeCloakDefaultSensitiveWords
+	}
+
 	// Determine if cloaking should be applied
 	if !helps.ShouldCloak(cloakMode, clientUserAgent) {
 		return payload, nil

@@ -186,6 +186,11 @@ type Config struct {
 	// the auth/OAuth token file). Default false preserves the per-client "auto" behavior.
 	DisableClaudeCloakMode bool `yaml:"disable-claude-cloak-mode" json:"disable-claude-cloak-mode"`
 
+	// ClaudeCloakDefaultSensitiveWords defines global default sensitive words for Claude cloaking.
+	// When a credential does not configure its own cloak_sensitive_words, these words are used.
+	// This ensures newly logged-in OAuth accounts get baseline obfuscation without manual config.
+	ClaudeCloakDefaultSensitiveWords []string `yaml:"claude-cloak-default-sensitive-words" json:"claude-cloak-default-sensitive-words"`
+
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
 
