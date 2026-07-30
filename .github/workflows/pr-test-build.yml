@@ -46,9 +46,23 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Check gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: Verify embedded model catalogs
+        run: |
+          go test ./internal/registry -run 'TestEmbeddedCodexClientModelsCatalogIsValid|TestModelOverrideHeadersFromEmbeddedModels' -count=1
+          go run ./cmd/validate_codex_models --file internal/registry/models/codex_client_models.json
       - name: Refresh models catalog
         run: bash .github/scripts/refresh-model-catalogs.sh
       - name: Build
-        run: go build ./cmd/server
+        run: go build -o test-output ./cmd/server && rm -f test-output
+      - name: Sentinel regression tests
+        run: |
+          go test ./internal/auth/xai -count=1
+          go test ./internal/api/handlers/management -run 'XAI|APICall|Copilot|CBOR' -count=1
+          go test ./sdk/cliproxy/usage/... -count=1
+          go test ./internal/runtime/executor/helps/... -count=1
+          go test ./internal/redisqueue/... -count=1
+          go test ./test -run 'TestThinkingE2EMatrix_Suffix|TestGeminiExecutorRecordsSuccessfulZeroUsage' -count=1
       - name: Test
-        run: go test ./...
+        run: go test ./... -count=1

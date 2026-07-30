@@ -642,6 +642,137 @@ func TestXAIExecutorPrepareDropsOrphanedToolChoiceBeforeXSearchInject(t *testing
 	}
 }
 
+func TestXAIExecutorPrepareResponsesRequestPreservesSupportedOutputControls(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		sourceFormat sdktranslator.Format
+		payload      []byte
+		want         map[string]string
+		absent       []string
+	}{
+		{
+			name:         "Chat Completions prefers max_completion_tokens",
+			sourceFormat: sdktranslator.FormatOpenAI,
+			payload: []byte(`{
+				"model":"grok-4.5",
+				"messages":[{"role":"user","content":"hello"}],
+				"max_completion_tokens":64,
+				"max_tokens":128,
+				"temperature":0,
+				"top_p":0.25,
+				"top_k":7,
+				"stop":["END"]
+			}`),
+			want: map[string]string{
+				"max_output_tokens": "64",
+				"temperature":       "0",
+				"top_p":             "0.25",
+				"top_k":             "7",
+			},
+			absent: []string{"max_completion_tokens", "max_tokens", "stop"},
+		},
+		{
+			name:         "Chat Completions falls back to max_tokens",
+			sourceFormat: sdktranslator.FormatOpenAI,
+			payload: []byte(`{
+				"model":"grok-4.5",
+				"messages":[{"role":"user","content":"hello"}],
+				"max_completion_tokens":null,
+				"max_tokens":128
+			}`),
+			want: map[string]string{
+				"max_output_tokens": "128",
+			},
+			absent: []string{"max_completion_tokens", "max_tokens", "temperature", "top_p", "top_k"},
+		},
+		{
+			name:         "Responses preserves native controls",
+			sourceFormat: sdktranslator.FormatOpenAIResponse,
+			payload: []byte(`{
+				"model":"grok-4.5",
+				"input":"hello",
+				"max_output_tokens":256,
+				"temperature":0.4,
+				"top_p":0.8,
+				"top_k":20,
+				"stop":["END"]
+			}`),
+			want: map[string]string{
+				"max_output_tokens": "256",
+				"temperature":       "0.4",
+				"top_p":             "0.8",
+				"top_k":             "20",
+			},
+			absent: []string{"stop"},
+		},
+		{
+			name:         "No controls remain absent",
+			sourceFormat: sdktranslator.FormatOpenAI,
+			payload:      []byte(`{"model":"grok-4.5","messages":[{"role":"user","content":"hello"}]}`),
+			absent:       []string{"max_output_tokens", "temperature", "top_p", "top_k", "stop"},
+		},
+	}
+
+	exec := NewXAIExecutor(&config.Config{})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+				Model:   "grok-4.5",
+				Payload: tt.payload,
+			}, cliproxyexecutor.Options{
+				SourceFormat: tt.sourceFormat,
+				Stream:       true,
+			}, true)
+			if errPrepare != nil {
+				t.Fatalf("prepareResponsesRequest() error = %v", errPrepare)
+			}
+
+			for path, want := range tt.want {
+				if got := gjson.GetBytes(prepared.body, path).Raw; got != want {
+					t.Fatalf("%s = %s, want %s; body=%s", path, got, want, prepared.body)
+				}
+			}
+			for _, path := range tt.absent {
+				if gjson.GetBytes(prepared.body, path).Exists() {
+					t.Fatalf("%s should be absent; body=%s", path, prepared.body)
+				}
+			}
+		})
+	}
+}
+
+func TestXAIExecutorPrepareResponsesRequestDropsPayloadStopOverride(t *testing.T) {
+	t.Parallel()
+
+	exec := NewXAIExecutor(&config.Config{
+		Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{
+				{
+					Models: []config.PayloadModelRule{{Name: "grok-4.5"}},
+					Params: map[string]any{"stop": []string{"END"}},
+				},
+			},
+		},
+	})
+	prepared, errPrepare := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+	}, true)
+	if errPrepare != nil {
+		t.Fatalf("prepareResponsesRequest() error = %v", errPrepare)
+	}
+	if gjson.GetBytes(prepared.body, "stop").Exists() {
+		t.Fatalf("stop should be removed after payload config; body=%s", prepared.body)
+	}
+}
+
 func TestXAIExecutorPrepareResponsesRequestAddsObjectTypeToRootUnionBranches(t *testing.T) {
 	t.Parallel()
 
@@ -1476,7 +1607,16 @@ func TestXAIExecutorCompactUsesCompactEndpoint(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewXAIExecutor(&config.Config{})
+	exec := NewXAIExecutor(&config.Config{
+		Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{
+				{
+					Models: []config.PayloadModelRule{{Name: "grok-4.3"}},
+					Params: map[string]any{"top_k": 10},
+				},
+			},
+		},
+	})
 	auth := &cliproxyauth.Auth{
 		Provider: "xai",
 		Attributes: map[string]string{
@@ -1485,7 +1625,7 @@ func TestXAIExecutorCompactUsesCompactEndpoint(t *testing.T) {
 		},
 	}
 
-	payload := []byte(`{"model":"grok-4.3","stream":true,"input":[{"type":"compaction","encrypted_content":""},{"role":"user","content":"hello"}]}`)
+	payload := []byte(`{"model":"grok-4.3","stream":true,"max_output_tokens":64,"temperature":0.3,"top_p":0.8,"stop":["END"],"input":[{"type":"compaction","encrypted_content":""},{"role":"user","content":"hello"}]}`)
 	payload, _ = sjson.SetBytes(payload, "input.0.encrypted_content", validEncryptedContent)
 	resp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "grok-4.3",
@@ -1507,8 +1647,10 @@ func TestXAIExecutorCompactUsesCompactEndpoint(t *testing.T) {
 	if gotAccept != "application/json" {
 		t.Fatalf("Accept = %q, want application/json", gotAccept)
 	}
-	if gjson.GetBytes(gotBody, "stream").Exists() {
-		t.Fatalf("stream exists in compact body: %s", string(gotBody))
+	for _, field := range []string{"stream", "max_output_tokens", "temperature", "top_p", "top_k", "stop"} {
+		if gjson.GetBytes(gotBody, field).Exists() {
+			t.Fatalf("%s exists in compact body: %s", field, string(gotBody))
+		}
 	}
 	if got := gjson.GetBytes(gotBody, "input.0.encrypted_content").String(); got != validEncryptedContent {
 		t.Fatalf("input.0.encrypted_content = %q, want valid sample; body=%s", got, string(gotBody))
@@ -1730,8 +1872,10 @@ func TestXAIExecutorExecuteStreamCompactionTriggerUsesCompactEndpoint(t *testing
 	if xaiInputHasItemType(gotBody, "compaction_trigger") {
 		t.Fatalf("compaction_trigger reached xai compact body: %s", string(gotBody))
 	}
-	if gjson.GetBytes(gotBody, "stream").Exists() {
-		t.Fatalf("stream exists in compact body: %s", string(gotBody))
+	for _, field := range []string{"stream", "max_output_tokens", "temperature", "top_p", "top_k", "stop"} {
+		if gjson.GetBytes(gotBody, field).Exists() {
+			t.Fatalf("%s exists in compact body: %s", field, string(gotBody))
+		}
 	}
 
 	var streamed bytes.Buffer
@@ -2191,6 +2335,8 @@ func TestXAIExecutorExecuteImagesUsesImagesEndpointAndPublishesUsage(t *testing.
 		if errRead != nil {
 			t.Fatalf("read body: %v", errRead)
 		}
+		// Windows timer resolution can yield 0 TTFT without a minimal handler delay.
+		time.Sleep(2 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"created":123,"data":[{"b64_json":"AA=="}],"usage":{"cost_in_usd_ticks":250000}}`))
 	}))
@@ -2709,6 +2855,104 @@ func TestXAIExecutorExecuteVideosUsesNativeEndpointFromRequestPath(t *testing.T)
 			}
 		})
 	}
+}
+
+func TestXAIExecutorExecuteVideosPublishesUsage(t *testing.T) {
+	const requestedModel = "grok-imagine-video"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"request_id":"vid_123"}`))
+	}))
+	defer server.Close()
+
+	plugin := &captureXAIUsagePlugin{
+		model:   requestedModel,
+		records: make(chan usage.Record, 2),
+	}
+	usage.RegisterPlugin(plugin)
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   requestedModel,
+		Payload: []byte(`{"model":"grok-imagine-video","prompt":"animate"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-video"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey: "/v1/videos/generations",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	record := waitForXAIUsageRecord(t, plugin.records)
+	if record.Model != requestedModel {
+		t.Fatalf("model = %q, want %q", record.Model, requestedModel)
+	}
+	if record.Failed {
+		t.Fatalf("failed = true, want false; failure=%+v", record.Fail)
+	}
+	if record.TTFT <= 0 {
+		t.Fatalf("ttft = %v, want positive duration", record.TTFT)
+	}
+	assertNoAdditionalXAIUsageRecord(t, plugin.records)
+}
+
+func TestXAIExecutorExecuteVideosPublishesFailureUsage(t *testing.T) {
+	const requestedModel = "grok-imagine-video"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	defer server.Close()
+
+	plugin := &captureXAIUsagePlugin{
+		model:   requestedModel,
+		records: make(chan usage.Record, 2),
+	}
+	usage.RegisterPlugin(plugin)
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "xai",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "xai-token"},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   requestedModel,
+		Payload: []byte(`{"model":"grok-imagine-video","prompt":"animate"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-video"),
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestPathMetadataKey: "/v1/videos/generations",
+		},
+	})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want non-nil")
+	}
+
+	record := waitForXAIUsageRecord(t, plugin.records)
+	if record.Model != requestedModel {
+		t.Fatalf("model = %q, want %q", record.Model, requestedModel)
+	}
+	if !record.Failed {
+		t.Fatal("failed = false, want true")
+	}
+	if record.Fail.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("failure status = %d, want %d", record.Fail.StatusCode, http.StatusTooManyRequests)
+	}
+	assertNoAdditionalXAIUsageRecord(t, plugin.records)
 }
 
 func TestNormalizeXAITools_SimplifiesCodexAppAutomationUpdateSchema(t *testing.T) {

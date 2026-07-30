@@ -16,6 +16,7 @@ Daily GitHub Action (`.github/workflows/upstream-sync.yml`) merges from `router-
 - **Clean merge + gates green** → auto fast-forward to `main`.
 - **Conflicts OR build/test fails** → opens PR labeled `upstream-sync`.
 - Manual trigger: Actions → "Upstream Sync" → Run workflow.
+- Selective batch plan and status: [docs/upstream-sync-backlog.md](docs/upstream-sync-backlog.md).
 
 ## What NOT to pull in
 

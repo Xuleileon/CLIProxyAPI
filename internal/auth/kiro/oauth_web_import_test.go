@@ -85,6 +85,7 @@ func TestOAuthWebImportLoadsIDCDeviceRegistrationFromClientIDHash(t *testing.T) 
 
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
 	cacheDir := filepath.Join(homeDir, ".aws", "sso", "cache")
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		t.Fatalf("failed to create cache dir: %v", err)

@@ -108,6 +108,7 @@ func effectiveSDKConfig(cfg *config.Config) *config.SDKConfig {
 		return nil
 	}
 	sdkCfg := cfg.SDKConfig
+	sdkCfg.CodexOptimizeMultiAgentV2 = cfg.Codex.OptimizeMultiAgentV2
 	if cfg.CommercialMode {
 		sdkCfg.RequestLog = false
 	}
@@ -1369,7 +1370,7 @@ func (s *Server) handleHomeCodexClientModels(c *gin.Context) {
 		models = append(models, model)
 	}
 
-	c.JSON(http.StatusOK, openai.CodexClientModelsResponse(models))
+	c.JSON(http.StatusOK, openai.CodexClientModelsResponseWithMultiAgentV2(models, s.cfg.Codex.OptimizeMultiAgentV2))
 }
 
 func (s *Server) geminiModelsHandler(geminiHandler *gemini.GeminiAPIHandler) gin.HandlerFunc {

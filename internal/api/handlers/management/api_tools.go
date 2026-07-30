@@ -15,6 +15,7 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
 	antigravityauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/antigravity"
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -319,6 +320,11 @@ func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) 
 		return token, errToken
 	}
 
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") && auth.AuthKind() == coreauth.AuthKindOAuth {
+		token, errToken := h.refreshXAIOAuthAccessToken(ctx, auth)
+		return token, errToken
+	}
+
 	return tokenValueForAuth(auth), nil
 }
 
@@ -494,6 +500,125 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 	}
 
 	return strings.TrimSpace(tokenResp.AccessToken), nil
+}
+
+func xaiOAuthTokenNeedsRefresh(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return true
+	}
+	if strings.TrimSpace(tokenValueFromMetadata(auth.Metadata)) == "" {
+		return true
+	}
+	lead := xaiauth.RefreshLead()
+	expiry, hasExpiry := auth.ExpirationTime()
+	if hasExpiry && !expiry.IsZero() {
+		return !expiry.After(time.Now().Add(lead))
+	}
+	if ts, ok := xaiOAuthLastRefreshTime(auth); ok {
+		return time.Since(ts) >= lead
+	}
+	return true
+}
+
+func xaiOAuthLastRefreshTime(auth *coreauth.Auth) (time.Time, bool) {
+	if auth == nil {
+		return time.Time{}, false
+	}
+	if !auth.LastRefreshedAt.IsZero() {
+		return auth.LastRefreshedAt, true
+	}
+	if raw := stringValue(auth.Metadata, "last_refresh"); raw != "" {
+		if ts, errParse := time.Parse(time.RFC3339, raw); errParse == nil {
+			return ts, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func (h *Handler) refreshXAIOAuthAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if auth == nil {
+		return "", nil
+	}
+
+	metadata := auth.Metadata
+	if len(metadata) == 0 {
+		return "", fmt.Errorf("xai oauth metadata missing")
+	}
+
+	current := strings.TrimSpace(tokenValueFromMetadata(metadata))
+	if current != "" && !xaiOAuthTokenNeedsRefresh(auth) {
+		return current, nil
+	}
+
+	refreshToken := stringValue(metadata, "refresh_token")
+	if refreshToken == "" {
+		return "", fmt.Errorf("xai refresh token missing")
+	}
+
+	tokenEndpoint := stringValue(metadata, "token_endpoint")
+	svc := xaiauth.NewXAIAuthWithProxyURL(h.cfg, auth.ProxyURL)
+	td, errRefresh := svc.RefreshTokens(ctx, refreshToken, tokenEndpoint)
+	if errRefresh != nil {
+		return "", fmt.Errorf("xai oauth token refresh: %w", errRefresh)
+	}
+	if strings.TrimSpace(td.AccessToken) == "" {
+		return "", fmt.Errorf("xai oauth token refresh returned empty access_token")
+	}
+
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["type"] = "xai"
+	auth.Metadata["auth_kind"] = "oauth"
+	auth.Metadata["access_token"] = strings.TrimSpace(td.AccessToken)
+	if strings.TrimSpace(td.RefreshToken) != "" {
+		auth.Metadata["refresh_token"] = strings.TrimSpace(td.RefreshToken)
+	}
+	if strings.TrimSpace(td.IDToken) != "" {
+		auth.Metadata["id_token"] = strings.TrimSpace(td.IDToken)
+	}
+	if strings.TrimSpace(td.TokenType) != "" {
+		auth.Metadata["token_type"] = strings.TrimSpace(td.TokenType)
+	}
+	if td.ExpiresIn > 0 {
+		auth.Metadata["expires_in"] = td.ExpiresIn
+	}
+	if strings.TrimSpace(td.Expire) != "" {
+		auth.Metadata["expired"] = strings.TrimSpace(td.Expire)
+	}
+	if strings.TrimSpace(td.Email) != "" {
+		auth.Metadata["email"] = strings.TrimSpace(td.Email)
+	}
+	if strings.TrimSpace(td.Subject) != "" {
+		auth.Metadata["sub"] = strings.TrimSpace(td.Subject)
+	}
+	if tokenEndpoint != "" {
+		auth.Metadata["token_endpoint"] = tokenEndpoint
+	}
+	if stringValue(auth.Metadata, "base_url") == "" {
+		auth.Metadata["base_url"] = xaiauth.DefaultAPIBaseURL
+	}
+	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
+
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes["auth_kind"] = "oauth"
+	if strings.TrimSpace(auth.Attributes["base_url"]) == "" {
+		auth.Attributes["base_url"] = xaiauth.DefaultAPIBaseURL
+	}
+
+	now := time.Now()
+	auth.LastRefreshedAt = now
+	auth.UpdatedAt = now
+	if h != nil && h.authManager != nil {
+		_, _ = h.authManager.Update(ctx, auth)
+	}
+
+	return strings.TrimSpace(td.AccessToken), nil
 }
 
 func antigravityTokenNeedsRefresh(metadata map[string]any) bool {

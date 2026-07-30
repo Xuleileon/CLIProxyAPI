@@ -34,6 +34,7 @@ auths/*
 
 # Documentation
 docs/*
+!docs/upstream-sync-backlog.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md
