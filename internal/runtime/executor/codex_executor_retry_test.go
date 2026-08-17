@@ -1,12 +1,39 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"testing"
 	"time"
 )
+
+func TestCodexTransportErrorMapsUpstreamEOFToBadGateway(t *testing.T) {
+	err := codexTransportError(io.EOF)
+	statusError, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status error, got %T", err)
+	}
+	if got := statusError.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadGateway)
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected wrapped EOF, got %v", err)
+	}
+}
+
+func TestCodexTransportErrorPreservesRequestCancellation(t *testing.T) {
+	err := codexTransportError(context.Canceled)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
+	}
+	if _, ok := err.(interface{ StatusCode() int }); ok {
+		t.Fatalf("request cancellation must not be classified as an upstream status error")
+	}
+}
 
 func TestParseCodexRetryAfter(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
