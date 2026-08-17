@@ -1027,6 +1027,7 @@ func baselineExecutorAuths() []*coreauth.Auth {
 		"antigravity",
 		"kimi",
 		"xai",
+		"opencode-go",
 		"openai-compatibility",
 	}
 	auths := make([]*coreauth.Auth, 0, len(providers))
@@ -1118,6 +1119,8 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
 	case "xai":
 		s.coreManager.RegisterExecutor(executor.NewXAIAutoExecutor(s.cfg))
+	case "opencode-go":
+		s.coreManager.RegisterExecutor(executor.NewOpenCodeGoExecutor(s.cfg))
 	case "kiro":
 		s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg))
 	case "kilo":
@@ -2079,6 +2082,17 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 			}
 		}
 		models = applyExcludedModels(models, excluded)
+	case "opencode-go":
+		models = registry.GetOpenCodeGoModels()
+		if entry := s.resolveConfigOpenCodeGoKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildOpenCodeGoConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
 	case "cursor":
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -2402,6 +2416,28 @@ func (s *Service) resolveConfigXAIKey(auth *coreauth.Auth) *config.XAIKey {
 		return nil
 	}
 	return resolveConfigCodexStyleKey(auth, s.cfg.XAIKey)
+}
+
+func (s *Service) resolveConfigOpenCodeGoKey(auth *coreauth.Auth) *config.OpenCodeGoKey {
+	if auth == nil || s == nil || s.cfg == nil {
+		return nil
+	}
+	apiKey, baseURL := "", ""
+	if auth.Attributes != nil {
+		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
+		baseURL = strings.TrimRight(strings.TrimSpace(auth.Attributes["base_url"]), "/")
+	}
+	for i := range s.cfg.OpenCodeGoKey {
+		entry := &s.cfg.OpenCodeGoKey[i]
+		if apiKey != "" && !strings.EqualFold(apiKey, strings.TrimSpace(entry.APIKey)) {
+			continue
+		}
+		if baseURL != "" && !strings.EqualFold(baseURL, strings.TrimRight(strings.TrimSpace(entry.BaseURL), "/")) {
+			continue
+		}
+		return entry
+	}
+	return nil
 }
 
 func resolveConfigCodexStyleKey(auth *coreauth.Auth, entries []config.CodexKey) *config.CodexKey {
@@ -2745,6 +2781,45 @@ func buildXAIConfigModels(entry *config.XAIKey) []*ModelInfo {
 		return nil
 	}
 	return buildConfigModels(entry.Models, "xai", "xai")
+}
+
+func buildOpenCodeGoConfigModels(entry *config.OpenCodeGoKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	models := buildConfigModels(entry.Models, "opencode-go", "opencode-go")
+	for i := range models {
+		if models[i] == nil {
+			continue
+		}
+		for j := range entry.Models {
+			configured := entry.Models[j]
+			alias := strings.TrimSpace(configured.Alias)
+			if alias == "" {
+				alias = strings.TrimSpace(configured.Name)
+			}
+			if !strings.EqualFold(alias, models[i].ID) {
+				continue
+			}
+			protocol := config.NormalizeOpenCodeGoProtocol(configured.Protocol)
+			if protocol == "" {
+				protocol = registry.OpenCodeGoProtocolForModel(configured.Name)
+			}
+			switch protocol {
+			case config.OpenCodeGoProtocolClaude:
+				models[i].Type = "claude"
+				models[i].SupportedEndpoints = []string{"/messages"}
+			case config.OpenCodeGoProtocolResponses:
+				models[i].Type = "openai-response"
+				models[i].SupportedEndpoints = []string{"/responses"}
+			default:
+				models[i].Type = "openai"
+				models[i].SupportedEndpoints = []string{"/chat/completions"}
+			}
+			break
+		}
+	}
+	return models
 }
 
 func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {

@@ -72,6 +72,21 @@ func ComputeCodexModelsHash(models []config.CodexModel) string {
 	return hashJoined(keys)
 }
 
+// ComputeOpenCodeGoModelsHash returns a stable hash for OpenCode Go model routing.
+func ComputeOpenCodeGoModelsHash(models []config.OpenCodeGoModel) string {
+	keys := normalizeModelPairs(func(out func(key string)) {
+		for _, model := range models {
+			name := strings.TrimSpace(model.Name)
+			alias := strings.TrimSpace(model.Alias)
+			if name == "" && alias == "" {
+				continue
+			}
+			out(strings.ToLower(name) + "|" + strings.ToLower(alias) + "|" + strings.TrimSpace(model.DisplayName) + "|" + config.NormalizeOpenCodeGoProtocol(model.Protocol) + "|" + fmt.Sprintf("force-mapping=%t", model.ForceMapping))
+		}
+	})
+	return hashJoined(keys)
+}
+
 // ComputeGeminiModelsHash returns a stable hash for Gemini model aliases.
 func ComputeGeminiModelsHash(models []config.GeminiModel) string {
 	keys := normalizeModelPairs(func(out func(key string)) {

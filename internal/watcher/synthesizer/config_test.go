@@ -42,6 +42,41 @@ func TestConfigSynthesizer_Synthesize_NilConfig(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_OpenCodeGoKeys(t *testing.T) {
+	cfg := &config.Config{OpenCodeGoKey: []config.OpenCodeGoKey{
+		{
+			Name:           "primary",
+			APIKey:         "go-secret",
+			Prefix:         "go",
+			BaseURL:        config.DefaultOpenCodeGoBaseURL,
+			ProxyURL:       "direct",
+			DisableCooling: true,
+			Models:         []config.OpenCodeGoModel{{Name: "minimax-m3", Alias: "mini", Protocol: "anthropic"}},
+		},
+		{Name: "backup", APIKey: "go-backup", BaseURL: config.DefaultOpenCodeGoBaseURL},
+	}}
+	auths, err := NewConfigSynthesizer().Synthesize(&SynthesisContext{Config: cfg, Now: time.Now(), IDGenerator: NewStableIDGenerator()})
+	if err != nil {
+		t.Fatalf("Synthesize() error = %v", err)
+	}
+	if len(auths) != 2 {
+		t.Fatalf("auth count = %d, want 2", len(auths))
+	}
+	auth := auths[0]
+	if auth.Provider != "opencode-go" || auth.Label != "primary" || auth.Prefix != "go" || auth.ProxyURL != "direct" {
+		t.Fatalf("auth = %#v", auth)
+	}
+	if backup := auths[1]; backup.Label != "backup" || backup.ID == auth.ID || backup.Attributes["api_key"] != "go-backup" {
+		t.Fatalf("backup auth = %#v", backup)
+	}
+	if auth.Attributes["api_key"] != "go-secret" || auth.Attributes["base_url"] != config.DefaultOpenCodeGoBaseURL || auth.Attributes["models_hash"] == "" {
+		t.Fatalf("attributes = %#v", auth.Attributes)
+	}
+	if disabled, _ := auth.Metadata["disable_cooling"].(bool); !disabled {
+		t.Fatalf("metadata = %#v", auth.Metadata)
+	}
+}
+
 func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 	tests := []struct {
 		name       string

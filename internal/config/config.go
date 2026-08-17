@@ -164,6 +164,9 @@ type Config struct {
 	// XAIKey defines xAI API key configurations using the same structure as Codex API keys.
 	XAIKey []XAIKey `yaml:"xai-api-key" json:"xai-api-key"`
 
+	// OpenCodeGoKey defines OpenCode Go subscription API key configurations.
+	OpenCodeGoKey []OpenCodeGoKey `yaml:"opencode-go-api-key" json:"opencode-go-api-key"`
+
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
 
@@ -982,6 +985,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize xAI keys: drop entries without base-url
 	cfg.SanitizeXAIKeys()
+
+	// Sanitize OpenCode Go API keys and apply the official default endpoint.
+	cfg.SanitizeOpenCodeGoKeys()
 
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()

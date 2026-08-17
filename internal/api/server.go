@@ -1036,6 +1036,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/xai-api-key", s.mgmt.PatchXAIKey)
 		mgmt.DELETE("/xai-api-key", s.mgmt.DeleteXAIKey)
 
+		mgmt.GET("/opencode-go-api-key", s.mgmt.GetOpenCodeGoKeys)
+		mgmt.PUT("/opencode-go-api-key", s.mgmt.PutOpenCodeGoKeys)
+		mgmt.PATCH("/opencode-go-api-key", s.mgmt.PatchOpenCodeGoKey)
+		mgmt.DELETE("/opencode-go-api-key", s.mgmt.DeleteOpenCodeGoKey)
+
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
@@ -1218,11 +1223,18 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
-	// Stock CPAMC builds omit Cursor OAuth. Always inject before serving so an
-	// existing unpatched management.html (or auto-update-disabled installs)
-	// still shows the Cursor login card.
+	// Stock CPAMC builds may omit Plus-only provider UI. Always inject before
+	// serving so existing or auto-update-disabled panels remain usable.
 	managementasset.EnsureCursorOAuthOnDisk(filePath)
+	managementasset.EnsureOpenCodeGoOnDisk(filePath)
 
+	// The panel is a single-file application. Serving a stale conditional-cache
+	// response keeps the old JavaScript bundle alive after provider UI patches.
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
+	c.Request.Header.Del("If-Modified-Since")
+	c.Request.Header.Del("If-None-Match")
 	c.File(filePath)
 }
 
@@ -2092,6 +2104,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	claudeAPIKeyCount := len(cfg.ClaudeKey)
 	codexAPIKeyCount := len(cfg.CodexKey)
 	xaiAPIKeyCount := len(cfg.XAIKey)
+	openCodeGoAPIKeyCount := len(cfg.OpenCodeGoKey)
 	vertexAICompatCount := len(cfg.VertexCompatAPIKey)
 	openAICompatCount := 0
 	for i := range cfg.OpenAICompatibility {
@@ -2102,8 +2115,8 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		openAICompatCount += len(entry.APIKeyEntries)
 	}
 
-	total := authEntries + geminiAPIKeyCount + interactionsAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + vertexAICompatCount + openAICompatCount
-	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Interactions API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d Vertex-compat + %d OpenAI-compat)\n",
+	total := authEntries + geminiAPIKeyCount + interactionsAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + openCodeGoAPIKeyCount + vertexAICompatCount + openAICompatCount
+	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Interactions API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d OpenCode Go keys + %d Vertex-compat + %d OpenAI-compat)\n",
 		total,
 		authEntries,
 		geminiAPIKeyCount,
@@ -2111,6 +2124,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		claudeAPIKeyCount,
 		codexAPIKeyCount,
 		xaiAPIKeyCount,
+		openCodeGoAPIKeyCount,
 		vertexAICompatCount,
 		openAICompatCount,
 	)

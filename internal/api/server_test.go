@@ -873,6 +873,7 @@ func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 
 	t.Run("management button query opens control panel", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/management.html?safe-mode=configure", nil)
+		req.Header.Set("If-Modified-Since", time.Now().Add(24*time.Hour).UTC().Format(http.TimeFormat))
 		rr := httptest.NewRecorder()
 		server.engine.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
@@ -880,6 +881,9 @@ func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 		}
 		if !strings.Contains(rr.Body.String(), "management app") {
 			t.Fatalf("management panel body missing: %s", rr.Body.String())
+		}
+		if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("Cache-Control = %q, want no-store", got)
 		}
 	})
 

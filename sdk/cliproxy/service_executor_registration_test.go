@@ -85,6 +85,7 @@ func TestRegisterAvailableExecutors(t *testing.T) {
 		"antigravity",
 		"kimi",
 		"xai",
+		"opencode-go",
 		"openai-compatibility",
 		"plugin-provider",
 	}

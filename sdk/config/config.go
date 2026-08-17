@@ -23,6 +23,8 @@ type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
 type XAIKey = internalconfig.XAIKey
 type XAIModel = internalconfig.XAIModel
+type OpenCodeGoKey = internalconfig.OpenCodeGoKey
+type OpenCodeGoModel = internalconfig.OpenCodeGoModel
 type ClaudeKey = internalconfig.ClaudeKey
 type VertexCompatKey = internalconfig.VertexCompatKey
 type VertexCompatModel = internalconfig.VertexCompatModel
@@ -35,7 +37,15 @@ type TLS = internalconfig.TLSConfig
 
 const (
 	DefaultPanelGitHubRepository = internalconfig.DefaultPanelGitHubRepository
+	DefaultOpenCodeGoBaseURL     = internalconfig.DefaultOpenCodeGoBaseURL
+	OpenCodeGoProtocolOpenAI     = internalconfig.OpenCodeGoProtocolOpenAI
+	OpenCodeGoProtocolClaude     = internalconfig.OpenCodeGoProtocolClaude
+	OpenCodeGoProtocolResponses  = internalconfig.OpenCodeGoProtocolResponses
 )
+
+func NormalizeOpenCodeGoProtocol(protocol string) string {
+	return internalconfig.NormalizeOpenCodeGoProtocol(protocol)
+}
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }
 

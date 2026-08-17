@@ -1412,7 +1412,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	} else {
 		auths := h.authManager.List()
 		for _, auth := range auths {
-			if auth.FileName == name {
+			if auth.FileName == name || auth.Index == name || auth.EnsureIndex() == name {
 				targetAuth = auth
 				break
 			}

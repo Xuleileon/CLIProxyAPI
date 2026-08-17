@@ -38,6 +38,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeClaudeKeys(ctx)...)
 	// Codex API Keys
 	out = append(out, s.synthesizeCodexKeys(ctx)...)
+	// OpenCode Go subscription API keys
+	out = append(out, s.synthesizeOpenCodeGoKeys(ctx)...)
 	// Kiro (AWS CodeWhisperer)
 	out = append(out, s.synthesizeKiroKeys(ctx)...)
 	// xAI API Keys
@@ -182,6 +184,61 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 // synthesizeXAIKeys creates Auth entries for xAI API keys.
 func (s *ConfigSynthesizer) synthesizeXAIKeys(ctx *SynthesisContext) []*coreauth.Auth {
 	return s.synthesizeCodexStyleKeys(ctx, ctx.Config.XAIKey, "xai")
+}
+
+func (s *ConfigSynthesizer) synthesizeOpenCodeGoKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	out := make([]*coreauth.Auth, 0, len(cfg.OpenCodeGoKey))
+	for i := range cfg.OpenCodeGoKey {
+		entry := cfg.OpenCodeGoKey[i]
+		key := strings.TrimSpace(entry.APIKey)
+		if key == "" {
+			continue
+		}
+		baseURL := strings.TrimSpace(entry.BaseURL)
+		if baseURL == "" {
+			baseURL = config.DefaultOpenCodeGoBaseURL
+		}
+		id, token := ctx.IDGenerator.Next("opencode-go:apikey", key, baseURL)
+		attrs := map[string]string{
+			"source":   fmt.Sprintf("config:opencode-go[%s]", token),
+			"api_key":  key,
+			"base_url": baseURL,
+		}
+		if entry.Priority != 0 {
+			attrs["priority"] = strconv.Itoa(entry.Priority)
+		}
+		if hash := diff.ComputeOpenCodeGoModelsHash(entry.Models); hash != "" {
+			attrs["models_hash"] = hash
+		}
+		addConfigHeadersToAttrs(entry.Headers, attrs)
+		metadata := map[string]any{}
+		if entry.DisableCooling {
+			metadata["disable_cooling"] = true
+		}
+		label := strings.TrimSpace(entry.Name)
+		if label == "" {
+			label = "opencode-go-apikey"
+		}
+		auth := &coreauth.Auth{
+			ID:         id,
+			Provider:   "opencode-go",
+			Label:      label,
+			Prefix:     strings.TrimSpace(entry.Prefix),
+			Status:     coreauth.StatusActive,
+			ProxyURL:   strings.TrimSpace(entry.ProxyURL),
+			Attributes: attrs,
+			Metadata:   metadata,
+			CreatedAt:  ctx.Now,
+			UpdatedAt:  ctx.Now,
+		}
+		ApplyAuthExcludedModelsMeta(auth, cfg, entry.ExcludedModels, "apikey")
+		if len(auth.Metadata) == 0 {
+			auth.Metadata = nil
+		}
+		out = append(out, auth)
+	}
+	return out
 }
 
 func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entries []config.CodexKey, provider string) []*coreauth.Auth {

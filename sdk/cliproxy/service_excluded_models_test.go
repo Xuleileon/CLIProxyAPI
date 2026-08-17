@@ -66,6 +66,23 @@ func TestRegisterModelsForAuth_MergesOAuthExcludedModelsFromConfigAndAuthAttribu
 	}
 }
 
+func TestRegisterModelsForAuth_OpenCodeGoUsesConfiguredCatalog(t *testing.T) {
+	service := &Service{cfg: &config.Config{OpenCodeGoKey: []config.OpenCodeGoKey{{
+		APIKey:  "go-secret",
+		BaseURL: config.DefaultOpenCodeGoBaseURL,
+		Models:  []config.OpenCodeGoModel{{Name: "minimax-m3", Alias: "mini", DisplayName: "Mini Go", Protocol: "anthropic"}},
+	}}}}
+	auth := &coreauth.Auth{ID: "opencode-go:test", Provider: "opencode-go", Status: coreauth.StatusActive, Attributes: map[string]string{"auth_kind": "apikey", "api_key": "go-secret", "base_url": config.DefaultOpenCodeGoBaseURL}}
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() { registry.UnregisterClient(auth.ID) })
+	service.registerModelsForAuth(context.Background(), auth)
+	models := registry.GetAvailableModelsByProvider("opencode-go")
+	if len(models) != 1 || models[0].ID != "mini" || models[0].Type != "claude" || models[0].DisplayName != "Mini Go" {
+		t.Fatalf("models = %#v", models)
+	}
+}
+
 func TestRegisterModelsForAuth_KiroFallbackModelsApplyExcludedModels(t *testing.T) {
 	excludedModel := "kiro-claude-sonnet-4-6"
 	service := &Service{

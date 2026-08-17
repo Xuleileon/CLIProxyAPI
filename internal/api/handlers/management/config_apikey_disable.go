@@ -81,6 +81,18 @@ func toggleConfigAPIKeyExcludedAll(cfg *config.Config, auth *coreauth.Auth, disa
 			return true, nil
 		}
 	}
+	for i := range cfg.OpenCodeGoKey {
+		entry := &cfg.OpenCodeGoKey[i]
+		baseURL := strings.TrimSpace(entry.BaseURL)
+		if baseURL == "" {
+			baseURL = config.DefaultOpenCodeGoBaseURL
+		}
+		id, _ := idGen.Next("opencode-go:apikey", entry.APIKey, baseURL)
+		if id == authID {
+			entry.ExcludedModels = setConfigAPIKeyExcludedAll(entry.ExcludedModels, disable)
+			return true, nil
+		}
+	}
 	for i := range cfg.VertexCompatAPIKey {
 		entry := &cfg.VertexCompatAPIKey[i]
 		id, _ := idGen.Next("vertex:apikey", entry.APIKey, entry.BaseURL, entry.ProxyURL)

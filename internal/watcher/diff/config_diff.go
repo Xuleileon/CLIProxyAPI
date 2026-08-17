@@ -279,6 +279,25 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		}
 	}
 
+	// OpenCode Go keys (do not print key material)
+	if len(oldCfg.OpenCodeGoKey) != len(newCfg.OpenCodeGoKey) {
+		changes = append(changes, fmt.Sprintf("opencode-go-api-key count: %d -> %d", len(oldCfg.OpenCodeGoKey), len(newCfg.OpenCodeGoKey)))
+	} else {
+		for i := range oldCfg.OpenCodeGoKey {
+			o := oldCfg.OpenCodeGoKey[i]
+			n := newCfg.OpenCodeGoKey[i]
+			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
+				changes = append(changes, fmt.Sprintf("opencode-go[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
+			}
+			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
+				changes = append(changes, fmt.Sprintf("opencode-go[%d].api-key: updated", i))
+			}
+			if ComputeOpenCodeGoModelsHash(o.Models) != ComputeOpenCodeGoModelsHash(n.Models) {
+				changes = append(changes, fmt.Sprintf("opencode-go[%d].models: updated (%d -> %d entries)", i, len(o.Models), len(n.Models)))
+			}
+		}
+	}
+
 	// xAI keys (do not print key material)
 	if len(oldCfg.XAIKey) != len(newCfg.XAIKey) {
 		changes = append(changes, fmt.Sprintf("xai-api-key count: %d -> %d", len(oldCfg.XAIKey), len(newCfg.XAIKey)))

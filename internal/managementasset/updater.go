@@ -259,8 +259,9 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 		if remoteHash != "" && localHash != "" && strings.EqualFold(remoteHash, localHash) {
 			log.Debug("management asset is already up to date")
-			// Upstream panel may still lack Plus-only Cursor OAuth UI.
+			// Upstream panel may still lack Plus-only provider UI.
 			ensureCursorOAuthOnDisk(localPath)
+			EnsureOpenCodeGoOnDisk(localPath)
 			return nil, nil
 		}
 
@@ -283,6 +284,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		}
 
 		data = patchManagementHTMLForCursorOAuth(data)
+		data = patchManagementHTMLForOpenCodeGo(data)
 		if err = atomicWriteFile(localPath, data); err != nil {
 			log.WithError(err).Warn("failed to update management asset on disk")
 			return nil, nil
@@ -294,6 +296,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 	if _, err := os.Stat(localPath); err == nil {
 		ensureCursorOAuthOnDisk(localPath)
+		EnsureOpenCodeGoOnDisk(localPath)
 		return true
 	}
 	return false
@@ -310,6 +313,7 @@ func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, loca
 		"enable verified GitHub updates by keeping disable-auto-update-panel set to false", downloadedHash)
 
 	data = patchManagementHTMLForCursorOAuth(data)
+	data = patchManagementHTMLForOpenCodeGo(data)
 	if err = atomicWriteFile(localPath, data); err != nil {
 		log.WithError(err).Warn("failed to persist fallback management control panel page")
 		return false

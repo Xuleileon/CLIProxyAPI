@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 )
 
@@ -26,6 +27,12 @@ type codexKeyWithAuthIndex struct {
 type xaiKeyWithAuthIndex struct {
 	config.XAIKey
 	AuthIndex string `json:"auth-index,omitempty"`
+}
+
+type openCodeGoKeyWithAuthIndex struct {
+	config.OpenCodeGoKey
+	AuthIndex  string `json:"auth-index,omitempty"`
+	ModelCount int    `json:"model-count"`
 }
 
 type vertexCompatKeyWithAuthIndex struct {
@@ -224,6 +231,34 @@ func (h *Handler) xaiKeysWithAuthIndex() []xaiKeyWithAuthIndex {
 			XAIKey:    entry,
 			AuthIndex: authIndex,
 		}
+	}
+	return out
+}
+
+func (h *Handler) openCodeGoKeysWithAuthIndex() []openCodeGoKeyWithAuthIndex {
+	if h == nil {
+		return nil
+	}
+	liveIndexByID := h.liveAuthIndexByID()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return nil
+	}
+	idGen := synthesizer.NewStableIDGenerator()
+	out := make([]openCodeGoKeyWithAuthIndex, len(h.cfg.OpenCodeGoKey))
+	for i := range h.cfg.OpenCodeGoKey {
+		entry := h.cfg.OpenCodeGoKey[i]
+		baseURL := strings.TrimSpace(entry.BaseURL)
+		if baseURL == "" {
+			baseURL = config.DefaultOpenCodeGoBaseURL
+		}
+		id, _ := idGen.Next("opencode-go:apikey", strings.TrimSpace(entry.APIKey), baseURL)
+		modelCount := len(entry.Models)
+		if modelCount == 0 {
+			modelCount = len(registry.GetOpenCodeGoModels())
+		}
+		out[i] = openCodeGoKeyWithAuthIndex{OpenCodeGoKey: entry, AuthIndex: liveIndexByID[id], ModelCount: modelCount}
 	}
 	return out
 }

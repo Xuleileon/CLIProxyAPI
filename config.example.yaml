@@ -285,6 +285,25 @@ nonstream-keepalive-interval: 0
 #       - "*-mini"          # wildcard matching suffix (e.g. gpt-5-codex-mini)
 #       - "*codex*"         # wildcard matching substring (e.g. gpt-5-codex-low)
 
+# OpenCode Go subscription API keys
+# Models are routed to their required Chat Completions, Anthropic Messages, or Responses endpoint.
+# opencode-go-api-key:
+#   - name: "primary" # optional: human-readable account label in the management panel
+#     api-key: "sk-opencode-your-key"
+#     prefix: "go" # optional: require calls like "go/deepseek-v4-flash"
+#     # base-url defaults to https://opencode.ai/zen/go/v1
+#     proxy-url: "socks5://proxy.example.com:1080" # optional
+#     models: # optional: replace the built-in catalog and override protocol routing
+#       - name: "minimax-m3"
+#         alias: "minimax-go"
+#         protocol: "anthropic" # openai, anthropic, or responses
+#         force-mapping: true
+#       - name: "gpt-5.6-luna"
+#         alias: "luna-go"
+#         protocol: "responses"
+#     excluded-models:
+#       - "hy3-preview"
+
 # xAI API keys
 # Uses the native xAI executor, including its Responses namespace-tool handling.
 # xai-api-key:
