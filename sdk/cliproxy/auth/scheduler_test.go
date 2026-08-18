@@ -1191,3 +1191,181 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 		t.Fatalf("len(seen) = %d, want %d", len(seen), 2)
 	}
 }
+
+func TestModelScheduler_AvailabilitySummaryBlockedWithRetryCountsAsCooldown(t *testing.T) {
+	t.Parallel()
+
+	nextRetry := time.Now().Add(60 * time.Second)
+	shard := &modelScheduler{
+		modelKey: "test-model",
+		entries: map[string]*scheduledAuth{
+			"auth-a": {
+				auth:        &Auth{ID: "auth-a"},
+				state:       scheduledStateBlocked,
+				nextRetryAt: nextRetry,
+			},
+		},
+	}
+
+	total, cooldownCount, earliest := shard.availabilitySummaryLocked(nil)
+	if total != 1 {
+		t.Fatalf("total = %d, want 1", total)
+	}
+	if cooldownCount != 1 {
+		t.Fatalf("cooldownCount = %d, want 1", cooldownCount)
+	}
+	if !earliest.Equal(nextRetry) {
+		t.Fatalf("earliest = %v, want %v", earliest, nextRetry)
+	}
+}
+
+func TestModelScheduler_AvailabilitySummaryBlockedWithoutRetryNotCounted(t *testing.T) {
+	t.Parallel()
+
+	shard := &modelScheduler{
+		modelKey: "test-model",
+		entries: map[string]*scheduledAuth{
+			"auth-a": {
+				auth:        &Auth{ID: "auth-a"},
+				state:       scheduledStateBlocked,
+				nextRetryAt: time.Time{},
+			},
+		},
+	}
+
+	total, cooldownCount, earliest := shard.availabilitySummaryLocked(nil)
+	if total != 1 {
+		t.Fatalf("total = %d, want 1", total)
+	}
+	if cooldownCount != 0 {
+		t.Fatalf("cooldownCount = %d, want 0", cooldownCount)
+	}
+	if !earliest.IsZero() {
+		t.Fatalf("earliest = %v, want zero", earliest)
+	}
+
+	err := shard.unavailableErrorLocked("codex", "test-model", nil)
+	var authErr *Error
+	if !errors.As(err, &authErr) {
+		t.Fatalf("unavailableErrorLocked() error = %T, want *Error", err)
+	}
+	if authErr.Code != "auth_unavailable" {
+		t.Fatalf("unavailableErrorLocked() code = %q, want %q", authErr.Code, "auth_unavailable")
+	}
+}
+
+func TestModelScheduler_UnavailableErrorAuthNotFoundWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	shard := &modelScheduler{
+		modelKey: "test-model",
+		entries:  map[string]*scheduledAuth{},
+	}
+
+	err := shard.unavailableErrorLocked("codex", "test-model", nil)
+	var authErr *Error
+	if !errors.As(err, &authErr) {
+		t.Fatalf("unavailableErrorLocked() error = %T, want *Error", err)
+	}
+	if authErr.Code != "auth_not_found" {
+		t.Fatalf("unavailableErrorLocked() code = %q, want %q", authErr.Code, "auth_not_found")
+	}
+}
+
+func TestManager_SchedulerTransientBlockedReturnsModelCooldownError(t *testing.T) {
+	t.Parallel()
+
+	prevQuota := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	prevTransient := transientErrorCooldownSeconds.Load()
+	SetTransientErrorCooldownSeconds(0)
+	t.Cleanup(func() {
+		quotaCooldownDisabled.Store(prevQuota)
+		transientErrorCooldownSeconds.Store(prevTransient)
+	})
+
+	model := "test-model-transient-scheduler"
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	auth := &Auth{
+		ID:       "auth-transient-scheduler",
+		Provider: "codex",
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	registerSchedulerModels(t, "codex", model, auth.ID)
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusBadGateway, Message: "bad gateway"},
+	})
+
+	got, errPick := manager.scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if got != nil {
+		t.Fatalf("pickSingle() auth = %v, want nil", got)
+	}
+
+	var cooldownErr *modelCooldownError
+	if !errors.As(errPick, &cooldownErr) {
+		t.Fatalf("pickSingle() error = %T (%v), want *modelCooldownError", errPick, errPick)
+	}
+	if cooldownErr.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode() = %d, want %d", cooldownErr.StatusCode(), http.StatusTooManyRequests)
+	}
+	if cooldownErr.Headers().Get("Retry-After") == "" {
+		t.Fatal("Headers().Get(Retry-After) = empty, want non-empty")
+	}
+
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal([]byte(cooldownErr.Error()), &payload); errUnmarshal != nil {
+		t.Fatalf("json.Unmarshal(Error()) error = %v", errUnmarshal)
+	}
+	rawErr, ok := payload["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("Error() payload missing error object: %v", payload)
+	}
+	if got, _ := rawErr["code"].(string); got != "model_cooldown" {
+		t.Fatalf("Error().error.code = %q, want %q", got, "model_cooldown")
+	}
+}
+
+func TestSchedulerPick_TransientBlockedReturnsModelCooldownError(t *testing.T) {
+	t.Parallel()
+
+	model := "test-model-transient-blocked"
+	nextRetry := time.Now().Add(60 * time.Second)
+	registerSchedulerModels(t, "codex", model, "auth-transient-blocked")
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{
+			ID:       "auth-transient-blocked",
+			Provider: "codex",
+			ModelStates: map[string]*ModelState{
+				model: {
+					Status:         StatusError,
+					Unavailable:    true,
+					NextRetryAfter: nextRetry,
+				},
+			},
+		},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if got != nil {
+		t.Fatalf("pickSingle() auth = %v, want nil", got)
+	}
+
+	var cooldownErr *modelCooldownError
+	if !errors.As(errPick, &cooldownErr) {
+		t.Fatalf("pickSingle() error = %T (%v), want *modelCooldownError", errPick, errPick)
+	}
+	if cooldownErr.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode() = %d, want %d", cooldownErr.StatusCode(), http.StatusTooManyRequests)
+	}
+	if cooldownErr.Headers().Get("Retry-After") == "" {
+		t.Fatal("Headers().Get(Retry-After) = empty, want non-empty")
+	}
+}

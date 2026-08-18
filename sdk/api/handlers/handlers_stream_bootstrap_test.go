@@ -2,7 +2,7 @@ package handlers
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -517,22 +517,27 @@ func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError
 	if gotErr == nil {
 		t.Fatalf("expected terminal error")
 	}
-	if gotErr.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusServiceUnavailable)
+	if gotErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", gotErr.StatusCode, http.StatusTooManyRequests)
 	}
 
-	var authErr *coreauth.Error
-	if !errors.As(gotErr.Error, &authErr) || authErr == nil {
-		t.Fatalf("expected coreauth.Error, got %T", gotErr.Error)
+	errText := gotErr.Error.Error()
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(errText), &payload); err != nil {
+		t.Fatalf("json.Unmarshal terminal error: %v (body=%q)", err, errText)
 	}
-	if authErr.Code != "auth_unavailable" {
-		t.Fatalf("code = %q, want %q", authErr.Code, "auth_unavailable")
+	rawErr, ok := payload["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("terminal error payload missing error object: %v", payload)
 	}
-	if !strings.Contains(authErr.Message, "providers=codex") {
-		t.Fatalf("message missing provider context: %q", authErr.Message)
+	if got, _ := rawErr["code"].(string); got != "model_cooldown" {
+		t.Fatalf("error.code = %q, want %q", got, "model_cooldown")
 	}
-	if !strings.Contains(authErr.Message, "model=test-model") {
-		t.Fatalf("message missing model context: %q", authErr.Message)
+	if got, _ := rawErr["model"].(string); got != "test-model" {
+		t.Fatalf("error.model = %q, want %q", got, "test-model")
+	}
+	if got, _ := rawErr["provider"].(string); got != "codex" {
+		t.Fatalf("error.provider = %q, want %q", got, "codex")
 	}
 
 	if executor.Calls() != 1 {

@@ -735,11 +735,133 @@ func TestManager_MarkResult_TransientErrorCooldownDefault(t *testing.T) {
 		t.Fatalf("expected model state to be present")
 	}
 	if state.NextRetryAfter.IsZero() {
-		t.Fatal("expected transient error cooldown to keep the legacy default")
+		t.Fatal("expected transient error cooldown to apply the default backoff")
 	}
 	diff := time.Until(state.NextRetryAfter)
-	if diff < 55*time.Second || diff > 65*time.Second {
-		t.Fatalf("expected transient error cooldown to be ~60 seconds, got %v", diff)
+	if diff < 4*time.Second || diff > 6*time.Second {
+		t.Fatalf("expected first transient error cooldown to be ~5 seconds, got %v", diff)
+	}
+	if state.Quota.BackoffLevel != 1 {
+		t.Fatalf("expected backoff level to advance to 1, got %d", state.Quota.BackoffLevel)
+	}
+}
+
+func TestManager_MarkResult_TransientErrorCooldownEscalates(t *testing.T) {
+	prevTransient := transientErrorCooldownSeconds.Load()
+	SetTransientErrorCooldownSeconds(0)
+	t.Cleanup(func() {
+		transientErrorCooldownSeconds.Store(prevTransient)
+	})
+
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "auth-transient-escalate",
+		Provider: "claude",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "test-model-transient-escalate"
+	result := Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusBadGateway, Message: "bad gateway"},
+	}
+
+	// First failure opens a ~5s window.
+	m.MarkResult(context.Background(), result)
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	firstRetry := updated.ModelStates[model].NextRetryAfter
+	if firstRetry.IsZero() {
+		t.Fatal("expected first transient cooldown to be set")
+	}
+
+	// A burst failure inside the open window reuses it without escalating.
+	m.MarkResult(context.Background(), result)
+	updated, _ = m.GetByID(auth.ID)
+	state := updated.ModelStates[model]
+	if !state.NextRetryAfter.Equal(firstRetry) {
+		t.Fatalf("expected open window to be reused, got %v want %v", state.NextRetryAfter, firstRetry)
+	}
+	if state.Quota.BackoffLevel != 1 {
+		t.Fatalf("expected backoff level to stay 1 inside open window, got %d", state.Quota.BackoffLevel)
+	}
+
+	// A failure landing after the previous window expired escalates to ~10s.
+	expired := time.Now().Add(-time.Second)
+	expiredAuth := &Auth{
+		ID:       "auth-transient-expired",
+		Provider: "claude",
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: expired,
+				Quota:          QuotaState{BackoffLevel: 1},
+			},
+		},
+	}
+	if _, errRegisterExpired := m.Register(context.Background(), expiredAuth); errRegisterExpired != nil {
+		t.Fatalf("register expired auth: %v", errRegisterExpired)
+	}
+	result.AuthID = expiredAuth.ID
+	result.Provider = expiredAuth.Provider
+	m.MarkResult(context.Background(), result)
+	updated, _ = m.GetByID(expiredAuth.ID)
+	state = updated.ModelStates[model]
+	diff := time.Until(state.NextRetryAfter)
+	if diff < 9*time.Second || diff > 11*time.Second {
+		t.Fatalf("expected second transient cooldown to be ~10 seconds, got %v", diff)
+	}
+	if state.Quota.BackoffLevel != 2 {
+		t.Fatalf("expected backoff level to advance to 2, got %d", state.Quota.BackoffLevel)
+	}
+}
+
+func TestManager_MarkResult_TransientErrorCooldownExplicitOverride(t *testing.T) {
+	prevTransient := transientErrorCooldownSeconds.Load()
+	SetTransientErrorCooldownSeconds(45)
+	t.Cleanup(func() {
+		transientErrorCooldownSeconds.Store(prevTransient)
+	})
+
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "auth-transient-override",
+		Provider: "claude",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "test-model-transient-override"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusBadGateway, Message: "bad gateway"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	diff := time.Until(state.NextRetryAfter)
+	if diff < 44*time.Second || diff > 46*time.Second {
+		t.Fatalf("expected pinned transient error cooldown to be ~45 seconds, got %v", diff)
 	}
 }
 

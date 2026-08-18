@@ -86,7 +86,11 @@ const (
 	refreshIneffectiveBackoff = 30 * time.Second
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
+	// transientErrorCooldown caps the exponential cooldown applied to 408/5xx
+	// failures; transientErrorBackoffBase is the first-step cooldown so that
+	// concurrent requests can wait out a brief blip instead of failing fast.
 	transientErrorCooldown    = time.Minute
+	transientErrorBackoffBase = 5 * time.Second
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -98,7 +102,8 @@ func SetQuotaCooldownDisabled(disable bool) {
 }
 
 // SetTransientErrorCooldownSeconds configures cooldowns for 408/500/502/503/504.
-// 0 keeps the legacy default; negative values disable transient error cooldowns.
+// 0 keeps the default exponential backoff; positive values pin a fixed cooldown;
+// negative values disable transient error cooldowns.
 func SetTransientErrorCooldownSeconds(seconds int) {
 	transientErrorCooldownSeconds.Store(int64(seconds))
 }
@@ -155,6 +160,37 @@ func nextTransientErrorRetryAfter(now time.Time) time.Time {
 		return now.Add(transientErrorCooldown)
 	}
 	return now.Add(time.Duration(seconds) * time.Second)
+}
+
+// transientErrorCooldownConfigured reports whether the operator pinned or
+// disabled transient cooldowns, in which case the exponential backoff ladder
+// is bypassed in favor of nextTransientErrorRetryAfter.
+func transientErrorCooldownConfigured() bool {
+	return transientErrorCooldownSeconds.Load() != 0
+}
+
+// transientCooldownAfterFailure returns the recovery deadline and backoff level
+// for a transient failure observed at now. The first failure starts with a short
+// cooldown so in-flight requests can wait for recovery instead of failing fast;
+// repeated failures escalate exponentially up to transientErrorCooldown.
+// Failures that land while a previous window is still open reuse that window
+// instead of escalating, so a burst of concurrent failures advances the ladder
+// at most once per window.
+func transientCooldownAfterFailure(prevNextRetryAt time.Time, prevLevel int, now time.Time) (time.Time, int) {
+	if prevNextRetryAt.After(now) {
+		return prevNextRetryAt, prevLevel
+	}
+	if prevLevel < 0 {
+		prevLevel = 0
+	}
+	cooldown := transientErrorBackoffBase * time.Duration(1<<prevLevel)
+	if cooldown < transientErrorBackoffBase {
+		cooldown = transientErrorBackoffBase
+	}
+	if cooldown >= transientErrorCooldown {
+		return now.Add(transientErrorCooldown), prevLevel
+	}
+	return now.Add(cooldown), prevLevel + 1
 }
 
 // Result captures execution outcome used to adjust auth state.
@@ -3867,8 +3903,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						case 408, 500, 502, 503, 504:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
-							} else {
+							} else if transientErrorCooldownConfigured() {
 								state.NextRetryAfter = nextTransientErrorRetryAfter(now)
+							} else {
+								var next time.Time
+								next, state.Quota.BackoffLevel = transientCooldownAfterFailure(state.NextRetryAfter, state.Quota.BackoffLevel, now)
+								state.NextRetryAfter = next
 							}
 						default:
 							state.NextRetryAfter = time.Time{}
@@ -4442,8 +4482,12 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.StatusMessage = "transient upstream error"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
-		} else {
+		} else if transientErrorCooldownConfigured() {
 			auth.NextRetryAfter = nextTransientErrorRetryAfter(now)
+		} else {
+			var next time.Time
+			next, auth.Quota.BackoffLevel = transientCooldownAfterFailure(auth.NextRetryAfter, auth.Quota.BackoffLevel, now)
+			auth.NextRetryAfter = next
 		}
 	default:
 		if auth.StatusMessage == "" {
