@@ -7,6 +7,27 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const cursorProviderCard = ",{kind:`builtin`,id:`cursor`,titleKey:`auth_login.cursor_oauth_title`,icon:{light:Ex,dark:Dx}}"
+
+const xaiProviderCardPrefix = "{kind:`builtin`,id:`xai`,titleKey:`auth_login.xai_oauth_title`,icon:{light:"
+
+func injectCursorProviderCard(s string) (string, bool) {
+	start := strings.Index(s, xaiProviderCardPrefix)
+	if start < 0 {
+		return s, false
+	}
+
+	cardEnd := strings.Index(s[start:], "}}")
+	if cardEnd < 0 {
+		return s, false
+	}
+	cardEnd += start + 2
+	xaiCard := s[start:cardEnd]
+	cursorCard := strings.Replace(xaiCard, "id:`xai`", "id:`cursor`", 1)
+	cursorCard = strings.Replace(cursorCard, "auth_login.xai_oauth_title", "auth_login.cursor_oauth_title", 1)
+	return s[:cardEnd] + "," + cursorCard + s[cardEnd:], true
+}
+
 // patchManagementHTMLForCursorOAuth injects the Cursor OAuth login card into the
 // management control panel when the upstream panel build omits it.
 // Backend already exposes GET /v0/management/cursor-auth-url; the stock panel
@@ -20,27 +41,74 @@ func patchManagementHTMLForCursorOAuth(data []byte) []byte {
 		return data
 	}
 
-	// Provider card list (Vk)
+	patched := false
+
+	// Provider card list (LA) — management center v1.20+
+	oldLA := "{kind:`builtin`,id:`xai`,titleKey:`auth_login.xai_oauth_title`,icon:{light:Ex,dark:Dx}}],RA=new Set(LA.map(e=>e.id))"
+	newLA := "{kind:`builtin`,id:`xai`,titleKey:`auth_login.xai_oauth_title`,icon:{light:Ex,dark:Dx}}" + cursorProviderCard + "],RA=new Set(LA.map(e=>e.id))"
+	if strings.Contains(s, oldLA) {
+		s = strings.Replace(s, oldLA, newLA, 1)
+		patched = true
+	}
+
+	// Provider card list (Vk) — legacy bundled panel builds
 	oldVk := "{kind:`builtin`,id:`xai`,titleKey:`auth_login.xai_oauth_title`,icon:{light:$b,dark:ex}}"
 	newVk := oldVk + ",{kind:`builtin`,id:`cursor`,titleKey:`auth_login.cursor_oauth_title`,icon:{light:$b,dark:ex}}"
-	if !strings.Contains(s, oldVk) {
-		log.Debug("management panel cursor OAuth patch skipped: Vk xai entry not found")
-		return data
+	if strings.Contains(s, oldVk) {
+		s = strings.Replace(s, oldVk, newVk, 1)
+		patched = true
 	}
-	s = strings.Replace(s, oldVk, newVk, 1)
+	if !strings.Contains(s, "id:`cursor`") {
+		var injected bool
+		s, injected = injectCursorProviderCard(s)
+		patched = patched || injected
+	}
 
-	// WebUI OAuth provider set used by startAuth()
+	// WebUI OAuth provider set used by startAuth() — new (Yv) and legacy (bv)
+	oldYv := "Yv=new Set([`codex`,`anthropic`,`antigravity`,`qoder`,`xai`])"
+	newYv := "Yv=new Set([`codex`,`anthropic`,`antigravity`,`qoder`,`xai`,`cursor`])"
+	if strings.Contains(s, oldYv) {
+		s = strings.Replace(s, oldYv, newYv, 1)
+		patched = true
+	}
 	oldBv := "bv=new Set([`codex`,`anthropic`,`antigravity`,`qoder`,`xai`])"
 	newBv := "bv=new Set([`codex`,`anthropic`,`antigravity`,`qoder`,`xai`,`cursor`])"
 	if strings.Contains(s, oldBv) {
 		s = strings.Replace(s, oldBv, newBv, 1)
+		patched = true
 	}
 
-	// Callback-style OAuth provider set
+	// Callback-style OAuth provider set — new (zA) and legacy (Uk)
+	oldZA := "zA=new Set([`codex`,`anthropic`,`antigravity`,`xai`])"
+	newZA := "zA=new Set([`codex`,`anthropic`,`antigravity`,`xai`,`cursor`])"
+	if strings.Contains(s, oldZA) {
+		s = strings.Replace(s, oldZA, newZA, 1)
+		patched = true
+	}
 	oldUk := "Uk=new Set([`codex`,`anthropic`,`antigravity`,`xai`])"
 	newUk := "Uk=new Set([`codex`,`anthropic`,`antigravity`,`xai`,`cursor`])"
 	if strings.Contains(s, oldUk) {
 		s = strings.Replace(s, oldUk, newUk, 1)
+		patched = true
+	}
+
+	// Minified variable names change between management center releases. Patch
+	// the provider set values as a fallback instead of relying on those names.
+	providerSetPatches := [][2]string{
+		{
+			"new Set([`codex`,`anthropic`,`antigravity`,`qoder`,`xai`])",
+			"new Set([`codex`,`anthropic`,`antigravity`,`qoder`,`xai`,`cursor`])",
+		},
+		{
+			"new Set([`codex`,`anthropic`,`antigravity`,`xai`])",
+			"new Set([`codex`,`anthropic`,`antigravity`,`xai`,`cursor`])",
+		},
+	}
+	for _, providerSetPatch := range providerSetPatches {
+		if strings.Contains(s, providerSetPatch[0]) {
+			s = strings.ReplaceAll(s, providerSetPatch[0], providerSetPatch[1])
+			patched = true
+		}
 	}
 
 	// i18n strings (zh-CN / zh-TW / en / ru) — insert before plugin_oauth_title
@@ -65,11 +133,16 @@ func patchManagementHTMLForCursorOAuth(data []byte) []byte {
 	for _, p := range localePatches {
 		if strings.Contains(s, p[0]) {
 			s = strings.Replace(s, p[0], p[1], 1)
+			patched = true
 		}
 	}
 
 	if !strings.Contains(s, "id:`cursor`") {
-		log.Debug("management panel cursor OAuth patch did not apply cleanly")
+		if patched {
+			log.Debug("management panel cursor OAuth patch did not apply cleanly")
+		} else {
+			log.Debug("management panel cursor OAuth patch skipped: provider anchors not found")
+		}
 		return data
 	}
 	log.Info("management panel: injected Cursor OAuth login card")
