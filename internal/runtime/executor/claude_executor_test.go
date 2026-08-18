@@ -1882,6 +1882,36 @@ func TestClaudeExecutor_ExecuteStream_InvalidGzipErrorBodyReturnsDecodeMessage(t
 	})
 }
 
+func TestClaudeExecutor_ExecuteStreamTransportErrorReturnsBadGateway(t *testing.T) {
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": "https://api.anthropic.com",
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, io.EOF
+	}))
+
+	_, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err == nil {
+		t.Fatal("expected transport error, got nil")
+	}
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("transport error does not expose StatusCode(): %T %v", err, err)
+	}
+	if got := statusErr.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("StatusCode() = %d, want %d", got, http.StatusBadGateway)
+	}
+	if !strings.Contains(err.Error(), "EOF") {
+		t.Fatalf("error = %q, want EOF detail", err)
+	}
+}
+
 func TestClaudeExecutor_CountTokens_InvalidGzipErrorBodyReturnsDecodeMessage(t *testing.T) {
 	testClaudeExecutorInvalidCompressedErrorBody(t, func(executor *ClaudeExecutor, auth *cliproxyauth.Auth, payload []byte) error {
 		_, err := executor.CountTokens(context.Background(), auth, cliproxyexecutor.Request{
