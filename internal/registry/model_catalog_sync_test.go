@@ -12,6 +12,7 @@ func TestSelectedSyncBaseline(t *testing.T) {
 	}
 	selected := []entry{
 		{"claude", "claude-opus-5"},
+		{"xai", "grok-4.6"},
 		{"gemini", "gemini-3.5-flash-lite"},
 		{"gemini", "gemini-3.6-flash"},
 		{"vertex", "gemini-3.1-pro-preview"},
@@ -28,6 +29,7 @@ func TestSelectedSyncBaseline(t *testing.T) {
 		"vertex":      GetGeminiVertexModels,
 		"aistudio":    GetAIStudioModels,
 		"antigravity": GetAntigravityModels,
+		"xai":         GetXAIModels,
 	}
 
 	for _, e := range selected {
