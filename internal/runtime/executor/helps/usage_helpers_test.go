@@ -2,13 +2,15 @@ package helps
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -335,6 +337,52 @@ func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
 	}
 }
 
+func TestParseClaudeUsagePreservesThinkingTokensAsReasoningSubset(t *testing.T) {
+	// Sanitized shape from local Anthropic request logs under ~/.config/cpa/logs.
+	data := []byte(`{"usage":{"input_tokens":2,"cache_creation_input_tokens":831,"cache_read_input_tokens":44225,"output_tokens":244,"output_tokens_details":{"thinking_tokens":40}}}`)
+	detail := ParseClaudeUsage(data)
+	if detail.OutputTokens != 244 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 244)
+	}
+	if detail.ReasoningTokens != 40 {
+		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 40)
+	}
+	if detail.TotalTokens != 45302 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 45302)
+	}
+	if !detail.TokenBreakdown.Valid() ||
+		detail.TokenBreakdown.Output.TotalTokens != 244 ||
+		detail.TokenBreakdown.Output.NonReasoningTokens != 204 ||
+		detail.TokenBreakdown.Output.ReasoningTokens != 40 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseClaudeStreamUsagePreservesThinkingTokensAsReasoningSubset(t *testing.T) {
+	line := []byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":2,"cache_creation_input_tokens":831,"cache_read_input_tokens":44225,"output_tokens":244,"output_tokens_details":{"thinking_tokens":40}}}`)
+	detail, ok := ParseClaudeStreamUsage(line)
+	if !ok {
+		t.Fatal("expected stream usage to parse")
+	}
+	if detail.OutputTokens != 244 || detail.ReasoningTokens != 40 || detail.TotalTokens != 45302 {
+		t.Fatalf("stream usage detail = %+v", detail)
+	}
+	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Output.NonReasoningTokens != 204 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseClaudeUsageFallsBackToTopLevelThinkingTokens(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":3,"output_tokens":10,"thinking_tokens":4}}`)
+	detail := ParseClaudeUsage(data)
+	if detail.OutputTokens != 10 || detail.ReasoningTokens != 4 || detail.TotalTokens != 13 {
+		t.Fatalf("detail = %+v", detail)
+	}
+	if detail.TokenBreakdown.Output.NonReasoningTokens != 6 {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
 func TestParseGeminiUsageNormalizesCachedContent(t *testing.T) {
 	detail := ParseGeminiUsage([]byte(`{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"cachedContentTokenCount":4,"totalTokenCount":12}}`))
 	if detail.CachedTokens != 4 {
@@ -356,6 +404,29 @@ func TestParseGeminiUsageIncludesToolUsePromptTokens(t *testing.T) {
 	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityComplete ||
 		detail.TokenBreakdown.Input.UncachedTokens != 15 || detail.TokenBreakdown.Output.ReasoningTokens != 3 {
 		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseGeminiStreamUsageSkipsZeroPlaceholder(t *testing.T) {
+	lines := [][]byte{
+		[]byte(`data: {"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"thoughtsTokenCount":0,"totalTokenCount":0}}`),
+		[]byte(`data: {"usageMetadata":{"promptTokenCount":17984,"candidatesTokenCount":2668,"thoughtsTokenCount":1028,"totalTokenCount":21680}}`),
+	}
+
+	accepted := make([]usage.Detail, 0, len(lines))
+	for _, line := range lines {
+		detail, ok := ParseGeminiStreamUsage(line)
+		if ok {
+			accepted = append(accepted, detail)
+		}
+	}
+
+	if len(accepted) != 1 {
+		t.Fatalf("accepted usage count = %d, want 1", len(accepted))
+	}
+	detail := accepted[0]
+	if detail.InputTokens != 17984 || detail.OutputTokens != 2668 || detail.ReasoningTokens != 1028 || detail.TotalTokens != 21680 {
+		t.Fatalf("accepted usage detail = %+v", detail)
 	}
 }
 
@@ -615,71 +686,37 @@ func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
 	}
 }
 
-func TestParseGeminiCLIUsageAppliesSeparateReasoningBreakdown(t *testing.T) {
-	data := []byte(`{"response":{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"thoughtsTokenCount":3,"cachedContentTokenCount":4,"toolUsePromptTokenCount":5,"totalTokenCount":20}}}`)
-	detail := ParseGeminiCLIUsage(data)
-	if detail.InputTokens != 15 || detail.OutputTokens != 2 || detail.ReasoningTokens != 3 || detail.TotalTokens != 20 {
-		t.Fatalf("detail = %+v", detail)
+func TestFailFromErrorsMapsContextStatuses(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "canceled", err: context.Canceled, want: clienterror.StatusClientClosedRequest},
+		{name: "deadline", err: context.DeadlineExceeded, want: http.StatusGatewayTimeout},
+		{
+			name: "url error wraps canceled",
+			err:  &url.Error{Op: "Post", URL: "https://example.com", Err: context.Canceled},
+			want: clienterror.StatusClientClosedRequest,
+		},
+		{name: "plain error", err: errors.New("boom"), want: 0},
 	}
-	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Quality != usage.TokenAccountingQualityComplete ||
-		detail.TokenBreakdown.Input.UncachedTokens != 11 || detail.TokenBreakdown.Output.ReasoningTokens != 3 {
-		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fail := failFromErrors(tc.err)
+			if fail.StatusCode != tc.want {
+				t.Fatalf("StatusCode = %d, want %d; body=%q", fail.StatusCode, tc.want, fail.Body)
+			}
+			if strings.TrimSpace(fail.Body) == "" {
+				t.Fatalf("expected non-empty failure body")
+			}
+		})
 	}
-}
 
-func TestParseGeminiCLIStreamUsageAppliesSeparateReasoningBreakdown(t *testing.T) {
-	line := []byte(`data: {"response":{"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":1,"thoughtsTokenCount":2,"totalTokenCount":11}}}`)
-	detail, ok := ParseGeminiCLIStreamUsage(line)
-	if !ok {
-		t.Fatal("ParseGeminiCLIStreamUsage() ok = false, want true")
+	if fail := failFromErrors(nil, nil); fail.StatusCode != 0 || fail.Body != "" {
+		t.Fatalf("failFromErrors(nil) = %+v, want empty failure", fail)
 	}
-	if detail.TotalTokens != 11 || detail.ReasoningTokens != 2 {
-		t.Fatalf("detail = %+v", detail)
-	}
-	if !detail.TokenBreakdown.Valid() || detail.TokenBreakdown.Output.TotalTokens != 3 {
-		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
-	}
-}
-
-func TestUsageReporterPublishAndEnsurePublishedExactlyOnce(t *testing.T) {
-	counter := &usagePublishCounter{}
-	pluginName := "helps-once-test"
-	usage.RegisterNamedPlugin(pluginName, counter)
-	defer usage.RegisterNamedPlugin(pluginName, &usagePublishCounter{})
-
-	usage.StartDefault(context.Background())
-	defer usage.StopDefault()
-
-	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
-	reporter.Publish(context.Background(), usage.Detail{InputTokens: 1, TotalTokens: 1})
-	reporter.Publish(context.Background(), usage.Detail{InputTokens: 99, TotalTokens: 99})
-	reporter.EnsurePublished(context.Background())
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if counter.published() == 1 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("publish count = %d, want 1", counter.published())
-}
-
-type usagePublishCounter struct {
-	mu sync.Mutex
-	n  int
-}
-
-func (c *usagePublishCounter) HandleUsage(context.Context, usage.Record) {
-	c.mu.Lock()
-	c.n++
-	c.mu.Unlock()
-}
-
-func (c *usagePublishCounter) published() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.n
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

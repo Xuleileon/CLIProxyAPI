@@ -1,6 +1,10 @@
 package config
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+)
 
 const (
 	// DefaultOpenCodeGoBaseURL is the official OpenCode Go API endpoint.
@@ -25,8 +29,10 @@ type OpenCodeGoKey struct {
 	DisableCooling bool              `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 }
 
-func (k OpenCodeGoKey) GetAPIKey() string  { return k.APIKey }
-func (k OpenCodeGoKey) GetBaseURL() string { return k.BaseURL }
+func (k OpenCodeGoKey) GetAPIKey() string   { return k.APIKey }
+func (k OpenCodeGoKey) GetBaseURL() string  { return k.BaseURL }
+func (k OpenCodeGoKey) GetPrefix() string   { return k.Prefix }
+func (k OpenCodeGoKey) GetProxyURL() string { return k.ProxyURL }
 
 // OpenCodeGoModel maps a client-facing alias to an upstream model and wire protocol.
 type OpenCodeGoModel struct {
@@ -40,7 +46,10 @@ type OpenCodeGoModel struct {
 func (m OpenCodeGoModel) GetName() string        { return m.Name }
 func (m OpenCodeGoModel) GetAlias() string       { return m.Alias }
 func (m OpenCodeGoModel) GetDisplayName() string { return m.DisplayName }
-func (m OpenCodeGoModel) GetForceMapping() bool  { return m.ForceMapping }
+func (m OpenCodeGoModel) GetThinking() *registry.ThinkingSupport {
+	return nil
+}
+func (m OpenCodeGoModel) GetForceMapping() bool { return m.ForceMapping }
 
 // NormalizeOpenCodeGoProtocol converts accepted protocol aliases to canonical values.
 func NormalizeOpenCodeGoProtocol(protocol string) string {
