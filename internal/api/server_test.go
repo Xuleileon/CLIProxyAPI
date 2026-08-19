@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -555,6 +556,7 @@ func TestManagementUsageEndpointsRequireManagementAuthAndServePlusContracts(t *t
 	})
 
 	server := newTestServer(t)
+	usageBefore := internalusage.GetRequestStatistics().Snapshot()
 
 	redisqueue.Enqueue([]byte(`{"id":1}`))
 	redisqueue.Enqueue([]byte(`{"id":2}`))
@@ -583,8 +585,8 @@ func TestManagementUsageEndpointsRequireManagementAuthAndServePlusContracts(t *t
 	if errUnmarshal := json.Unmarshal(legacyRR.Body.Bytes(), &usagePayload); errUnmarshal != nil {
 		t.Fatalf("unmarshal legacy usage response: %v body=%s", errUnmarshal, legacyRR.Body.String())
 	}
-	if usagePayload.Usage.TotalRequests != 0 || usagePayload.FailedRequests != 0 {
-		t.Fatalf("legacy usage payload = %+v, want zeroed statistics", usagePayload)
+	if usagePayload.Usage.TotalRequests != usageBefore.TotalRequests || usagePayload.FailedRequests != usageBefore.FailureCount {
+		t.Fatalf("legacy usage payload = %+v, want current statistics %d/%d", usagePayload, usageBefore.TotalRequests, usageBefore.FailureCount)
 	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
