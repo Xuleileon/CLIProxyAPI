@@ -176,7 +176,7 @@ func TestClaudeExecutor_Execute_OAuthSSEToolNameRestore(t *testing.T) {
 		gotUpstreamToolName = gjson.GetBytes(raw, "tools.0.name").String()
 
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(sseBody))
+		_, _ = w.Write([]byte(strings.ReplaceAll(sseBody, `"Bash"`, `"`+gotUpstreamToolName+`"`)))
 	}))
 	defer server.Close()
 
@@ -184,7 +184,7 @@ func TestClaudeExecutor_Execute_OAuthSSEToolNameRestore(t *testing.T) {
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
 		"api_key":  "sk-ant-oat-test-token",
 		"base_url": server.URL,
-	}}
+	}, Metadata: claudeOAuthTestMetadata()}
 	payload := []byte(`{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"run ls"}],"tools":[{"name":"bash","description":"run commands","input_schema":{"type":"object"}}]}`)
 
 	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
@@ -198,9 +198,9 @@ func TestClaudeExecutor_Execute_OAuthSSEToolNameRestore(t *testing.T) {
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	// Upstream should have received TitleCase "Bash"
-	if gotUpstreamToolName != "Bash" {
-		t.Errorf("upstream tool name = %q, want %q", gotUpstreamToolName, "Bash")
+	// OAuth tool names are rewritten upstream and restored for the caller.
+	if gotUpstreamToolName == "" || gotUpstreamToolName == "bash" {
+		t.Errorf("upstream tool name = %q, want a rewritten alias", gotUpstreamToolName)
 	}
 
 	// Response is translated to OpenAI format; tool name should be restored to "bash"
@@ -263,8 +263,10 @@ func TestClaudeExecutor_Execute_NonStreamJSONResponseToolNameRestore(t *testing.
 	jsonResp := `{"id":"msg_1","type":"message","model":"claude-3-5-sonnet-20241022","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":5,"output_tokens":3}}`
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		upstreamToolName := gjson.GetBytes(raw, "tools.0.name").String()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(jsonResp))
+		_, _ = w.Write([]byte(strings.ReplaceAll(jsonResp, `"Bash"`, `"`+upstreamToolName+`"`)))
 	}))
 	defer server.Close()
 
@@ -272,7 +274,7 @@ func TestClaudeExecutor_Execute_NonStreamJSONResponseToolNameRestore(t *testing.
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
 		"api_key":  "sk-ant-oat-test-token",
 		"base_url": server.URL,
-	}}
+	}, Metadata: claudeOAuthTestMetadata()}
 	payload := []byte(`{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"run ls"}],"tools":[{"name":"bash","description":"run commands","input_schema":{"type":"object"}}]}`)
 
 	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{

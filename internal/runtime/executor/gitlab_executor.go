@@ -1064,6 +1064,7 @@ func buildGitLabOpenAIGatewayAuth(auth *cliproxyauth.Auth, requestedModel string
 	}
 	nativeAuth.Attributes["api_key"] = token
 	nativeAuth.Attributes["base_url"] = baseURL
+	nativeAuth.Attributes["gitlab_duo_gateway"] = "true"
 	for key, value := range gitLabGatewayHeaders(auth, "openai") {
 		if key == "" || value == "" {
 			continue

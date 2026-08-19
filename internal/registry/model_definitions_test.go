@@ -51,19 +51,29 @@ func TestWithXAIBuiltinsIncludesImage20(t *testing.T) {
 	t.Fatalf("expected xAI builtin model %s", xaiBuiltinImage20ModelID)
 }
 
-func TestWithXAIBuiltinsIncludesVideoPreviewModel(t *testing.T) {
+func TestWithXAIBuiltinsIncludesVideo15GAAndPreviewAlias(t *testing.T) {
 	models := WithXAIBuiltins(nil)
+	foundGA := false
+	foundPreviewAlias := false
 
 	for _, model := range models {
 		if model == nil {
 			continue
 		}
-		if model.ID == xaiBuiltinVideo15PreviewModelID {
-			return
+		if model.ID == xaiBuiltinVideo15ModelID {
+			foundGA = true
+		}
+		if model.ID == xaiBuiltinVideo15PreviewID {
+			foundPreviewAlias = true
 		}
 	}
 
-	t.Fatalf("expected xAI builtin model %s", xaiBuiltinVideo15PreviewModelID)
+	if !foundGA {
+		t.Fatalf("expected xAI builtin model %s", xaiBuiltinVideo15ModelID)
+	}
+	if !foundPreviewAlias {
+		t.Fatalf("expected xAI builtin compatibility alias %s", xaiBuiltinVideo15PreviewID)
+	}
 }
 
 func TestGetKiroModelsReturnsStaticFallbackSet(t *testing.T) {

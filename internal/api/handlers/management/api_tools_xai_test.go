@@ -88,7 +88,7 @@ func TestResolveTokenForAuth_XAIOAuthLegacyMetadataRefreshes(t *testing.T) {
 	auth := xaiOAuthLegacyMetadataAuth(tokenServer.URL, "legacy-refresh-token-unique-a")
 	h := &Handler{cfg: &config.Config{}}
 
-	token, err := h.resolveTokenForAuth(context.Background(), auth)
+	token, err := h.resolveTokenForAuth(context.Background(), auth, "")
 	if err != nil {
 		t.Fatalf("resolveTokenForAuth() error = %v", err)
 	}
@@ -118,7 +118,7 @@ func TestResolveTokenForAuth_XAIOAuthExpiredRefreshes(t *testing.T) {
 	auth.Metadata["refresh_token"] = "expired-refresh-token-unique-b"
 	h := &Handler{cfg: &config.Config{}}
 
-	token, err := h.resolveTokenForAuth(context.Background(), auth)
+	token, err := h.resolveTokenForAuth(context.Background(), auth, "")
 	if err != nil {
 		t.Fatalf("resolveTokenForAuth() error = %v", err)
 	}
@@ -147,7 +147,7 @@ func TestResolveTokenForAuth_XAIOAuthStillValidSkipsRefresh(t *testing.T) {
 	auth := xaiOAuthTestAuth(tokenServer.URL, false)
 	h := &Handler{cfg: &config.Config{}}
 
-	token, err := h.resolveTokenForAuth(context.Background(), auth)
+	token, err := h.resolveTokenForAuth(context.Background(), auth, "")
 	if err != nil {
 		t.Fatalf("resolveTokenForAuth() error = %v", err)
 	}
@@ -180,7 +180,7 @@ func TestResolveTokenForAuth_XAIAPIKeySkipsRefresh(t *testing.T) {
 	}
 	h := &Handler{cfg: &config.Config{}}
 
-	token, err := h.resolveTokenForAuth(context.Background(), auth)
+	token, err := h.resolveTokenForAuth(context.Background(), auth, "")
 	if err != nil {
 		t.Fatalf("resolveTokenForAuth() error = %v", err)
 	}
@@ -203,7 +203,7 @@ func TestResolveTokenForAuth_XAIRefreshErrorDoesNotLeakSecret(t *testing.T) {
 	auth.Metadata["refresh_token"] = "error-refresh-token-unique-c"
 	h := &Handler{cfg: &config.Config{}}
 
-	_, err := h.resolveTokenForAuth(context.Background(), auth)
+	_, err := h.resolveTokenForAuth(context.Background(), auth, "")
 	if err == nil {
 		t.Fatal("expected refresh error")
 	}
@@ -231,7 +231,7 @@ func TestResolveTokenForAuth_XAIRetainsRefreshTokenWhenUpstreamOmitsIt(t *testin
 	auth.Metadata["refresh_token"] = "retain-refresh-token-unique-d"
 	h := &Handler{cfg: &config.Config{}}
 
-	token, err := h.resolveTokenForAuth(context.Background(), auth)
+	token, err := h.resolveTokenForAuth(context.Background(), auth, "")
 	if err != nil {
 		t.Fatalf("resolveTokenForAuth() error = %v", err)
 	}
