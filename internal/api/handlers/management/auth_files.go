@@ -4784,12 +4784,22 @@ func (h *Handler) RequestCursorToken(c *gin.Context) {
 
 	state := fmt.Sprintf("cur-%d", time.Now().UnixNano())
 	RegisterOAuthSession(state, "cursor")
+	proxyURL := ""
+	if h != nil && h.cfg != nil {
+		proxyURL = h.cfg.ProxyURL
+	}
 
 	go func() {
 		log.Info("Waiting for Cursor authentication...")
 		log.Infof("Open this URL in your browser: %s", authParams.LoginURL)
 
-		tokens, errPoll := cursorauth.PollForAuth(ctx, authParams.UUID, authParams.Verifier)
+		httpClient, errClient := cursorauth.NewHTTPClient(proxyURL, 10*time.Second)
+		if errClient != nil {
+			SetOAuthSessionError(state, "Authentication failed: "+errClient.Error())
+			log.Errorf("Cursor authentication failed: %v", errClient)
+			return
+		}
+		tokens, errPoll := cursorauth.PollForAuthWithClient(ctx, authParams.UUID, authParams.Verifier, httpClient)
 		if errPoll != nil {
 			SetOAuthSessionError(state, "Authentication failed: "+errPoll.Error())
 			log.Errorf("Cursor authentication failed: %v", errPoll)

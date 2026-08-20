@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -23,10 +22,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
-	"golang.org/x/net/http2"
 )
 
 const (
@@ -217,7 +216,11 @@ func (e *CursorExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	if err := e.PrepareRequest(req, auth); err != nil {
 		return nil, err
 	}
-	return http.DefaultClient.Do(req)
+	httpClient, err := cursorauth.NewHTTPClient(cursorProxyURL(e.cfg, auth), 0)
+	if err != nil {
+		return nil, err
+	}
+	return httpClient.Do(req)
 }
 
 // CountTokens estimates token count locally using tiktoken.
@@ -258,7 +261,11 @@ func (e *CursorExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 		return nil, fmt.Errorf("cursor: no refresh token available")
 	}
 
-	tokens, err := cursorauth.RefreshToken(ctx, refreshToken)
+	httpClient, err := cursorauth.NewHTTPClient(cursorProxyURL(e.cfg, auth), 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	tokens, err := cursorauth.RefreshTokenWithClient(ctx, refreshToken, httpClient)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +318,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	requestBytes := cursorproto.EncodeRunRequest(params)
 	framedRequest := cursorproto.FrameConnectMessage(requestBytes, 0)
 
-	stream, err := openCursorH2Stream(accessToken)
+	stream, err := openCursorH2Stream(ctx, e.cfg, auth, accessToken)
 	if err != nil {
 		return resp, err
 	}
@@ -508,7 +515,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	requestBytes := cursorproto.EncodeRunRequest(params)
 	framedRequest := cursorproto.FrameConnectMessage(requestBytes, 0)
 
-	stream, err := openCursorH2Stream(accessToken)
+	stream, err := openCursorH2Stream(ctx, e.cfg, auth, accessToken)
 	if err != nil {
 		return nil, err
 	}
@@ -800,9 +807,29 @@ func (e *CursorExecutor) resumeWithToolResults(
 
 // --- H2Stream helpers ---
 
-func openCursorH2Stream(accessToken string) (*cursorproto.H2Stream, error) {
+func openCursorH2Stream(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, accessToken string) (*cursorproto.H2Stream, error) {
 	headers := cursorRequestHeaders(accessToken, cursorRunPath)
-	return cursorproto.DialH2Stream("api2.cursor.sh", headers)
+	proxyURL := cursorProxyURL(cfg, auth)
+	dialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
+	if errBuild != nil {
+		return nil, fmt.Errorf("cursor: configure proxy: %w", errBuild)
+	}
+	if mode == proxyutil.ModeProxy {
+		log.Debugf("cursor: opening H2 stream through proxy %s", proxyutil.Redact(proxyURL))
+	}
+	return cursorproto.DialH2StreamWithDialer(ctx, "api2.cursor.sh", headers, dialer)
+}
+
+func cursorProxyURL(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if auth != nil {
+		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+			return proxyURL
+		}
+	}
+	if cfg != nil {
+		return strings.TrimSpace(cfg.ProxyURL)
+	}
+	return ""
 }
 
 // cursorRequestHeaders mirrors Cursor IDE transport headers (not the CLI surface).
@@ -1445,14 +1472,6 @@ func applyCursorHeaders(req *http.Request, accessToken string) {
 	}
 }
 
-func newH2Client() *http.Client {
-	return &http.Client{
-		Transport: &http2.Transport{
-			TLSClientConfig: &tls.Config{},
-		},
-	}
-}
-
 // extractCCH extracts the cch value from the system prompt's billing header.
 func extractCCH(systemPrompt string) string {
 	idx := strings.Index(systemPrompt, "cch=")
@@ -1716,7 +1735,12 @@ func FetchCursorModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	return fetchCursorModels(ctx, authID, accessToken, newH2Client(), cursorAPIURL+cursorModelsPath)
+	httpClient, errClient := cursorauth.NewHTTPClient(cursorProxyURL(cfg, auth), 0)
+	if errClient != nil {
+		log.Debugf("cursor: failed to configure models proxy: %v", errClient)
+		return cursorModelsOrFallback(authID)
+	}
+	return fetchCursorModels(ctx, authID, accessToken, httpClient, cursorAPIURL+cursorModelsPath)
 }
 
 func fetchCursorModels(ctx context.Context, authID, accessToken string, client *http.Client, modelsURL string) []*registry.ModelInfo {

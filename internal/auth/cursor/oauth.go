@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 )
 
 const (
@@ -81,10 +83,17 @@ func GenerateAuthParams() (*AuthParams, error) {
 
 // PollForAuth polls the Cursor auth endpoint until the user completes login.
 func PollForAuth(ctx context.Context, uuid, verifier string) (*TokenPair, error) {
+	return PollForAuthWithClient(ctx, uuid, verifier, &http.Client{Timeout: 10 * time.Second})
+}
+
+// PollForAuthWithClient polls the Cursor auth endpoint with a caller-provided client.
+func PollForAuthWithClient(ctx context.Context, uuid, verifier string, client *http.Client) (*TokenPair, error) {
 	delay := pollBaseDelay
 	consecutiveErrors := 0
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
 
 	for attempt := 0; attempt < pollMaxAttempts; attempt++ {
 		select {
@@ -136,7 +145,14 @@ func PollForAuth(ctx context.Context, uuid, verifier string) (*TokenPair, error)
 
 // RefreshToken refreshes a Cursor access token using the refresh token.
 func RefreshToken(ctx context.Context, refreshToken string) (*TokenPair, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	return RefreshTokenWithClient(ctx, refreshToken, &http.Client{Timeout: 10 * time.Second})
+}
+
+// RefreshTokenWithClient refreshes a Cursor access token with a caller-provided client.
+func RefreshTokenWithClient(ctx context.Context, refreshToken string, client *http.Client) (*TokenPair, error) {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, CursorRefreshURL,
 		strings.NewReader("{}"))
@@ -169,6 +185,19 @@ func RefreshToken(ctx context.Context, refreshToken string) (*TokenPair, error) 
 	}
 
 	return &tokens, nil
+}
+
+// NewHTTPClient creates a Cursor HTTP client for an explicit proxy setting.
+func NewHTTPClient(proxyURL string, timeout time.Duration) (*http.Client, error) {
+	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		return nil, fmt.Errorf("cursor: configure proxy: %w", errBuild)
+	}
+	client := &http.Client{Timeout: timeout}
+	if transport != nil {
+		client.Transport = transport
+	}
+	return client, nil
 }
 
 // ParseJWTSub extracts the "sub" claim from a Cursor JWT access token.

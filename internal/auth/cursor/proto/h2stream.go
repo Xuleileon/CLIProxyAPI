@@ -1,6 +1,7 @@
 package proto
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
+	"golang.org/x/net/proxy"
 )
 
 const (
@@ -51,10 +53,36 @@ func (s *H2Stream) FrameNum() int64 {
 
 // DialH2Stream establishes a TLS+HTTP/2 connection and opens a new stream.
 func DialH2Stream(host string, headers map[string]string) (*H2Stream, error) {
-	tlsConn, err := tls.Dial("tcp", host+":443", &tls.Config{
+	return DialH2StreamWithDialer(context.Background(), host, headers, nil)
+}
+
+// DialH2StreamWithDialer establishes a TLS+HTTP/2 connection through dialer.
+// A nil dialer preserves the existing direct-connect behavior.
+func DialH2StreamWithDialer(ctx context.Context, host string, headers map[string]string, dialer proxy.Dialer) (*H2Stream, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	target := net.JoinHostPort(host, "443")
+	var rawConn net.Conn
+	var err error
+	if dialer == nil {
+		rawConn, err = (&net.Dialer{}).DialContext(ctx, "tcp", target)
+	} else if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+		rawConn, err = contextDialer.DialContext(ctx, "tcp", target)
+	} else {
+		rawConn, err = dialer.Dial("tcp", target)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("h2: TCP dial failed: %w", err)
+	}
+
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		ServerName: host,
 		NextProtos: []string{"h2"},
 	})
-	if err != nil {
+	if err = tlsConn.HandshakeContext(ctx); err != nil {
+		_ = rawConn.Close()
 		return nil, fmt.Errorf("h2: TLS dial failed: %w", err)
 	}
 	if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {

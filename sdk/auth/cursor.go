@@ -62,7 +62,11 @@ func (a CursorAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 	fmt.Println("Waiting for Cursor authorization...")
 
 	// Poll for the auth result
-	tokens, err := cursorauth.PollForAuth(ctx, authParams.UUID, authParams.Verifier)
+	httpClient, err := cursorauth.NewHTTPClient(cfg.ProxyURL, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	tokens, err := cursorauth.PollForAuthWithClient(ctx, authParams.UUID, authParams.Verifier, httpClient)
 	if err != nil {
 		return nil, fmt.Errorf("cursor: authentication failed: %w", err)
 	}
