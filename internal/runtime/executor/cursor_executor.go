@@ -145,6 +145,30 @@ func (e *CursorExecutor) findSessionByConversationLocked(convId string) string {
 	return ""
 }
 
+// findSessionByToolResultsLocked finds the active H2 session whose pending tool
+// call produced one of the returned results. Results are searched newest first
+// because stateless clients resend the full tool history on every request.
+// Caller must hold e.mu.
+func (e *CursorExecutor) findSessionByToolResultsLocked(authID string, results []toolResultInfo) (string, *cursorSession) {
+	for resultIndex := len(results) - 1; resultIndex >= 0; resultIndex-- {
+		toolCallID := results[resultIndex].ToolCallId
+		if toolCallID == "" {
+			continue
+		}
+		for sessionKey, session := range e.sessions {
+			if session == nil || session.authID != authID {
+				continue
+			}
+			for _, pending := range session.pending {
+				if pending.ToolCallId == toolCallID {
+					return sessionKey, session
+				}
+			}
+		}
+	}
+	return "", nil
+}
+
 // cursorStatusErr implements the StatusError and RetryAfter interfaces so the
 // conductor can classify Cursor errors (e.g. 429 → quota cooldown).
 type cursorStatusErr struct {
@@ -430,8 +454,21 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if len(parsed.ToolResults) > 0 {
 		e.mu.Lock()
 		session, hasSession := e.sessions[sessionKey]
+		matchedSessionKey := sessionKey
 		if hasSession {
 			delete(e.sessions, sessionKey)
+		}
+		// Stateless OpenAI-compatible clients do not provide Claude Code's session_id,
+		// so every HTTP request has a fresh conversationId. Match the newest returned
+		// tool_call_id to the pending H2 session instead.
+		if !hasSession && ccSessionId == "" {
+			if matchedKey, matchedSession := e.findSessionByToolResultsLocked(authID, parsed.ToolResults); matchedSession != nil {
+				session = matchedSession
+				hasSession = true
+				matchedSessionKey = matchedKey
+				delete(e.sessions, matchedKey)
+				log.Debugf("cursor: matched stateless tool result to session %s", matchedKey)
+			}
 		}
 		// If no session found for current auth, check for stale sessions from
 		// a different auth on the same conversation (quota failover scenario).
@@ -450,11 +487,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		e.mu.Unlock()
 
 		if hasSession && session.stream != nil && session.authID == authID {
-			log.Debugf("cursor: resuming session %s with %d tool results", sessionKey, len(parsed.ToolResults))
+			log.Debugf("cursor: resuming session %s with %d tool results", matchedSessionKey, len(parsed.ToolResults))
 			return e.resumeWithToolResults(ctx, session, parsed, from, to, req, originalPayload, payload, needsTranslate)
 		}
 		if hasSession && session.authID != authID {
-			log.Warnf("cursor: session %s belongs to auth %s, but request is from %s — skipping resume", sessionKey, session.authID, authID)
+			log.Warnf("cursor: session %s belongs to auth %s, but request is from %s — skipping resume", matchedSessionKey, session.authID, authID)
 		}
 	}
 
