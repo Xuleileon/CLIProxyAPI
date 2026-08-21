@@ -108,15 +108,33 @@ func TestH2StreamPoolReconnectsAfterConnectionLoss(t *testing.T) {
 
 	server.CloseClientConnections()
 	deadline := time.Now().Add(2 * time.Second)
-	for dialer.dials.Load() < 2 && time.Now().Before(deadline) {
+	reconnected := false
+	var lastErr error
+	for time.Now().Before(deadline) {
 		second, openErr := pool.Open(ctx, "account|direct", "api2.cursor.sh", headers, dialer)
-		if openErr == nil {
-			if writeErr := second.Write([]byte("reconnected")); writeErr == nil && readH2StreamText(t, second) == "ack:reconnected" {
-				second.Close()
-				break
-			}
-			second.Close()
+		if openErr != nil {
+			lastErr = openErr
+			continue
 		}
+		writeErr := second.Write([]byte("reconnected"))
+		if writeErr == nil {
+			var response string
+			response, lastErr = readH2StreamTextResult(second)
+			if lastErr == nil && response == "ack:reconnected" {
+				reconnected = true
+			} else if lastErr == nil {
+				lastErr = fmt.Errorf("unexpected response %q", response)
+			}
+		} else {
+			lastErr = writeErr
+		}
+		second.Close()
+		if reconnected {
+			break
+		}
+	}
+	if !reconnected {
+		t.Fatalf("stream did not reconnect: %v", lastErr)
 	}
 	if got := dialer.dials.Load(); got < 2 {
 		t.Fatalf("TLS dial count = %d, want a new connection after connection loss", got)
@@ -181,6 +199,14 @@ func newH2EchoServer(t *testing.T) *httptest.Server {
 
 func readH2StreamText(t *testing.T, stream *H2Stream) string {
 	t.Helper()
+	result, err := readH2StreamTextResult(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func readH2StreamTextResult(stream *H2Stream) (string, error) {
 	var result strings.Builder
 	timer := time.NewTimer(3 * time.Second)
 	defer timer.Stop()
@@ -189,16 +215,16 @@ func readH2StreamText(t *testing.T, stream *H2Stream) string {
 		case chunk, ok := <-stream.Data():
 			if !ok {
 				if err := stream.Err(); err != nil {
-					t.Fatalf("stream closed with error: %v", err)
+					return result.String(), fmt.Errorf("stream closed with error: %w", err)
 				}
-				return result.String()
+				return result.String(), nil
 			}
 			result.Write(chunk)
 			if strings.HasPrefix(result.String(), "ack:") {
-				return result.String()
+				return result.String(), nil
 			}
 		case <-timer.C:
-			t.Fatalf("timed out waiting for stream response; err=%v", stream.Err())
+			return result.String(), fmt.Errorf("timed out waiting for stream response; err=%v", stream.Err())
 		}
 	}
 }
