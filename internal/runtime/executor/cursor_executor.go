@@ -429,7 +429,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	requestBytes := cursorproto.EncodeRunRequest(params)
 	framedRequest := cursorproto.FrameConnectMessage(requestBytes, 0)
-	log.Debugf("cursor: encoded Run request bytes=%d userTextBytes=%d checkpoint=%t", len(requestBytes), len(params.UserText), len(params.RawCheckpoint) > 0)
+	log.Debugf("cursor: encoded Run request bytes=%d userTextBytes=%d checkpoint=%t conv=%s", len(requestBytes), len(params.UserText), len(params.RawCheckpoint) > 0, conversationId)
 
 	stream, err := openCursorH2Stream(ctx, e.cfg, auth, accessToken)
 	if err != nil {
@@ -671,7 +671,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	requestBytes := cursorproto.EncodeRunRequest(params)
 	framedRequest := cursorproto.FrameConnectMessage(requestBytes, 0)
-	log.Debugf("cursor: encoded Run request bytes=%d userTextBytes=%d checkpoint=%t", len(requestBytes), len(params.UserText), len(params.RawCheckpoint) > 0)
+	log.Debugf("cursor: encoded Run request bytes=%d userTextBytes=%d checkpoint=%t conv=%s", len(requestBytes), len(params.UserText), len(params.RawCheckpoint) > 0, conversationId)
 
 	requestStartedAt := time.Now()
 	stream, err := openCursorH2Stream(ctx, e.cfg, auth, accessToken)
