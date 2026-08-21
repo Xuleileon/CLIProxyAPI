@@ -196,7 +196,6 @@ func decodeInteractionUpdate(data []byte, msg *DecodedServerMessage) {
 				// step_completed - ignore
 				log.Debugf("decodeInteractionUpdate: StepCompletedUpdate (ignored)")
 			default:
-				log.Debugf("decodeInteractionUpdate: unknown field %d", num)
 			}
 		} else {
 			n := protowire.ConsumeFieldValue(num, typ, data)
@@ -309,9 +308,6 @@ func decodeExecServerMessage(data []byte, msg *DecodedServerMessage) {
 				return
 			}
 			data = data[n:]
-
-			// Debug: log all fields found in ExecServerMessage
-			log.Debugf("decodeExecServerMessage: found field %d, len=%d, first 20 bytes: %x", num, len(val), val[:min(20, len(val))])
 
 			switch num {
 			case ESM_ExecId:

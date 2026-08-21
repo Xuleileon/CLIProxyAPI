@@ -1153,11 +1153,7 @@ func processH2SessionFrames(
 				log.Debugf("cursor: processH2SessionFrames[%s]: exiting: stream data channel closed", stream.ID())
 				return stream.Err() // may be RST_STREAM, GOAWAY, or nil for clean close
 			}
-			// Log first 20 bytes of raw data for debugging
-			previewLen := min(20, len(data))
-			log.Debugf("cursor: processH2SessionFrames[%s]: received %d bytes from dataCh, first bytes: %x (%q)", stream.ID(), len(data), data[:previewLen], string(data[:previewLen]))
 			buf.Write(data)
-			log.Debugf("cursor: processH2SessionFrames[%s]: buf total=%d", stream.ID(), buf.Len())
 
 			var pendingBatch []pendingMcpExec
 			turnEnded := false
@@ -1174,13 +1170,9 @@ func processH2SessionFrames(
 					}
 					flags, payload, consumed, ok := cursorproto.ParseConnectFrame(currentBuf)
 					if !ok {
-						// Log detailed info about why parsing failed
-						previewLen := min(20, len(currentBuf))
-						log.Debugf("cursor: incomplete frame in buffer, waiting for more data (buf=%d bytes, first bytes: %x = %q)", len(currentBuf), currentBuf[:previewLen], string(currentBuf[:previewLen]))
 						break
 					}
 					buf.Next(consumed)
-					log.Debugf("cursor: parsed Connect frame flags=0x%02x payload=%d bytes consumed=%d", flags, len(payload), consumed)
 
 					if flags&cursorproto.ConnectEndStreamFlag != 0 {
 						if err := cursorproto.ParseConnectEndStream(payload); err != nil {
@@ -1196,7 +1188,6 @@ func processH2SessionFrames(
 						continue
 					}
 
-					log.Debugf("cursor: decoded server message type=%d", msg.Type)
 					switch msg.Type {
 					case cursorproto.ServerMsgTextDelta:
 						if msg.Text != "" && onText != nil {
