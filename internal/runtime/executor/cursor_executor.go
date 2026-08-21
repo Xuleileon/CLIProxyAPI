@@ -1270,7 +1270,14 @@ func processH2SessionFrames(
 							if tr.ToolCallId == pending.ToolCallId {
 								log.Debugf("cursor: sending inline MCP result for tool=%s", pending.ToolName)
 								resultBytes := cursorproto.EncodeExecMcpResult(pending.ExecMsgId, pending.ExecId, tr.Content, false)
-								stream.Write(cursorproto.FrameConnectMessage(resultBytes, 0))
+								if err := stream.Write(cursorproto.FrameConnectMessage(resultBytes, 0)); err != nil {
+									return fmt.Errorf("cursor: write MCP result: %w", err)
+								}
+								closeBytes := cursorproto.EncodeExecStreamClose(pending.ExecMsgId)
+								if err := stream.Write(cursorproto.FrameConnectMessage(closeBytes, 0)); err != nil {
+									return fmt.Errorf("cursor: close MCP exec stream: %w", err)
+								}
+								log.Debugf("cursor: closed inline MCP exec stream id=%d tool=%s", pending.ExecMsgId, pending.ToolName)
 								break
 							}
 						}

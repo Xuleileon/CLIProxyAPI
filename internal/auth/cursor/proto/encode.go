@@ -519,6 +519,20 @@ func EncodeExecMcpError(execMsgId uint32, execId string, errMsg string) []byte {
 	return encodeExecClientMsg(execMsgId, execId, "mcp_result", result)
 }
 
+// EncodeExecStreamClose marks an exec stream complete after its final result.
+// Cursor's native client emits this control message for every completed exec.
+func EncodeExecStreamClose(execMsgId uint32) []byte {
+	streamClose := newMsg("ExecClientStreamClose")
+	setUint32(streamClose, "id", execMsgId)
+
+	control := newMsg("ExecClientControlMessage")
+	setMsg(control, "stream_close", streamClose)
+
+	acm := newMsg("AgentClientMessage")
+	setMsg(acm, "exec_client_control_message", control)
+	return marshal(acm)
+}
+
 // --- Rejection encoders (mirror handleExecMessage rejections) ---
 
 func EncodeExecReadRejected(execMsgId uint32, execId string, path, reason string) []byte {
