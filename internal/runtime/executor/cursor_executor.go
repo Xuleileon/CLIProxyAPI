@@ -98,17 +98,19 @@ func (e *CursorExecutor) Identifier() string { return cursorAuthType }
 // CloseExecutionSession implements ExecutionSessionCloser.
 func (e *CursorExecutor) CloseExecutionSession(sessionID string) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	var sessions []*cursorSession
 	if sessionID == cliproxyauth.CloseAllExecutionSessionsID {
 		for k, s := range e.sessions {
-			s.cancel()
+			sessions = append(sessions, s)
 			delete(e.sessions, k)
 		}
-		return
-	}
-	if s, ok := e.sessions[sessionID]; ok {
-		s.cancel()
+	} else if s, ok := e.sessions[sessionID]; ok {
+		sessions = append(sessions, s)
 		delete(e.sessions, sessionID)
+	}
+	e.mu.Unlock()
+	for _, session := range sessions {
+		closeCursorSession(session)
 	}
 }
 
@@ -117,9 +119,10 @@ func (e *CursorExecutor) cleanupLoop() {
 	defer ticker.Stop()
 	for range ticker.C {
 		e.mu.Lock()
+		var expired []*cursorSession
 		for k, s := range e.sessions {
 			if time.Since(s.createdAt) > cursorSessionTTL {
-				s.cancel()
+				expired = append(expired, s)
 				delete(e.sessions, k)
 			}
 		}
@@ -129,7 +132,52 @@ func (e *CursorExecutor) cleanupLoop() {
 			}
 		}
 		e.mu.Unlock()
+		for _, session := range expired {
+			closeCursorSession(session)
+		}
 	}
+}
+
+func closeCursorSession(session *cursorSession) {
+	if session == nil {
+		return
+	}
+	if session.cancel != nil {
+		session.cancel()
+	}
+	if session.stream != nil {
+		session.stream.Close()
+	}
+}
+
+func (e *CursorExecutor) hasPendingSessionForStreamLocked(stream *cursorproto.H2Stream) bool {
+	for _, session := range e.sessions {
+		if session != nil && session.stream == stream && len(session.pending) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *CursorExecutor) closeStreamWhenDownstreamEnds(ctx context.Context, stream *cursorproto.H2Stream, cancel context.CancelFunc) {
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-stream.Done():
+			return
+		}
+
+		e.mu.Lock()
+		waitingForTool := e.hasPendingSessionForStreamLocked(stream)
+		e.mu.Unlock()
+		if waitingForTool {
+			return
+		}
+
+		log.Debugf("cursor: downstream ended with no pending tool call; closing H2 stream %s", stream.ID())
+		cancel()
+		stream.Close()
+	}()
 }
 
 // findSessionByConversationLocked searches for a session matching the given
@@ -455,6 +503,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		e.mu.Lock()
 		session, hasSession := e.sessions[sessionKey]
 		matchedSessionKey := sessionKey
+		matchedStateless := false
 		if hasSession {
 			delete(e.sessions, sessionKey)
 		}
@@ -465,6 +514,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if matchedKey, matchedSession := e.findSessionByToolResultsLocked(authID, parsed.ToolResults); matchedSession != nil {
 				session = matchedSession
 				hasSession = true
+				matchedStateless = true
 				matchedSessionKey = matchedKey
 				delete(e.sessions, matchedKey)
 				log.Debugf("cursor: matched stateless tool result to session %s", matchedKey)
@@ -487,8 +537,17 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		e.mu.Unlock()
 
 		if hasSession && session.stream != nil && session.authID == authID {
-			log.Debugf("cursor: resuming session %s with %d tool results", matchedSessionKey, len(parsed.ToolResults))
-			return e.resumeWithToolResults(ctx, session, parsed, from, to, req, originalPayload, payload, needsTranslate)
+			if matchedStateless {
+				// Cursor's inline MCP continuation can acknowledge the result but then
+				// emit only heartbeats until the downstream request times out. Stateless
+				// clients already resend the complete tool history, so close the old H2
+				// stream and continue immediately in a fresh request with that history.
+				log.Debugf("cursor: replacing stateless MCP session %s with a fresh continuation", matchedSessionKey)
+				closeCursorSession(session)
+			} else {
+				log.Debugf("cursor: resuming session %s with %d tool results", matchedSessionKey, len(parsed.ToolResults))
+				return e.resumeWithToolResults(ctx, session, parsed, from, to, req, originalPayload, payload, needsTranslate)
+			}
 		}
 		if hasSession && session.authID != authID {
 			log.Warnf("cursor: session %s belongs to auth %s, but request is from %s — skipping resume", matchedSessionKey, session.authID, authID)
@@ -569,6 +628,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Mirrors the TS plugin's setInterval-based heartbeat that lives independently of HTTP responses.
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	go cursorH2Heartbeat(sessionCtx, stream)
+	e.closeStreamWhenDownstreamEnds(ctx, stream, sessionCancel)
 
 	chunks := make(chan cliproxyexecutor.StreamChunk, 64)
 	chatId := "chatcmpl-" + uuid.New().String()[:28]
@@ -685,15 +745,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				sendChunkSwitchable(`{}`, `"tool_calls"`)
 				sendDoneSwitchable()
 
-				// Close current output to end the current HTTP SSE response
-				outMu.Lock()
-				if currentOut != nil {
-					close(currentOut)
-					currentOut = nil
-				}
-				outMu.Unlock()
-
-				// Create new resume output channel, reuse the same toolResultCh
+				// Register the pending tool call before closing the current HTTP
+				// response. The downstream cancellation watcher can then distinguish a
+				// normal tool boundary from a user cancellation without a race.
 				resumeOut := make(chan cliproxyexecutor.StreamChunk, 64)
 				log.Debugf("cursor: saving session %s for MCP tool resume (tool=%s)", sessionKey, exec.ToolName)
 				e.mu.Lock()
@@ -721,6 +775,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				e.mu.Unlock()
 				resumeOutCh = resumeOut
+
+				// Close current output to end the current HTTP SSE response.
+				outMu.Lock()
+				if currentOut != nil {
+					close(currentOut)
+					currentOut = nil
+				}
+				outMu.Unlock()
 
 				// processH2SessionFrames will now block on toolResultCh (inline wait loop)
 				// while continuing to handle KV messages
@@ -1299,42 +1361,45 @@ func parseOpenAIRequest(payload []byte) *parsedOpenAIRequest {
 	return p
 }
 
-// bakeToolResultsIntoTurns merges tool results into the last turn's assistant text
-// when there's no active H2 session to resume. This ensures the model sees the
-// full tool interaction context in a new conversation.
 // flattenConversationIntoUserText flattens the full conversation history
-// (turns + tool results) into the UserText field as plain text.
+// into the UserText field as plain text while preserving tool call order.
 // This is the fallback for cold resume when no checkpoint is available.
 // Cursor reliably reads UserText but ignores structured turns.
 func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 	var buf strings.Builder
-
-	// Flatten turns into readable context
-	for _, turn := range parsed.Turns {
-		if turn.UserText != "" {
-			buf.WriteString("USER: ")
-			buf.WriteString(turn.UserText)
-			buf.WriteString("\n\n")
-		}
-		if turn.AssistantText != "" {
-			buf.WriteString("ASSISTANT: ")
-			buf.WriteString(turn.AssistantText)
-			buf.WriteString("\n\n")
+	currentUserIndex := -1
+	if parsed.UserText != "" {
+		for index := len(parsed.Messages) - 1; index >= 0; index-- {
+			if parsed.Messages[index].Get("role").String() == "user" {
+				currentUserIndex = index
+				break
+			}
 		}
 	}
 
-	// Flatten tool results
-	for _, tr := range parsed.ToolResults {
-		buf.WriteString("TOOL_RESULT (call_id: ")
-		buf.WriteString(tr.ToolCallId)
-		buf.WriteString("): ")
-		// Truncate very large tool results to avoid overwhelming the context
-		content := tr.Content
-		if len(content) > 8000 {
-			content = content[:8000] + "\n... [truncated]"
+	for index, message := range parsed.Messages {
+		role := message.Get("role").String()
+		switch role {
+		case "system":
+			continue
+		case "user":
+			if index == currentUserIndex {
+				continue
+			}
+			appendCursorHistorySection(&buf, "USER", extractTextContent(message.Get("content")))
+		case "assistant":
+			appendCursorHistorySection(&buf, "ASSISTANT", extractTextContent(message.Get("content")))
+			for _, toolCall := range message.Get("tool_calls").Array() {
+				callID := toolCall.Get("id").String()
+				name := toolCall.Get("function.name").String()
+				arguments := truncateCursorHistoryText(toolCall.Get("function.arguments").String())
+				fmt.Fprintf(&buf, "ASSISTANT_TOOL_CALL (call_id: %s, name: %s): %s\n\n", callID, name, arguments)
+			}
+		case "tool":
+			callID := message.Get("tool_call_id").String()
+			content := truncateCursorHistoryText(extractTextContent(message.Get("content")))
+			fmt.Fprintf(&buf, "TOOL_RESULT (call_id: %s): %s\n\n", callID, content)
 		}
-		buf.WriteString(content)
-		buf.WriteString("\n\n")
 	}
 
 	if buf.Len() > 0 {
@@ -1352,6 +1417,25 @@ func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 	// Clear turns and tool results since they're now in UserText
 	parsed.Turns = nil
 	parsed.ToolResults = nil
+}
+
+func appendCursorHistorySection(buf *strings.Builder, label, content string) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return
+	}
+	buf.WriteString(label)
+	buf.WriteString(": ")
+	buf.WriteString(truncateCursorHistoryText(content))
+	buf.WriteString("\n\n")
+}
+
+func truncateCursorHistoryText(content string) string {
+	const maxHistoryItemBytes = 8000
+	if len(content) <= maxHistoryItemBytes {
+		return content
+	}
+	return content[:maxHistoryItemBytes] + "\n... [truncated]"
 }
 
 func extractTextContent(content gjson.Result) string {
