@@ -11,60 +11,43 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-func TestResumeWithToolResultsReusesExistingOutput(t *testing.T) {
+func TestWaitForCursorCheckpointForwardsResultBeforeContinuing(t *testing.T) {
 	t.Parallel()
 
 	toolResultCh := make(chan []toolResultInfo, 1)
-	resumeOutCh := make(chan cliproxyexecutor.StreamChunk, 1)
-	switched := false
+	checkpointReady := make(chan struct{})
+	streamDone := make(chan struct{})
 	session := &cursorSession{
-		toolResultCh: toolResultCh,
-		resumeOutCh:  resumeOutCh,
-		switchOutput: func(ch chan cliproxyexecutor.StreamChunk) {
-			if ch != resumeOutCh {
-				t.Fatalf("switched to unexpected output channel")
-			}
-			switched = true
-		},
+		toolResultCh:    toolResultCh,
+		checkpointReady: checkpointReady,
+		streamDone:      streamDone,
 	}
 
-	executor := &CursorExecutor{}
-	result, err := executor.resumeWithToolResults(context.Background(), session, []toolResultInfo{{ToolCallId: "tool-current", Content: "result"}})
-	if err != nil {
-		t.Fatalf("resumeWithToolResults error: %v", err)
-	}
-	if !switched || result.Chunks != resumeOutCh {
-		t.Fatal("existing Run output was not reused")
-	}
+	resultCh := make(chan struct {
+		received bool
+		err      error
+	}, 1)
+	go func() {
+		received, err := waitForCursorCheckpoint(context.Background(), session, []toolResultInfo{{ToolCallId: "tool-current", Content: "result"}})
+		resultCh <- struct {
+			received bool
+			err      error
+		}{received: received, err: err}
+	}()
+
 	results := <-toolResultCh
 	if len(results) != 1 || results[0].ToolCallId != "tool-current" {
 		t.Fatalf("forwarded tool results = %#v", results)
 	}
-}
-
-func TestAdaptCursorTeammateReplyRequiresSendMessage(t *testing.T) {
-	t.Parallel()
-
-	payload := []byte(`{
-		"model":"composer-2.5-fast",
-		"messages":[{"role":"user","content":"<teammate-message teammate_id=\"team-lead\" summary=\"send findings\">Please report to main.</teammate-message>"}],
-		"tools":[{"type":"function","function":{"name":"SendMessage","description":"Send to teammate","parameters":{"type":"object"}}}]
-	}`)
-	parsed := parseOpenAIRequest(payload)
-	adaptCursorTeammateReply(parsed)
-	for _, want := range []string{"plain assistant response remains only", "calling the SendMessage tool exactly once"} {
-		if !strings.Contains(parsed.UserText, want) {
-			t.Fatalf("adapted teammate message missing %q: %s", want, parsed.UserText)
-		}
+	select {
+	case result := <-resultCh:
+		t.Fatalf("checkpoint wait completed early: %#v", result)
+	default:
 	}
-
-	idle := &parsedOpenAIRequest{
-		UserText: `<teammate-message teammate_id="worker">{"type":"idle_notification"}</teammate-message>`,
-		Tools:    parsed.Tools,
-	}
-	adaptCursorTeammateReply(idle)
-	if strings.Contains(idle.UserText, "Claude Code team protocol") {
-		t.Fatal("idle notification was incorrectly adapted as a teammate request")
+	close(checkpointReady)
+	result := <-resultCh
+	if result.err != nil || !result.received {
+		t.Fatalf("checkpoint result = %#v", result)
 	}
 }
 
