@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -9,6 +10,46 @@ import (
 	cursorproto "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor/proto"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+func TestWaitForCursorCheckpointForwardsResultBeforeContinuing(t *testing.T) {
+	t.Parallel()
+
+	toolResultCh := make(chan []toolResultInfo, 1)
+	checkpointReady := make(chan struct{})
+	streamDone := make(chan struct{})
+	session := &cursorSession{
+		toolResultCh:    toolResultCh,
+		checkpointReady: checkpointReady,
+		streamDone:      streamDone,
+	}
+
+	resultCh := make(chan struct {
+		received bool
+		err      error
+	}, 1)
+	go func() {
+		received, err := waitForCursorCheckpoint(context.Background(), session, []toolResultInfo{{ToolCallId: "tool-current", Content: "result"}})
+		resultCh <- struct {
+			received bool
+			err      error
+		}{received: received, err: err}
+	}()
+
+	results := <-toolResultCh
+	if len(results) != 1 || results[0].ToolCallId != "tool-current" {
+		t.Fatalf("forwarded tool results = %#v", results)
+	}
+	select {
+	case result := <-resultCh:
+		t.Fatalf("checkpoint wait completed early: %#v", result)
+	default:
+	}
+	close(checkpointReady)
+	result := <-resultCh
+	if result.err != nil || !result.received {
+		t.Fatalf("checkpoint result = %#v", result)
+	}
+}
 
 func TestFindSessionByToolResultsLockedUsesNewestMatchingResult(t *testing.T) {
 	t.Parallel()
@@ -48,6 +89,11 @@ func TestFindSessionByToolResultsLockedRejectsUnmatchedOrForeignResults(t *testi
 			authID:  "other-account",
 			pending: []pendingMcpExec{{ToolCallId: "tool-foreign"}},
 		},
+		"cursor-account:resuming": {
+			authID:   "cursor-account",
+			pending:  []pendingMcpExec{{ToolCallId: "tool-busy"}},
+			resuming: true,
+		},
 	}}
 
 	for _, results := range [][]toolResultInfo{
@@ -55,6 +101,7 @@ func TestFindSessionByToolResultsLockedRejectsUnmatchedOrForeignResults(t *testi
 		{{ToolCallId: ""}},
 		{{ToolCallId: "tool-missing"}},
 		{{ToolCallId: "tool-foreign"}},
+		{{ToolCallId: "tool-busy"}},
 	} {
 		if key, session := executor.findSessionByToolResultsLocked("cursor-account", results); key != "" || session != nil {
 			t.Fatalf("unexpected session match for %#v: key=%q session=%p", results, key, session)

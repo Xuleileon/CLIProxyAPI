@@ -63,12 +63,46 @@ type savedCheckpoint struct {
 }
 
 type cursorSession struct {
-	stream         *cursorproto.H2Stream
-	pending        []pendingMcpExec
-	cancel         context.CancelFunc // cancels the session-scoped heartbeat (NOT tied to HTTP request)
-	createdAt      time.Time
-	authID         string // auth file ID that created this session (for multi-account isolation)
-	conversationID string // Cursor conversation inherited by fresh tool continuations
+	stream          *cursorproto.H2Stream
+	pending         []pendingMcpExec
+	toolResultCh    chan []toolResultInfo
+	checkpointReady <-chan struct{}
+	streamDone      <-chan struct{}
+	resuming        bool
+	cancel          context.CancelFunc // cancels the session-scoped heartbeat (NOT tied to HTTP request)
+	createdAt       time.Time
+	authID          string // auth file ID that created this session (for multi-account isolation)
+	conversationID  string // Cursor conversation inherited by fresh tool continuations
+}
+
+func waitForCursorCheckpoint(ctx context.Context, session *cursorSession, results []toolResultInfo) (bool, error) {
+	if session == nil || session.toolResultCh == nil {
+		return false, nil
+	}
+	select {
+	case session.toolResultCh <- results:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-session.streamDone:
+		return false, nil
+	}
+
+	if session.checkpointReady == nil {
+		return false, nil
+	}
+	select {
+	case <-session.checkpointReady:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-session.streamDone:
+		select {
+		case <-session.checkpointReady:
+			return true, nil
+		default:
+			return false, nil
+		}
+	}
 }
 
 type pendingMcpExec struct {
@@ -239,7 +273,7 @@ func (e *CursorExecutor) findSessionByToolResultsLocked(authID string, results [
 			continue
 		}
 		for sessionKey, session := range e.sessions {
-			if session == nil || session.authID != authID {
+			if session == nil || session.authID != authID || session.resuming {
 				continue
 			}
 			for _, pending := range session.pending {
@@ -542,8 +576,8 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		e.mu.Lock()
 		session, hasSession := e.sessions[sessionKey]
 		matchedSessionKey := sessionKey
-		if hasSession && sessionMatchesToolResults(session, parsed.ToolResults) {
-			delete(e.sessions, sessionKey)
+		if hasSession && !session.resuming && sessionMatchesToolResults(session, parsed.ToolResults) {
+			session.resuming = true
 		} else {
 			session = nil
 			hasSession = false
@@ -553,7 +587,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				session = matchedSession
 				hasSession = true
 				matchedSessionKey = matchedKey
-				delete(e.sessions, matchedKey)
+				session.resuming = true
 				log.Debugf("cursor: matched tool result lineage to session %s", matchedKey)
 			}
 		}
@@ -581,7 +615,18 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if hasSession && session.stream != nil && session.authID == authID {
 			continuationPending = append([]pendingMcpExec(nil), session.pending...)
 			continuationMatched = true
-			log.Debugf("cursor: replacing MCP session %s with checkpoint continuation", matchedSessionKey)
+			log.Debugf("cursor: forwarding tool result to MCP session %s before checkpoint continuation", matchedSessionKey)
+			checkpointReceived, waitErr := waitForCursorCheckpoint(ctx, session, parsed.ToolResults)
+			e.mu.Lock()
+			if current := e.sessions[matchedSessionKey]; current == session {
+				delete(e.sessions, matchedSessionKey)
+			}
+			e.mu.Unlock()
+			if waitErr != nil {
+				closeCursorSession(session)
+				return nil, fmt.Errorf("cursor: waiting for checkpoint: %w", waitErr)
+			}
+			log.Debugf("cursor: replacing MCP session %s with checkpoint continuation (checkpoint=%t)", matchedSessionKey, checkpointReceived)
 			closeCursorSession(session)
 		}
 		if hasSession && session.authID != authID {
@@ -681,6 +726,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Keep the old stream alive at a tool boundary long enough to receive Cursor's
 	// checkpoint. The next HTTP request closes it and starts a fresh continuation.
 	toolResultCh := make(chan []toolResultInfo, 1)
+	checkpointReady := make(chan struct{})
+	var checkpointReadyOnce sync.Once
+	streamDone := make(chan struct{})
 
 	// The output closes at an MCP tool boundary while the upstream stream remains
 	// available for checkpoint and KV messages.
@@ -747,6 +795,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	go func() {
+		defer close(streamDone)
 		roleSent := false
 		toolCallIndex := 0
 		usage := &cursorTokenUsage{}
@@ -793,12 +842,15 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				log.Debugf("cursor: saving session %s for MCP tool resume (tool=%s)", sessionKey, exec.ToolName)
 				e.mu.Lock()
 				e.sessions[sessionKey] = &cursorSession{
-					stream:         stream,
-					pending:        []pendingMcpExec{exec},
-					cancel:         sessionCancel,
-					createdAt:      time.Now(),
-					authID:         authID,
-					conversationID: conversationId,
+					stream:          stream,
+					pending:         []pendingMcpExec{exec},
+					toolResultCh:    toolResultCh,
+					checkpointReady: checkpointReady,
+					streamDone:      streamDone,
+					cancel:          sessionCancel,
+					createdAt:       time.Now(),
+					authID:          authID,
+					conversationID:  conversationId,
 				}
 				e.mu.Unlock()
 
@@ -825,6 +877,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					updatedAt: time.Now(),
 				}
 				e.mu.Unlock()
+				checkpointReadyOnce.Do(func() { close(checkpointReady) })
 				log.Debugf("cursor: saved checkpoint (%d bytes) for conv=%s auth=%s", len(cpData), checkpointKey, authID)
 			},
 		)
