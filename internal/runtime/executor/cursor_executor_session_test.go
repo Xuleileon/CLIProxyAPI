@@ -11,6 +11,7 @@ import (
 
 	cursorproto "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor/proto"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 func TestResumeWithToolResultsReusesExistingOutput(t *testing.T) {
@@ -495,6 +496,212 @@ func TestEncodeCursorExecCompletionAlwaysClosesExec(t *testing.T) {
 			t.Fatalf("completion kind %d did not end with stream close", pending.Kind)
 		}
 	}
+}
+
+type fakeCursorToolResultStream struct {
+	dataCh chan []byte
+	doneCh chan struct{}
+	writes [][]byte
+}
+
+func (stream *fakeCursorToolResultStream) Data() <-chan []byte   { return stream.dataCh }
+func (stream *fakeCursorToolResultStream) Done() <-chan struct{} { return stream.doneCh }
+func (stream *fakeCursorToolResultStream) Err() error            { return nil }
+func (stream *fakeCursorToolResultStream) Write(data []byte) error {
+	stream.writes = append(stream.writes, append([]byte(nil), data...))
+	return nil
+}
+
+func TestWaitForCursorToolResultsQueuesLateParallelExecBatch(t *testing.T) {
+	t.Parallel()
+
+	stream := &fakeCursorToolResultStream{
+		dataCh: make(chan []byte),
+		doneCh: make(chan struct{}),
+	}
+	toolResultCh := make(chan []toolResultInfo)
+	tools := []cursorproto.McpToolDef{{
+		Name:        "Read",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}`),
+	}}
+
+	type waitResult struct {
+		results []toolResultInfo
+		queued  []pendingMcpExec
+		err     error
+	}
+	outcomeCh := make(chan waitResult, 1)
+	go func() {
+		results, queued, err := waitForCursorToolResults(
+			context.Background(), stream, &bytes.Buffer{}, map[string][]byte{}, tools,
+			toolResultCh, nil, nil,
+		)
+		outcomeCh <- waitResult{results: results, queued: queued, err: err}
+	}()
+
+	var lateBatchFrames []byte
+	for index := 0; index < 8; index++ {
+		lateBatchFrames = append(lateBatchFrames, testCursorReadServerFrame(
+			uint32(index+20),
+			"exec-late-"+string(rune('a'+index)),
+			"tool-late-"+string(rune('a'+index)),
+		)...)
+	}
+	stream.dataCh <- lateBatchFrames
+	wantResults := []toolResultInfo{{ToolCallId: "tool-current", Content: "done"}}
+	toolResultCh <- wantResults
+
+	outcome := <-outcomeCh
+	if outcome.err != nil {
+		t.Fatalf("waitForCursorToolResults() error = %v", outcome.err)
+	}
+	if len(outcome.results) != 1 || outcome.results[0].ToolCallId != "tool-current" {
+		t.Fatalf("returned results = %#v", outcome.results)
+	}
+	if len(outcome.queued) != 8 {
+		t.Fatalf("queued batch size = %d, want 8", len(outcome.queued))
+	}
+	for index, pending := range outcome.queued {
+		wantID := "tool-late-" + string(rune('a'+index))
+		if pending.ToolCallId != wantID || pending.ToolName != "Read" || pending.ExecMsgId != uint32(index+20) {
+			t.Fatalf("queued[%d] = %#v, want tool call %q", index, pending, wantID)
+		}
+	}
+	if len(stream.writes) != 0 {
+		t.Fatalf("late bridged calls emitted %d upstream responses before client execution", len(stream.writes))
+	}
+}
+
+func TestWaitForCursorToolResultsQueuesLateAgentBatch(t *testing.T) {
+	t.Parallel()
+
+	stream := &fakeCursorToolResultStream{
+		dataCh: make(chan []byte),
+		doneCh: make(chan struct{}),
+	}
+	toolResultCh := make(chan []toolResultInfo)
+
+	type waitResult struct {
+		queued []pendingMcpExec
+		err    error
+	}
+	outcomeCh := make(chan waitResult, 1)
+	go func() {
+		_, queued, err := waitForCursorToolResults(
+			context.Background(), stream, &bytes.Buffer{}, map[string][]byte{}, nil,
+			toolResultCh, nil, nil,
+		)
+		outcomeCh <- waitResult{queued: queued, err: err}
+	}()
+
+	var lateBatchFrames []byte
+	for index := 0; index < 8; index++ {
+		lateBatchFrames = append(lateBatchFrames, testCursorMCPServerFrame(
+			uint32(index+40),
+			"exec-agent-"+string(rune('a'+index)),
+			"tool-agent-"+string(rune('a'+index)),
+			"Agent",
+		)...)
+	}
+	stream.dataCh <- lateBatchFrames
+	toolResultCh <- []toolResultInfo{{ToolCallId: "tool-current", Content: "done"}}
+
+	outcome := <-outcomeCh
+	if outcome.err != nil {
+		t.Fatalf("waitForCursorToolResults() error = %v", outcome.err)
+	}
+	if len(outcome.queued) != 8 {
+		t.Fatalf("queued agent batch size = %d, want 8", len(outcome.queued))
+	}
+	for index, pending := range outcome.queued {
+		wantID := "tool-agent-" + string(rune('a'+index))
+		if pending.ToolCallId != wantID || pending.ToolName != "Agent" || pending.Kind != cursorExecMCP {
+			t.Fatalf("queued agent[%d] = %#v, want tool call %q", index, pending, wantID)
+		}
+	}
+	if len(stream.writes) != 0 {
+		t.Fatalf("late agent calls emitted %d upstream responses before client execution", len(stream.writes))
+	}
+}
+
+func TestWaitForCursorToolResultsQueuesFragmentedLateAgentCall(t *testing.T) {
+	t.Parallel()
+
+	stream := &fakeCursorToolResultStream{
+		dataCh: make(chan []byte),
+		doneCh: make(chan struct{}),
+	}
+	toolResultCh := make(chan []toolResultInfo)
+
+	type waitResult struct {
+		queued []pendingMcpExec
+		err    error
+	}
+	outcomeCh := make(chan waitResult, 1)
+	go func() {
+		_, queued, err := waitForCursorToolResults(
+			context.Background(), stream, &bytes.Buffer{}, map[string][]byte{}, nil,
+			toolResultCh, nil, nil,
+		)
+		outcomeCh <- waitResult{queued: queued, err: err}
+	}()
+
+	frame := testCursorMCPServerFrame(60, "exec-agent-fragmented", "tool-agent-fragmented", "Agent")
+	split := len(frame) / 2
+	stream.dataCh <- frame[:split]
+	stream.dataCh <- frame[split:]
+	toolResultCh <- []toolResultInfo{{ToolCallId: "tool-current", Content: "done"}}
+
+	outcome := <-outcomeCh
+	if outcome.err != nil {
+		t.Fatalf("waitForCursorToolResults() error = %v", outcome.err)
+	}
+	if len(outcome.queued) != 1 || outcome.queued[0].ToolCallId != "tool-agent-fragmented" {
+		t.Fatalf("fragmented queued batch = %#v", outcome.queued)
+	}
+}
+
+func testCursorReadServerFrame(messageID uint32, execID, toolCallID string) []byte {
+	var args []byte
+	args = appendCursorTestString(args, cursorproto.RA_Path, "README.md")
+	args = appendCursorTestString(args, cursorproto.RA_ToolCallID, toolCallID)
+
+	var exec []byte
+	exec = appendCursorTestVarint(exec, cursorproto.ESM_Id, uint64(messageID))
+	exec = appendCursorTestBytes(exec, cursorproto.ESM_ReadArgs, args)
+	exec = appendCursorTestString(exec, cursorproto.ESM_ExecId, execID)
+
+	serverMessage := appendCursorTestBytes(nil, cursorproto.ASM_ExecServerMessage, exec)
+	return cursorproto.FrameConnectMessage(serverMessage, 0)
+}
+
+func testCursorMCPServerFrame(messageID uint32, execID, toolCallID, toolName string) []byte {
+	var args []byte
+	args = appendCursorTestString(args, cursorproto.MCA_Name, toolName)
+	args = appendCursorTestString(args, cursorproto.MCA_ToolCallId, toolCallID)
+
+	var exec []byte
+	exec = appendCursorTestVarint(exec, cursorproto.ESM_Id, uint64(messageID))
+	exec = appendCursorTestBytes(exec, cursorproto.ESM_McpArgs, args)
+	exec = appendCursorTestString(exec, cursorproto.ESM_ExecId, execID)
+
+	serverMessage := appendCursorTestBytes(nil, cursorproto.ASM_ExecServerMessage, exec)
+	return cursorproto.FrameConnectMessage(serverMessage, 0)
+}
+
+func appendCursorTestString(dst []byte, number protowire.Number, value string) []byte {
+	dst = protowire.AppendTag(dst, number, protowire.BytesType)
+	return protowire.AppendString(dst, value)
+}
+
+func appendCursorTestBytes(dst []byte, number protowire.Number, value []byte) []byte {
+	dst = protowire.AppendTag(dst, number, protowire.BytesType)
+	return protowire.AppendBytes(dst, value)
+}
+
+func appendCursorTestVarint(dst []byte, number protowire.Number, value uint64) []byte {
+	dst = protowire.AppendTag(dst, number, protowire.VarintType)
+	return protowire.AppendVarint(dst, value)
 }
 
 func TestApplyOriginalToolResultErrorsPreservesClaudeErrorFlag(t *testing.T) {

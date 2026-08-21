@@ -1326,13 +1326,13 @@ func processH2SessionFrames(
 				}
 			}
 
-			if len(pendingBatch) > 0 {
+			for len(pendingBatch) > 0 {
 				onToolExec(append([]pendingMcpExec(nil), pendingBatch...))
 				if toolResultCh == nil {
 					return nil
 				}
 				log.Debugf("cursor: waiting for %d downstream tool results on active Run", len(pendingBatch))
-				toolResults, err := waitForCursorToolResults(ctx, stream, &buf, blobStore, mcpTools, toolResultCh, tokenUsage, onCheckpoint)
+				toolResults, queuedBatch, err := waitForCursorToolResults(ctx, stream, &buf, blobStore, mcpTools, toolResultCh, tokenUsage, onCheckpoint)
 				if err != nil {
 					return err
 				}
@@ -1350,6 +1350,13 @@ func processH2SessionFrames(
 					}
 					log.Debugf("cursor: completed inline exec id=%d tool=%s nativeKind=%d error=%t", pending.ExecMsgId, pending.ToolName, pending.Kind, result.IsError)
 				}
+				if len(queuedBatch) > 0 {
+					log.Debugf("cursor: delivering %d tool calls queued behind the completed downstream batch", len(queuedBatch))
+				}
+				// Cursor may dispatch more client tools while earlier ones are still
+				// running. Claude clients require each assistant tool batch to finish
+				// before returning its results, so expose queued calls in the next turn.
+				pendingBatch = queuedBatch
 			}
 			if turnEnded {
 				return nil
@@ -1362,29 +1369,43 @@ func processH2SessionFrames(
 	}
 }
 
+type cursorMessageWriter interface {
+	Write([]byte) error
+}
+
+type cursorToolResultStream interface {
+	cursorMessageWriter
+	Data() <-chan []byte
+	Done() <-chan struct{}
+	Err() error
+}
+
 func waitForCursorToolResults(
 	ctx context.Context,
-	stream *cursorproto.H2Stream,
+	stream cursorToolResultStream,
 	buf *bytes.Buffer,
 	blobStore map[string][]byte,
 	mcpTools []cursorproto.McpToolDef,
 	toolResultCh <-chan []toolResultInfo,
 	tokenUsage *cursorTokenUsage,
 	onCheckpoint func(data []byte),
-) ([]toolResultInfo, error) {
-	rejectReason := "A previous client tool batch is still running. Retry after it completes."
+) ([]toolResultInfo, []pendingMcpExec, error) {
+	rejectReason := "Tool not available in this environment. Use the MCP tools provided instead."
+	// Do not reject supported execs that arrive while the downstream client is
+	// executing the current batch. They belong to a later Claude assistant turn.
+	var queuedBatch []pendingMcpExec
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		case results, ok := <-toolResultCh:
 			if !ok {
-				return nil, fmt.Errorf("cursor: downstream tool result channel closed")
+				return nil, nil, fmt.Errorf("cursor: downstream tool result channel closed")
 			}
-			return results, nil
+			return results, queuedBatch, nil
 		case waitData, ok := <-stream.Data():
 			if !ok {
-				return nil, cursorStreamClosedError(stream)
+				return nil, nil, cursorStreamClosedError(stream)
 			}
 			buf.Write(waitData)
 			for {
@@ -1399,7 +1420,7 @@ func waitForCursorToolResults(
 				buf.Next(consumed)
 				if flags&cursorproto.ConnectEndStreamFlag != 0 {
 					if err := cursorproto.ParseConnectEndStream(payload); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 					continue
 				}
@@ -1411,49 +1432,67 @@ func waitForCursorToolResults(
 				case cursorproto.ServerMsgKvGetBlob:
 					blobKey := cursorproto.BlobIdHex(msg.BlobId)
 					if err := stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeKvGetBlobResult(msg.KvId, blobStore[blobKey]), 0)); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 				case cursorproto.ServerMsgKvSetBlob:
 					blobKey := cursorproto.BlobIdHex(msg.BlobId)
 					blobStore[blobKey] = append([]byte(nil), msg.BlobData...)
 					if err := stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeKvSetBlobResult(msg.KvId), 0)); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 				case cursorproto.ServerMsgExecRequestCtx:
 					messages := [][]byte{cursorproto.EncodeExecRequestContextResult(msg.ExecMsgId, msg.ExecId, mcpTools)}
 					if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 				case cursorproto.ServerMsgExecMcpArgs:
-					messages := [][]byte{cursorproto.EncodeExecMcpError(msg.ExecMsgId, msg.ExecId, rejectReason)}
-					if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
-						return nil, err
+					decodedArgs := decodeMcpArgsToJSON(msg.McpArgs)
+					if rejection := rejectCursorTeammateTaskOutput(msg.McpToolName, decodedArgs); rejection != "" {
+						messages := [][]byte{cursorproto.EncodeExecMcpError(msg.ExecMsgId, msg.ExecId, rejection)}
+						if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
+							return nil, nil, err
+						}
+						continue
 					}
+					toolCallID := msg.McpToolCallId
+					if toolCallID == "" {
+						toolCallID = uuid.New().String()
+					}
+					queuedBatch = append(queuedBatch, pendingMcpExec{
+						ExecMsgId:  msg.ExecMsgId,
+						ExecId:     msg.ExecId,
+						ToolCallId: toolCallID,
+						ToolName:   msg.McpToolName,
+						Args:       decodedArgs,
+						Kind:       cursorExecMCP,
+					})
 				case cursorproto.ServerMsgExecReadArgs, cursorproto.ServerMsgExecWriteArgs,
 					cursorproto.ServerMsgExecDeleteArgs, cursorproto.ServerMsgExecLsArgs,
 					cursorproto.ServerMsgExecGrepArgs, cursorproto.ServerMsgExecShellArgs,
 					cursorproto.ServerMsgExecShellStream, cursorproto.ServerMsgExecFetchArgs:
-					if err := writeCursorExecMessages(stream, encodeCursorExecRejection(msg, rejectReason)); err != nil {
-						return nil, err
+					if pending, bridged := bridgeCursorNativeExec(msg, mcpTools); bridged {
+						queuedBatch = append(queuedBatch, pending)
+					} else if err := writeCursorExecMessages(stream, encodeCursorExecRejection(msg, rejectReason)); err != nil {
+						return nil, nil, err
 					}
 				case cursorproto.ServerMsgExecDiagnostics:
 					messages := [][]byte{cursorproto.EncodeExecDiagnosticsResult(msg.ExecMsgId, msg.ExecId)}
 					if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 				case cursorproto.ServerMsgExecBgShellSpawn:
 					messages := [][]byte{cursorproto.EncodeExecBackgroundShellSpawnRejected(msg.ExecMsgId, msg.ExecId, msg.Command, msg.WorkingDirectory, rejectReason)}
 					if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 				case cursorproto.ServerMsgExecWriteShellStdin:
 					messages := [][]byte{cursorproto.EncodeExecWriteShellStdinError(msg.ExecMsgId, msg.ExecId, rejectReason)}
 					if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 				case cursorproto.ServerMsgExecOther:
 					if err := writeCursorExecMessages(stream, [][]byte{cursorproto.EncodeExecStreamClose(msg.ExecMsgId)}); err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 				case cursorproto.ServerMsgCheckpoint:
 					if onCheckpoint != nil && len(msg.CheckpointData) > 0 {
@@ -1464,23 +1503,23 @@ func waitForCursorToolResults(
 						tokenUsage.addOutput(msg.TokenDelta)
 					}
 				case cursorproto.ServerMsgTurnEnded:
-					return nil, fmt.Errorf("cursor: Run ended before downstream tool results were returned")
+					return nil, nil, fmt.Errorf("cursor: Run ended before downstream tool results were returned")
 				}
 			}
 		case <-stream.Done():
-			return nil, cursorStreamClosedError(stream)
+			return nil, nil, cursorStreamClosedError(stream)
 		}
 	}
 }
 
-func cursorStreamClosedError(stream *cursorproto.H2Stream) error {
+func cursorStreamClosedError(stream cursorToolResultStream) error {
 	if err := stream.Err(); err != nil {
 		return err
 	}
 	return io.ErrUnexpectedEOF
 }
 
-func writeCursorExecMessages(stream *cursorproto.H2Stream, messages [][]byte) error {
+func writeCursorExecMessages(stream cursorMessageWriter, messages [][]byte) error {
 	for _, message := range messages {
 		if err := stream.Write(cursorproto.FrameConnectMessage(message, 0)); err != nil {
 			return err
