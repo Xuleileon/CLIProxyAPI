@@ -314,31 +314,59 @@ const (
 
 // ReadArgs
 const (
-	RA_Path = 1 // string
+	RA_Path       = 1 // string
+	RA_ToolCallID = 2 // string
 )
 
 // WriteArgs
 const (
-	WA_Path = 1 // string
+	WA_Path       = 1 // string
+	WA_FileText   = 2 // string
+	WA_ToolCallID = 3 // string
+	WA_FileBytes  = 5 // bytes
 )
 
 // DeleteArgs
 const (
-	DA_Path = 1 // string
+	DA_Path       = 1 // string
+	DA_ToolCallID = 2 // string
 )
 
 // LsArgs
 const (
-	LA_Path = 1 // string
+	LA_Path       = 1 // string
+	LA_Ignore     = 2 // repeated string
+	LA_ToolCallID = 3 // string
+	LA_TimeoutMS  = 5 // int32
 )
 
 // ShellArgs
 const (
-	SHA_Command          = 1 // string
-	SHA_WorkingDirectory = 2 // string
+	SHA_Command          = 1  // string
+	SHA_WorkingDirectory = 2  // string
+	SHA_Timeout          = 3  // int32
+	SHA_ToolCallID       = 4  // string
+	SHA_IsBackground     = 11 // bool
+)
+
+// GrepArgs
+const (
+	GA_Pattern         = 1  // string
+	GA_Path            = 2  // string
+	GA_Glob            = 3  // string
+	GA_OutputMode      = 4  // string
+	GA_ContextBefore   = 5  // int32
+	GA_ContextAfter    = 6  // int32
+	GA_Context         = 7  // int32
+	GA_CaseInsensitive = 8  // bool
+	GA_Type            = 9  // string
+	GA_HeadLimit       = 10 // int32
+	GA_Multiline       = 11 // bool
+	GA_ToolCallID      = 14 // string
 )
 
 // FetchArgs
 const (
-	FA_Url = 1 // string
+	FA_Url        = 1 // string
+	FA_ToolCallID = 2 // string
 )

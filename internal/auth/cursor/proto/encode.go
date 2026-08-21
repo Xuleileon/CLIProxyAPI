@@ -79,6 +79,14 @@ func setUint32(msg *dynamicpb.Message, name string, val uint32) {
 	msg.Set(field(msg, name), protoreflect.ValueOfUint32(val))
 }
 
+func setInt32(msg *dynamicpb.Message, name string, val int32) {
+	msg.Set(field(msg, name), protoreflect.ValueOfInt32(val))
+}
+
+func setInt64(msg *dynamicpb.Message, name string, val int64) {
+	msg.Set(field(msg, name), protoreflect.ValueOfInt64(val))
+}
+
 func setBool(msg *dynamicpb.Message, name string, val bool) {
 	msg.Set(field(msg, name), protoreflect.ValueOfBool(val))
 }
@@ -533,6 +541,269 @@ func EncodeExecStreamClose(execMsgId uint32) []byte {
 	return marshal(acm)
 }
 
+// EncodeExecShellResult adapts a completed downstream shell tool result to the
+// native Cursor shell result expected by the active Agent Run.
+func EncodeExecShellResult(execMsgId uint32, execId, command, workDir, content string, isError bool) []byte {
+	result := newMsg("ShellResult")
+	if isError {
+		failure := newMsg("ShellFailure")
+		setStr(failure, "command", command)
+		setStr(failure, "working_directory", workDir)
+		setInt32(failure, "exit_code", 1)
+		setStr(failure, "stderr", content)
+		setStr(failure, "interleaved_output", content)
+		setMsg(result, "failure", failure)
+	} else {
+		success := newMsg("ShellSuccess")
+		setStr(success, "command", command)
+		setStr(success, "working_directory", workDir)
+		setInt32(success, "exit_code", 0)
+		setStr(success, "stdout", content)
+		setStr(success, "interleaved_output", content)
+		setMsg(result, "success", success)
+	}
+	return encodeExecClientMsg(execMsgId, execId, "shell_result", result)
+}
+
+// EncodeExecShellStreamResult emits the native stream lifecycle for a shell
+// command that was executed through a downstream tool.
+func EncodeExecShellStreamResult(execMsgId uint32, execId, workDir, content string, isError bool) [][]byte {
+	start := newMsg("ShellStreamStart")
+	startStream := newMsg("ShellStream")
+	setMsg(startStream, "start", start)
+
+	outputStream := newMsg("ShellStream")
+	if isError {
+		stderr := newMsg("ShellStreamStderr")
+		setStr(stderr, "data", content)
+		setMsg(outputStream, "stderr", stderr)
+	} else {
+		stdout := newMsg("ShellStreamStdout")
+		setStr(stdout, "data", content)
+		setMsg(outputStream, "stdout", stdout)
+	}
+
+	exit := newMsg("ShellStreamExit")
+	if isError {
+		setUint32(exit, "code", 1)
+	}
+	setStr(exit, "cwd", workDir)
+	exitStream := newMsg("ShellStream")
+	setMsg(exitStream, "exit", exit)
+
+	return [][]byte{
+		encodeExecClientMsg(execMsgId, execId, "shell_stream", startStream),
+		encodeExecClientMsg(execMsgId, execId, "shell_stream", outputStream),
+		encodeExecClientMsg(execMsgId, execId, "shell_stream", exitStream),
+	}
+}
+
+func EncodeExecReadResult(execMsgId uint32, execId, path, content string, isError bool) []byte {
+	result := newMsg("ReadResult")
+	if isError {
+		readErr := newMsg("ReadError")
+		setStr(readErr, "path", path)
+		setStr(readErr, "error", content)
+		setMsg(result, "error", readErr)
+	} else {
+		success := newMsg("ReadSuccess")
+		setStr(success, "path", path)
+		setStr(success, "content", content)
+		setInt32(success, "total_lines", int32(textLineCount(content)))
+		setInt64(success, "file_size", int64(len(content)))
+		setMsg(result, "success", success)
+	}
+	return encodeExecClientMsg(execMsgId, execId, "read_result", result)
+}
+
+func EncodeExecWriteResult(execMsgId uint32, execId, path, fileText, content string, isError bool) []byte {
+	result := newMsg("WriteResult")
+	if isError {
+		writeErr := newMsg("WriteError")
+		setStr(writeErr, "path", path)
+		setStr(writeErr, "error", content)
+		setMsg(result, "error", writeErr)
+	} else {
+		success := newMsg("WriteSuccess")
+		setStr(success, "path", path)
+		setInt32(success, "lines_created", int32(textLineCount(fileText)))
+		setInt32(success, "file_size", int32(len(fileText)))
+		setMsg(result, "success", success)
+	}
+	return encodeExecClientMsg(execMsgId, execId, "write_result", result)
+}
+
+func EncodeExecDeleteResult(execMsgId uint32, execId, path, content string, isError bool) []byte {
+	result := newMsg("DeleteResult")
+	if isError {
+		deleteErr := newMsg("DeleteError")
+		setStr(deleteErr, "path", path)
+		setStr(deleteErr, "error", content)
+		setMsg(result, "error", deleteErr)
+	} else {
+		success := newMsg("DeleteSuccess")
+		setStr(success, "path", path)
+		setStr(success, "deleted_file", path)
+		setMsg(result, "success", success)
+	}
+	return encodeExecClientMsg(execMsgId, execId, "delete_result", result)
+}
+
+func EncodeExecLsResult(execMsgId uint32, execId, path, content string, isError bool) []byte {
+	result := newMsg("LsResult")
+	if isError {
+		lsErr := newMsg("LsError")
+		setStr(lsErr, "path", path)
+		setStr(lsErr, "error", content)
+		setMsg(result, "error", lsErr)
+	} else {
+		root := newMsg("LsDirectoryTreeNode")
+		setStr(root, "abs_path", path)
+		files := nonEmptyLines(content)
+		childrenField := field(root, "children_files")
+		children := root.Mutable(childrenField).List()
+		for _, name := range files {
+			fileNode := newMsg("LsDirectoryTreeNode_File")
+			setStr(fileNode, "name", name)
+			children.Append(protoreflect.ValueOfMessage(fileNode.ProtoReflect()))
+		}
+		setBool(root, "children_were_processed", true)
+		setInt32(root, "num_files", int32(len(files)))
+		success := newMsg("LsSuccess")
+		setMsg(success, "directory_tree_root", root)
+		setMsg(result, "success", success)
+	}
+	return encodeExecClientMsg(execMsgId, execId, "ls_result", result)
+}
+
+func EncodeExecGrepResult(execMsgId uint32, execId, pattern, path, outputMode, content string, isError bool) []byte {
+	result := newMsg("GrepResult")
+	if isError {
+		grepErr := newMsg("GrepError")
+		setStr(grepErr, "error", content)
+		setMsg(result, "error", grepErr)
+		return encodeExecClientMsg(execMsgId, execId, "grep_result", result)
+	}
+
+	union := newMsg("GrepUnionResult")
+	lines := nonEmptyLines(content)
+	if outputMode == "count" {
+		counts := newMsg("GrepCountResult")
+		countsField := field(counts, "counts")
+		countsList := counts.Mutable(countsField).List()
+		var total int32
+		for _, line := range lines {
+			fileName, count := splitTrailingCount(line)
+			fileCount := newMsg("GrepFileCount")
+			setStr(fileCount, "file", fileName)
+			setInt32(fileCount, "count", count)
+			countsList.Append(protoreflect.ValueOfMessage(fileCount.ProtoReflect()))
+			total += count
+		}
+		setInt32(counts, "total_files", int32(len(lines)))
+		setInt32(counts, "total_matches", total)
+		setMsg(union, "count", counts)
+	} else if outputMode == "files_with_matches" {
+		files := newMsg("GrepFilesResult")
+		filesField := field(files, "files")
+		filesList := files.Mutable(filesField).List()
+		for _, line := range lines {
+			filesList.Append(protoreflect.ValueOfString(line))
+		}
+		setInt32(files, "total_files", int32(len(lines)))
+		setMsg(union, "files", files)
+	} else {
+		matches := newMsg("GrepContentResult")
+		matchesField := field(matches, "matches")
+		matchesList := matches.Mutable(matchesField).List()
+		for _, line := range lines {
+			fileName, lineNumber, lineContent := splitGrepContentLine(line, path)
+			fileMatch := newMsg("GrepFileMatch")
+			setStr(fileMatch, "file", fileName)
+			contentMatch := newMsg("GrepContentMatch")
+			setInt32(contentMatch, "line_number", lineNumber)
+			setStr(contentMatch, "content", lineContent)
+			matchField := field(fileMatch, "matches")
+			fileMatch.Mutable(matchField).List().Append(protoreflect.ValueOfMessage(contentMatch.ProtoReflect()))
+			matchesList.Append(protoreflect.ValueOfMessage(fileMatch.ProtoReflect()))
+		}
+		setInt32(matches, "total_lines", int32(len(lines)))
+		setInt32(matches, "total_matched_lines", int32(len(lines)))
+		setMsg(union, "content", matches)
+	}
+
+	success := newMsg("GrepSuccess")
+	setStr(success, "pattern", pattern)
+	setStr(success, "path", path)
+	setStr(success, "output_mode", outputMode)
+	setMsg(success, "active_editor_result", union)
+	setMsg(result, "success", success)
+	return encodeExecClientMsg(execMsgId, execId, "grep_result", result)
+}
+
+func EncodeExecFetchResult(execMsgId uint32, execId, url, content string, isError bool) []byte {
+	result := newMsg("FetchResult")
+	if isError {
+		fetchErr := newMsg("FetchError")
+		setStr(fetchErr, "url", url)
+		setStr(fetchErr, "error", content)
+		setMsg(result, "error", fetchErr)
+	} else {
+		success := newMsg("FetchSuccess")
+		setStr(success, "url", url)
+		setStr(success, "content", content)
+		setInt32(success, "status_code", 200)
+		setStr(success, "content_type", "text/plain")
+		setMsg(result, "success", success)
+	}
+	return encodeExecClientMsg(execMsgId, execId, "fetch_result", result)
+}
+
+func textLineCount(text string) int {
+	if text == "" {
+		return 0
+	}
+	return strings.Count(text, "\n") + 1
+}
+
+func nonEmptyLines(content string) []string {
+	var lines []string
+	for _, line := range strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func splitTrailingCount(line string) (string, int32) {
+	separator := strings.LastIndexByte(line, ':')
+	if separator <= 0 {
+		return line, 0
+	}
+	var count int32
+	if _, err := fmt.Sscan(line[separator+1:], &count); err != nil {
+		return line, 0
+	}
+	return line[:separator], count
+}
+
+func splitGrepContentLine(line, fallbackPath string) (string, int32, string) {
+	lastSeparator := strings.LastIndexByte(line, ':')
+	if lastSeparator <= 0 {
+		return fallbackPath, 0, line
+	}
+	preceding := strings.LastIndexByte(line[:lastSeparator], ':')
+	if preceding <= 0 {
+		return fallbackPath, 0, line
+	}
+	var lineNumber int32
+	if _, err := fmt.Sscan(line[preceding+1:lastSeparator], &lineNumber); err != nil {
+		return fallbackPath, 0, line
+	}
+	return line[:preceding], lineNumber, line[lastSeparator+1:]
+}
+
 // --- Rejection encoders (mirror handleExecMessage rejections) ---
 
 func EncodeExecReadRejected(execMsgId uint32, execId string, path, reason string) []byte {
@@ -552,6 +823,16 @@ func EncodeExecShellRejected(execMsgId uint32, execId string, command, workDir, 
 	result := newMsg("ShellResult")
 	setMsg(result, "rejected", rej)
 	return encodeExecClientMsg(execMsgId, execId, "shell_result", result)
+}
+
+func EncodeExecShellStreamRejected(execMsgId uint32, execId string, command, workDir, reason string) []byte {
+	rej := newMsg("ShellRejected")
+	setStr(rej, "command", command)
+	setStr(rej, "working_directory", workDir)
+	setStr(rej, "reason", reason)
+	stream := newMsg("ShellStream")
+	setMsg(stream, "rejected", rej)
+	return encodeExecClientMsg(execMsgId, execId, "shell_stream", stream)
 }
 
 func EncodeExecWriteRejected(execMsgId uint32, execId string, path, reason string) []byte {

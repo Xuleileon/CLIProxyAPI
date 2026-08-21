@@ -3,339 +3,457 @@ package proto
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptrace"
+	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/hpack"
 	"golang.org/x/net/proxy"
 )
 
-const (
-	defaultInitialWindowSize = 65535 // HTTP/2 default
-	maxFramePayload          = 16384 // HTTP/2 default max frame size
-)
+var h2StreamSequence atomic.Uint64
 
-// H2Stream provides bidirectional HTTP/2 streaming for the Connect protocol.
-// Go's net/http does not support full-duplex HTTP/2, so we use the low-level framer.
+var h2DialRetryDelays = [...]time.Duration{100 * time.Millisecond, 250 * time.Millisecond}
+
+// H2StreamPool owns reusable HTTP/2 transports. Each transport multiplexes
+// independent Connect RPCs over persistent TLS connections and delegates
+// flow control, GOAWAY, RST_STREAM, and stream ID allocation to x/net/http2.
+type H2StreamPool struct {
+	mu         sync.Mutex
+	transports map[string]*http2.Transport
+	tlsConfig  *tls.Config
+}
+
+// NewH2StreamPool creates an empty reusable HTTP/2 transport pool.
+func NewH2StreamPool() *H2StreamPool {
+	return &H2StreamPool{transports: make(map[string]*http2.Transport)}
+}
+
+// H2Stream provides a full-duplex request and response body for one Connect
+// RPC. Closing a stream resets only that HTTP/2 stream, not the shared TLS
+// connection used by other requests.
 type H2Stream struct {
-	framer   *http2.Framer
-	conn     net.Conn
-	streamID uint32
-	mu       sync.Mutex
-	id       string // unique identifier for debugging
-	frameNum int64  // sequential frame counter for debugging
+	id  string
+	ctx context.Context
 
-	dataCh chan []byte
-	doneCh chan struct{}
-	err    error
+	requestWriter *io.PipeWriter
+	cancel        context.CancelFunc
 
-	// Send-side flow control
-	sendWindow int32      // available bytes we can send on this stream
-	connWindow int32      // available bytes on the connection level
-	windowCond *sync.Cond // signaled when window is updated
-	windowMu   sync.Mutex // protects sendWindow, connWindow
+	writeMu sync.Mutex
+	errMu   sync.RWMutex
+	err     error
+
+	responseMu   sync.Mutex
+	responseBody io.ReadCloser
+
+	dataCh    chan []byte
+	doneCh    chan struct{}
+	closeOnce sync.Once
+	frameNum  atomic.Int64
+}
+
+type h2RoundTripResult struct {
+	response *http.Response
+	err      error
 }
 
 // ID returns the unique identifier for this stream (for logging).
 func (s *H2Stream) ID() string { return s.id }
 
-// FrameNum returns the current frame number for debugging.
-func (s *H2Stream) FrameNum() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.frameNum
-}
+// FrameNum returns the number of response-body chunks read from this stream.
+func (s *H2Stream) FrameNum() int64 { return s.frameNum.Load() }
 
-// DialH2Stream establishes a TLS+HTTP/2 connection and opens a new stream.
+// DialH2Stream establishes a direct TLS+HTTP/2 stream without retaining a
+// reusable pool. Long-lived callers should use H2StreamPool.Open instead.
 func DialH2Stream(host string, headers map[string]string) (*H2Stream, error) {
 	return DialH2StreamWithDialer(context.Background(), host, headers, nil)
 }
 
-// DialH2StreamWithDialer establishes a TLS+HTTP/2 connection through dialer.
-// A nil dialer preserves the existing direct-connect behavior.
+// DialH2StreamWithDialer establishes a TLS+HTTP/2 stream through dialer.
+// A nil dialer preserves direct-connect behavior.
 func DialH2StreamWithDialer(ctx context.Context, host string, headers map[string]string, dialer proxy.Dialer) (*H2Stream, error) {
+	pool := NewH2StreamPool()
+	return pool.Open(ctx, host, host, headers, dialer)
+}
+
+// Open starts a full-duplex Connect RPC on a reusable HTTP/2 transport.
+// poolKey must identify connection-affecting state such as endpoint, proxy,
+// and credential isolation. Headers remain request-scoped.
+func (p *H2StreamPool) Open(ctx context.Context, poolKey, host string, headers map[string]string, dialer proxy.Dialer) (*H2Stream, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if p == nil {
+		return nil, fmt.Errorf("h2: nil stream pool")
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return nil, fmt.Errorf("h2: empty host")
+	}
+	path := headers[":path"]
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		return nil, fmt.Errorf("h2: invalid path %q", path)
+	}
+	if poolKey == "" {
+		poolKey = host
+	}
 
-	target := net.JoinHostPort(host, "443")
-	var rawConn net.Conn
-	var err error
-	if dialer == nil {
-		rawConn, err = (&net.Dialer{}).DialContext(ctx, "tcp", target)
-	} else if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
-		rawConn, err = contextDialer.DialContext(ctx, "tcp", target)
+	transport := p.transportFor(poolKey, dialer)
+	requestReader, requestWriter := io.Pipe()
+	streamCtx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	var readyState struct {
+		sync.Mutex
+		gotConn      bool
+		wroteHeaders bool
+		closed       bool
+	}
+	markReady := func(gotConn, wroteHeaders bool) {
+		readyState.Lock()
+		defer readyState.Unlock()
+		readyState.gotConn = readyState.gotConn || gotConn
+		readyState.wroteHeaders = readyState.wroteHeaders || wroteHeaders
+		if readyState.gotConn && readyState.wroteHeaders && !readyState.closed {
+			readyState.closed = true
+			close(ready)
+		}
+	}
+	var reused atomic.Bool
+
+	requestURL := &url.URL{Scheme: "https", Host: host, Path: path}
+	request := (&http.Request{
+		Method:        http.MethodPost,
+		URL:           requestURL,
+		Header:        make(http.Header),
+		Body:          requestReader,
+		ContentLength: -1,
+		Host:          host,
+	}).WithContext(httptrace.WithClientTrace(streamCtx, &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			reused.Store(info.Reused)
+			markReady(true, false)
+		},
+		WroteHeaders: func() {
+			markReady(false, true)
+		},
+	}))
+	for name, value := range headers {
+		if strings.HasPrefix(name, ":") {
+			continue
+		}
+		request.Header.Set(name, value)
+	}
+
+	streamID := h2StreamSequence.Add(1)
+	stream := &H2Stream{
+		id:            fmt.Sprintf("%d-%s", streamID, time.Now().Format("150405.000")),
+		ctx:           streamCtx,
+		requestWriter: requestWriter,
+		cancel:        cancel,
+		dataCh:        make(chan []byte, 256),
+		doneCh:        make(chan struct{}),
+	}
+	resultCh := make(chan h2RoundTripResult, 1)
+	go func() {
+		response, err := transport.RoundTrip(request)
+		resultCh <- h2RoundTripResult{response: response, err: err}
+	}()
+	go stream.readLoop(resultCh)
+
+	select {
+	case <-ready:
+		log.Debugf("h2stream[%s]: request headers sent reused=%t", stream.id, reused.Load())
+		return stream, nil
+	case <-stream.Done():
+		err := stream.Err()
+		if err == nil {
+			err = fmt.Errorf("h2: stream ended before request headers were sent")
+		}
+		stream.Close()
+		return nil, err
+	case <-ctx.Done():
+		stream.Close()
+		return nil, ctx.Err()
+	}
+}
+
+// CloseIdleConnections closes pooled TLS connections that have no active
+// streams. Active Connect RPCs are not interrupted.
+func (p *H2StreamPool) CloseIdleConnections() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	transports := make([]*http2.Transport, 0, len(p.transports))
+	for _, transport := range p.transports {
+		transports = append(transports, transport)
+	}
+	p.mu.Unlock()
+	for _, transport := range transports {
+		transport.CloseIdleConnections()
+	}
+}
+
+func (p *H2StreamPool) transportFor(poolKey string, dialer proxy.Dialer) *http2.Transport {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.transports == nil {
+		p.transports = make(map[string]*http2.Transport)
+	}
+	if transport := p.transports[poolKey]; transport != nil {
+		return transport
+	}
+	tlsConfig := p.tlsConfig
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{}
 	} else {
-		rawConn, err = dialer.Dial("tcp", target)
+		tlsConfig = tlsConfig.Clone()
+	}
+	transport := &http2.Transport{
+		TLSClientConfig:    tlsConfig,
+		DisableCompression: true,
+		// Keep protocol liveness under the Connect heartbeat. No network
+		// timeout is applied after a Cursor Run has been established.
+		IdleConnTimeout:  0,
+		ReadIdleTimeout:  0,
+		WriteByteTimeout: 0,
+		DialTLSContext: func(ctx context.Context, network, address string, config *tls.Config) (net.Conn, error) {
+			return dialCursorH2TLS(ctx, network, address, config, dialer)
+		},
+		CountError: func(errorType string) {
+			log.Debugf("h2: transport error type=%s", errorType)
+		},
+	}
+	p.transports[poolKey] = transport
+	return transport
+}
+
+func dialCursorH2TLS(ctx context.Context, network, address string, config *tls.Config, dialer proxy.Dialer) (net.Conn, error) {
+	var lastErr error
+	for attempt := 0; attempt <= len(h2DialRetryDelays); attempt++ {
+		conn, err := dialCursorH2TLSOnce(ctx, network, address, config, dialer)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if attempt == len(h2DialRetryDelays) || !isRetryableH2DialError(err) {
+			return nil, err
+		}
+
+		delay := h2DialRetryDelays[attempt]
+		log.Debugf("h2: connection attempt %d failed, retrying in %s: %v", attempt+1, delay, err)
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
+}
+
+func dialCursorH2TLSOnce(ctx context.Context, network, address string, config *tls.Config, dialer proxy.Dialer) (net.Conn, error) {
+	var (
+		rawConn net.Conn
+		err     error
+	)
+	if dialer == nil {
+		rawConn, err = (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext(ctx, network, address)
+	} else if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+		rawConn, err = contextDialer.DialContext(ctx, network, address)
+	} else {
+		rawConn, err = dialer.Dial(network, address)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("h2: TCP dial failed: %w", err)
 	}
 
-	tlsConn := tls.Client(rawConn, &tls.Config{
-		ServerName: host,
-		NextProtos: []string{"h2"},
-	})
+	tlsConfig := &tls.Config{}
+	if config != nil {
+		tlsConfig = config.Clone()
+	}
+	if tlsConfig.ServerName == "" {
+		host, _, splitErr := net.SplitHostPort(address)
+		if splitErr != nil {
+			host = address
+		}
+		tlsConfig.ServerName = strings.Trim(host, "[]")
+	}
+	tlsConfig.NextProtos = []string{"h2"}
+	tlsConn := tls.Client(rawConn, tlsConfig)
 	if err = tlsConn.HandshakeContext(ctx); err != nil {
 		_ = rawConn.Close()
 		return nil, fmt.Errorf("h2: TLS dial failed: %w", err)
 	}
 	if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return nil, fmt.Errorf("h2: server did not negotiate h2")
 	}
-
-	framer := http2.NewFramer(tlsConn, tlsConn)
-
-	// Client connection preface
-	if _, err := tlsConn.Write([]byte(http2.ClientPreface)); err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("h2: preface write failed: %w", err)
-	}
-
-	// Send initial SETTINGS (tell server how much WE can receive)
-	if err := framer.WriteSettings(
-		http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 * 1024 * 1024},
-		http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 100},
-	); err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("h2: settings write failed: %w", err)
-	}
-
-	// Connection-level window update (for receiving)
-	if err := framer.WriteWindowUpdate(0, 3*1024*1024); err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("h2: window update failed: %w", err)
-	}
-
-	// Read and handle initial server frames (SETTINGS, WINDOW_UPDATE)
-	// Track server's initial window size (how much WE can send)
-	serverInitialWindowSize := int32(defaultInitialWindowSize)
-	connWindowSize := int32(defaultInitialWindowSize) // connection-level send window
-	for i := 0; i < 10; i++ {
-		f, err := framer.ReadFrame()
-		if err != nil {
-			tlsConn.Close()
-			return nil, fmt.Errorf("h2: initial frame read failed: %w", err)
-		}
-		switch sf := f.(type) {
-		case *http2.SettingsFrame:
-			if !sf.IsAck() {
-				sf.ForeachSetting(func(s http2.Setting) error {
-					if s.ID == http2.SettingInitialWindowSize {
-						serverInitialWindowSize = int32(s.Val)
-						log.Debugf("h2: server initial window size: %d", s.Val)
-					}
-					return nil
-				})
-				framer.WriteSettingsAck()
-			} else {
-				goto handshakeDone
-			}
-		case *http2.WindowUpdateFrame:
-			if sf.StreamID == 0 {
-				connWindowSize += int32(sf.Increment)
-				log.Debugf("h2: initial conn window update: +%d, total=%d", sf.Increment, connWindowSize)
-			}
-		default:
-			// unexpected but continue
-		}
-	}
-handshakeDone:
-
-	// Build HEADERS
-	streamID := uint32(1)
-	var hdrBuf []byte
-	enc := hpack.NewEncoder(&sliceWriter{buf: &hdrBuf})
-	enc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
-	enc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
-	enc.WriteField(hpack.HeaderField{Name: ":authority", Value: host})
-	if p, ok := headers[":path"]; ok {
-		enc.WriteField(hpack.HeaderField{Name: ":path", Value: p})
-	}
-	for k, v := range headers {
-		if len(k) > 0 && k[0] == ':' {
-			continue
-		}
-		enc.WriteField(hpack.HeaderField{Name: k, Value: v})
-	}
-
-	if err := framer.WriteHeaders(http2.HeadersFrameParam{
-		StreamID:      streamID,
-		BlockFragment: hdrBuf,
-		EndStream:     false,
-		EndHeaders:    true,
-	}); err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("h2: headers write failed: %w", err)
-	}
-
-	s := &H2Stream{
-		framer:     framer,
-		conn:       tlsConn,
-		streamID:   streamID,
-		dataCh:     make(chan []byte, 256),
-		doneCh:     make(chan struct{}),
-		id:         fmt.Sprintf("%d-%s", streamID, time.Now().Format("150405.000")),
-		frameNum:   0,
-		sendWindow: serverInitialWindowSize,
-		connWindow: connWindowSize,
-	}
-	s.windowCond = sync.NewCond(&s.windowMu)
-	go s.readLoop()
-	return s, nil
+	return tlsConn, nil
 }
 
-// Write sends a DATA frame on the stream, respecting flow control.
+func isRetryableH2DialError(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET)
+}
+
+// Write writes request-body bytes to this Connect RPC. Concurrent heartbeat
+// and tool-result writes are serialized per stream.
 func (s *H2Stream) Write(data []byte) error {
-	for len(data) > 0 {
-		chunk := data
-		if len(chunk) > maxFramePayload {
-			chunk = data[:maxFramePayload]
-		}
-
-		// Wait for flow control window
-		s.windowMu.Lock()
-		for s.sendWindow <= 0 || s.connWindow <= 0 {
-			s.windowCond.Wait()
-		}
-		// Limit chunk to available window
-		allowed := int(s.sendWindow)
-		if int(s.connWindow) < allowed {
-			allowed = int(s.connWindow)
-		}
-		if len(chunk) > allowed {
-			chunk = chunk[:allowed]
-		}
-		s.sendWindow -= int32(len(chunk))
-		s.connWindow -= int32(len(chunk))
-		s.windowMu.Unlock()
-
-		s.mu.Lock()
-		err := s.framer.WriteData(s.streamID, false, chunk)
-		s.mu.Unlock()
-		if err != nil {
+	if s == nil || s.requestWriter == nil {
+		return fmt.Errorf("h2: stream is not writable")
+	}
+	select {
+	case <-s.doneCh:
+		if err := s.Err(); err != nil {
 			return err
 		}
-		data = data[len(chunk):]
+		return io.ErrClosedPipe
+	default:
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.requestWriter.Write(data); err != nil {
+		if streamErr := s.Err(); streamErr != nil {
+			return streamErr
+		}
+		return fmt.Errorf("h2: request body write failed: %w", err)
 	}
 	return nil
 }
 
-// Data returns the channel of received data chunks.
+// Data returns the channel of received response-body chunks.
 func (s *H2Stream) Data() <-chan []byte { return s.dataCh }
 
 // Done returns a channel closed when the stream ends.
 func (s *H2Stream) Done() <-chan struct{} { return s.doneCh }
 
-// Err returns the error (if any) that caused the stream to close.
-// Returns nil for a clean shutdown (EOF / StreamEnded).
-func (s *H2Stream) Err() error { return s.err }
-
-// Close tears down the connection.
-func (s *H2Stream) Close() {
-	s.conn.Close()
-	// Unblock any writers waiting on flow control
-	s.windowCond.Broadcast()
+// Err returns the error that caused the stream to close, or nil after EOF.
+func (s *H2Stream) Err() error {
+	if s == nil {
+		return nil
+	}
+	s.errMu.RLock()
+	defer s.errMu.RUnlock()
+	return s.err
 }
 
-func (s *H2Stream) readLoop() {
+// Close cancels only this HTTP/2 stream. The transport keeps healthy shared
+// TLS connections available for other and future Cursor Runs.
+func (s *H2Stream) Close() {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		if s.requestWriter != nil {
+			_ = s.requestWriter.Close()
+		}
+		s.responseMu.Lock()
+		responseBody := s.responseBody
+		s.responseMu.Unlock()
+		if responseBody != nil {
+			_ = responseBody.Close()
+		}
+		if s.cancel != nil {
+			s.cancel()
+		}
+	})
+}
+
+func (s *H2Stream) readLoop(resultCh <-chan h2RoundTripResult) {
 	defer close(s.doneCh)
 	defer close(s.dataCh)
 
+	result := <-resultCh
+	if result.err != nil {
+		s.setErr(result.err)
+		log.Debugf("h2stream[%s]: round trip error: %v", s.id, result.err)
+		return
+	}
+	if result.response == nil {
+		err := fmt.Errorf("h2: empty response")
+		s.setErr(err)
+		return
+	}
+	s.responseMu.Lock()
+	s.responseBody = result.response.Body
+	s.responseMu.Unlock()
+	defer result.response.Body.Close()
+
+	if result.response.StatusCode < http.StatusOK || result.response.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(result.response.Body, 4096))
+		err := fmt.Errorf("h2: upstream returned %s: %s", result.response.Status, strings.TrimSpace(string(body)))
+		s.setErr(err)
+		return
+	}
+
+	buffer := make([]byte, 32*1024)
 	for {
-		f, err := s.framer.ReadFrame()
-		if err != nil {
-			if err != io.EOF {
-				s.err = err
-				log.Debugf("h2stream[%s]: readLoop error: %v", s.id, err)
+		count, err := result.response.Body.Read(buffer)
+		if count > 0 {
+			chunk := append([]byte(nil), buffer[:count]...)
+			s.frameNum.Add(1)
+			select {
+			case s.dataCh <- chunk:
+			case <-s.doneContext():
+				return
 			}
-			return
 		}
-
-		// Increment frame counter
-		s.mu.Lock()
-		s.frameNum++
-		s.mu.Unlock()
-
-		switch frame := f.(type) {
-		case *http2.DataFrame:
-			if frame.StreamID == s.streamID && len(frame.Data()) > 0 {
-				cp := make([]byte, len(frame.Data()))
-				copy(cp, frame.Data())
-				s.dataCh <- cp
-
-				// Flow control: send WINDOW_UPDATE for received data
-				s.mu.Lock()
-				s.framer.WriteWindowUpdate(0, uint32(len(cp)))
-				s.framer.WriteWindowUpdate(s.streamID, uint32(len(cp)))
-				s.mu.Unlock()
+		if err != nil {
+			if err != io.EOF && !isClosedStreamError(err) {
+				s.setErr(err)
+				log.Debugf("h2stream[%s]: response read error: %v", s.id, err)
 			}
-			if frame.StreamEnded() {
-				return
-			}
-
-		case *http2.HeadersFrame:
-			if frame.StreamEnded() {
-				return
-			}
-
-		case *http2.RSTStreamFrame:
-			s.err = fmt.Errorf("h2: RST_STREAM code=%d", frame.ErrCode)
-			log.Debugf("h2stream[%s]: received RST_STREAM code=%d", s.id, frame.ErrCode)
 			return
-
-		case *http2.GoAwayFrame:
-			s.err = fmt.Errorf("h2: GOAWAY code=%d", frame.ErrCode)
-			return
-
-		case *http2.PingFrame:
-			if !frame.IsAck() {
-				s.mu.Lock()
-				s.framer.WritePing(true, frame.Data)
-				s.mu.Unlock()
-			}
-
-		case *http2.SettingsFrame:
-			if !frame.IsAck() {
-				// Check for window size changes
-				frame.ForeachSetting(func(setting http2.Setting) error {
-					if setting.ID == http2.SettingInitialWindowSize {
-						s.windowMu.Lock()
-						delta := int32(setting.Val) - s.sendWindow
-						s.sendWindow += delta
-						s.windowMu.Unlock()
-						s.windowCond.Broadcast()
-					}
-					return nil
-				})
-				s.mu.Lock()
-				s.framer.WriteSettingsAck()
-				s.mu.Unlock()
-			}
-
-		case *http2.WindowUpdateFrame:
-			// Update send-side flow control window
-			s.windowMu.Lock()
-			if frame.StreamID == 0 {
-				s.connWindow += int32(frame.Increment)
-			} else if frame.StreamID == s.streamID {
-				s.sendWindow += int32(frame.Increment)
-			}
-			s.windowMu.Unlock()
-			s.windowCond.Broadcast()
 		}
 	}
 }
 
-type sliceWriter struct{ buf *[]byte }
+func (s *H2Stream) setErr(err error) {
+	if err == nil {
+		return
+	}
+	s.errMu.Lock()
+	if s.err == nil {
+		s.err = err
+	}
+	s.errMu.Unlock()
+}
 
-func (w *sliceWriter) Write(p []byte) (int, error) {
-	*w.buf = append(*w.buf, p...)
-	return len(p), nil
+func (s *H2Stream) doneContext() <-chan struct{} {
+	if s.ctx == nil {
+		return nil
+	}
+	return s.ctx.Done()
+}
+
+func isClosedStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "request canceled") ||
+		strings.Contains(message, "context canceled") ||
+		strings.Contains(message, "closed response body") ||
+		strings.Contains(message, "response body closed")
 }

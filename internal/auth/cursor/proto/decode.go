@@ -20,13 +20,13 @@ const (
 	ServerMsgKvSetBlob                             // Server wants to store a blob
 	ServerMsgExecRequestCtx                        // Server requests context (tools, etc.)
 	ServerMsgExecMcpArgs                           // Server wants MCP tool execution
-	ServerMsgExecShellArgs                         // Rejected: shell command
-	ServerMsgExecReadArgs                          // Rejected: file read
-	ServerMsgExecWriteArgs                         // Rejected: file write
-	ServerMsgExecDeleteArgs                        // Rejected: file delete
-	ServerMsgExecLsArgs                            // Rejected: directory listing
-	ServerMsgExecGrepArgs                          // Rejected: grep search
-	ServerMsgExecFetchArgs                         // Rejected: HTTP fetch
+	ServerMsgExecShellArgs                         // Native shell command
+	ServerMsgExecReadArgs                          // Native file read
+	ServerMsgExecWriteArgs                         // Native file write
+	ServerMsgExecDeleteArgs                        // Native file delete
+	ServerMsgExecLsArgs                            // Native directory listing
+	ServerMsgExecGrepArgs                          // Native grep search
+	ServerMsgExecFetchArgs                         // Native HTTP fetch
 	ServerMsgExecDiagnostics                       // Respond with empty diagnostics
 	ServerMsgExecShellStream                       // Rejected: shell stream
 	ServerMsgExecBgShellSpawn                      // Rejected: background shell
@@ -59,11 +59,27 @@ type DecodedServerMessage struct {
 	McpToolCallId string
 	McpArgs       map[string][]byte // arg name -> protobuf-encoded value
 
-	// For rejection context
+	// For native exec args
+	ToolCallId       string
 	Path             string
 	Command          string
 	WorkingDirectory string
 	Url              string
+	FileText         string
+	FileBytes        []byte
+	Ignore           []string
+	Pattern          string
+	Glob             string
+	OutputMode       string
+	FileType         string
+	Timeout          int32
+	ContextBefore    int32
+	ContextAfter     int32
+	Context          int32
+	HeadLimit        int32
+	CaseInsensitive  bool
+	Multiline        bool
+	IsBackground     bool
 
 	// For other exec - the raw field number for building a response
 	ExecFieldNumber int
@@ -324,21 +340,22 @@ func decodeExecServerMessage(data []byte, msg *DecodedServerMessage) {
 				decodeShellArgs(val, msg)
 			case ESM_ReadArgs:
 				msg.Type = ServerMsgExecReadArgs
-				msg.Path = decodeStringField(val, RA_Path)
+				decodeReadArgs(val, msg)
 			case ESM_WriteArgs:
 				msg.Type = ServerMsgExecWriteArgs
-				msg.Path = decodeStringField(val, WA_Path)
+				decodeWriteArgs(val, msg)
 			case ESM_DeleteArgs:
 				msg.Type = ServerMsgExecDeleteArgs
-				msg.Path = decodeStringField(val, DA_Path)
+				decodeDeleteArgs(val, msg)
 			case ESM_LsArgs:
 				msg.Type = ServerMsgExecLsArgs
-				msg.Path = decodeStringField(val, LA_Path)
+				decodeLsArgs(val, msg)
 			case ESM_GrepArgs:
 				msg.Type = ServerMsgExecGrepArgs
+				decodeGrepArgs(val, msg)
 			case ESM_FetchArgs:
 				msg.Type = ServerMsgExecFetchArgs
-				msg.Url = decodeStringField(val, FA_Url)
+				decodeFetchArgs(val, msg)
 			case ESM_DiagnosticsArgs:
 				msg.Type = ServerMsgExecDiagnostics
 			case ESM_BackgroundShellSpawn:
@@ -458,6 +475,20 @@ func decodeShellArgs(data []byte, msg *DecodedServerMessage) {
 				msg.Command = string(val)
 			case SHA_WorkingDirectory:
 				msg.WorkingDirectory = string(val)
+			case SHA_ToolCallID:
+				msg.ToolCallId = string(val)
+			}
+		} else if typ == protowire.VarintType {
+			val, n := protowire.ConsumeVarint(data)
+			if n < 0 {
+				return
+			}
+			data = data[n:]
+			switch num {
+			case SHA_Timeout:
+				msg.Timeout = int32(val)
+			case SHA_IsBackground:
+				msg.IsBackground = val != 0
 			}
 		} else {
 			n := protowire.ConsumeFieldValue(num, typ, data)
@@ -465,6 +496,152 @@ func decodeShellArgs(data []byte, msg *DecodedServerMessage) {
 				return
 			}
 			data = data[n:]
+		}
+	}
+}
+
+func decodeReadArgs(data []byte, msg *DecodedServerMessage) {
+	decodeNativeStringFields(data, func(num protowire.Number, val []byte) {
+		switch num {
+		case RA_Path:
+			msg.Path = string(val)
+		case RA_ToolCallID:
+			msg.ToolCallId = string(val)
+		}
+	})
+}
+
+func decodeWriteArgs(data []byte, msg *DecodedServerMessage) {
+	decodeNativeStringFields(data, func(num protowire.Number, val []byte) {
+		switch num {
+		case WA_Path:
+			msg.Path = string(val)
+		case WA_FileText:
+			msg.FileText = string(val)
+		case WA_ToolCallID:
+			msg.ToolCallId = string(val)
+		case WA_FileBytes:
+			msg.FileBytes = append([]byte(nil), val...)
+		}
+	})
+}
+
+func decodeDeleteArgs(data []byte, msg *DecodedServerMessage) {
+	decodeNativeStringFields(data, func(num protowire.Number, val []byte) {
+		switch num {
+		case DA_Path:
+			msg.Path = string(val)
+		case DA_ToolCallID:
+			msg.ToolCallId = string(val)
+		}
+	})
+}
+
+func decodeLsArgs(data []byte, msg *DecodedServerMessage) {
+	decodeNativeFields(data,
+		func(num protowire.Number, val []byte) {
+			switch num {
+			case LA_Path:
+				msg.Path = string(val)
+			case LA_Ignore:
+				msg.Ignore = append(msg.Ignore, string(val))
+			case LA_ToolCallID:
+				msg.ToolCallId = string(val)
+			}
+		},
+		func(num protowire.Number, val uint64) {
+			if num == LA_TimeoutMS {
+				msg.Timeout = int32(val)
+			}
+		},
+	)
+}
+
+func decodeGrepArgs(data []byte, msg *DecodedServerMessage) {
+	decodeNativeFields(data,
+		func(num protowire.Number, val []byte) {
+			switch num {
+			case GA_Pattern:
+				msg.Pattern = string(val)
+			case GA_Path:
+				msg.Path = string(val)
+			case GA_Glob:
+				msg.Glob = string(val)
+			case GA_OutputMode:
+				msg.OutputMode = string(val)
+			case GA_Type:
+				msg.FileType = string(val)
+			case GA_ToolCallID:
+				msg.ToolCallId = string(val)
+			}
+		},
+		func(num protowire.Number, val uint64) {
+			switch num {
+			case GA_ContextBefore:
+				msg.ContextBefore = int32(val)
+			case GA_ContextAfter:
+				msg.ContextAfter = int32(val)
+			case GA_Context:
+				msg.Context = int32(val)
+			case GA_HeadLimit:
+				msg.HeadLimit = int32(val)
+			case GA_CaseInsensitive:
+				msg.CaseInsensitive = val != 0
+			case GA_Multiline:
+				msg.Multiline = val != 0
+			}
+		},
+	)
+}
+
+func decodeFetchArgs(data []byte, msg *DecodedServerMessage) {
+	decodeNativeStringFields(data, func(num protowire.Number, val []byte) {
+		switch num {
+		case FA_Url:
+			msg.Url = string(val)
+		case FA_ToolCallID:
+			msg.ToolCallId = string(val)
+		}
+	})
+}
+
+func decodeNativeStringFields(data []byte, onBytes func(protowire.Number, []byte)) {
+	decodeNativeFields(data, onBytes, nil)
+}
+
+func decodeNativeFields(data []byte, onBytes func(protowire.Number, []byte), onVarint func(protowire.Number, uint64)) {
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return
+		}
+		data = data[n:]
+
+		switch typ {
+		case protowire.BytesType:
+			val, consumed := protowire.ConsumeBytes(data)
+			if consumed < 0 {
+				return
+			}
+			data = data[consumed:]
+			if onBytes != nil {
+				onBytes(num, val)
+			}
+		case protowire.VarintType:
+			val, consumed := protowire.ConsumeVarint(data)
+			if consumed < 0 {
+				return
+			}
+			data = data[consumed:]
+			if onVarint != nil {
+				onVarint(num, val)
+			}
+		default:
+			consumed := protowire.ConsumeFieldValue(num, typ, data)
+			if consumed < 0 {
+				return
+			}
+			data = data[consumed:]
 		}
 	}
 }
