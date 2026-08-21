@@ -151,6 +151,36 @@ func TestCountXAIInputTokensExcludesRequestStructure(t *testing.T) {
 	}
 }
 
+func TestNormalizeXAIResponseModel(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		input string
+		want  string
+	}{
+		"created": {
+			input: `{"type":"response.created","response":{"model":"grok-4.6-build"}}`,
+			want:  "grok-4.6",
+		},
+		"completed": {
+			input: `{"type":"response.completed","response":{"model":"grok-4.6-build"}}`,
+			want:  "grok-4.6",
+		},
+		"unrelated event": {
+			input: `{"type":"response.output_text.delta","response":{"model":"grok-4.6-build"}}`,
+			want:  "grok-4.6-build",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := normalizeXAIResponseModel([]byte(tc.input), "grok-4.6")
+			if model := gjson.GetBytes(got, "response.model").String(); model != tc.want {
+				t.Fatalf("response.model = %q, want %q; payload=%s", model, tc.want, got)
+			}
+		})
+	}
+}
+
 func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 	var gotPath string
 	var gotAuth string
@@ -171,7 +201,7 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 			t.Fatalf("read body: %v", errRead)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3-build\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
 	}))
 	defer server.Close()
 
@@ -189,7 +219,7 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 		},
 	}
 
-	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+	resp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "grok-4.3",
 		Payload: []byte(`{"model":"grok-4.3","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"test"}],"content":null,"encrypted_content":null},{"type":"reasoning","summary":[{"type":"summary_text","text":"second"}]},{"role":"user","content":"hello"}],"include":["reasoning.encrypted_content"],"reasoning":{"effort":"high"},"tools":[{"type":"tool_search"},{"type":"image_generation"},{"type":"custom","name":"apply_patch"},{"type":"custom","name":"custom_lookup"},{"type":"function","name":"lookup"},{"type":"web_search","external_web_access":true,"search_content_types":["text","image"]},{"type":"namespace","name":"codex_app","description":"Tools in the codex_app namespace.","tools":[{"type":"function","name":"automation_update"},{"type":"custom","name":"namespace_custom"},{"type":"tool_search"}]}],"tool_choice":{"type":"allowed_tools","tools":[{"type":"function","name":"automation_update","namespace":"codex_app"},{"type":"function","name":"lookup"},{"type":"web_search"}]}}`),
 	}, cliproxyexecutor.Options{
@@ -201,6 +231,9 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "model").String(); got != "grok-4.3" {
+		t.Fatalf("response model = %q, want grok-4.3; payload=%s", got, resp.Payload)
 	}
 
 	if gotPath != "/responses" {
@@ -532,7 +565,7 @@ func TestXAIExecutorExecuteStreamFiltersInternalXSearchCalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		names := []string{"x_user_search", "x_semantic_search", "x_keyword_search", "x_thread_fetch"}
-		completed := []byte(`{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"grok-4.5-build","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
 		for i, name := range names {
 			itemID := fmt.Sprintf("ctc_%d", i)
 			callID := fmt.Sprintf("xs_call-%d", i)
@@ -617,6 +650,9 @@ func TestXAIExecutorExecuteStreamFiltersInternalXSearchCalls(t *testing.T) {
 	}
 	if got := completed.Get("response.output.0.type").String(); got != "message" {
 		t.Fatalf("completed output type = %q, want message; completed=%s", got, completed.Raw)
+	}
+	if got := completed.Get("response.model").String(); got != "grok-4.5" {
+		t.Fatalf("completed model = %q, want grok-4.5; completed=%s", got, completed.Raw)
 	}
 }
 

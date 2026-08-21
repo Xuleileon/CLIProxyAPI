@@ -94,6 +94,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		if len(eventData) == 0 {
 			continue
 		}
+		eventData = normalizeXAIResponseModel(eventData, prepared.responseModel)
 		switch gjson.GetBytes(eventData, "type").String() {
 		case "response.output_item.done":
 			xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)

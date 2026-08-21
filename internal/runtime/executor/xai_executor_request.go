@@ -24,6 +24,7 @@ import (
 
 type xaiPreparedRequest struct {
 	baseModel             string
+	responseModel         string
 	from                  sdktranslator.Format
 	responseFormat        sdktranslator.Format
 	to                    sdktranslator.Format
@@ -126,6 +127,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 
 	return &xaiPreparedRequest{
 		baseModel:             baseModel,
+		responseModel:         requestedModel,
 		from:                  from,
 		responseFormat:        responseFormat,
 		to:                    to,

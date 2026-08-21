@@ -18,6 +18,28 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+func normalizeXAIResponseModel(eventData []byte, requestedModel string) []byte {
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		return eventData
+	}
+
+	switch gjson.GetBytes(eventData, "type").String() {
+	case "response.created", "response.in_progress", "response.completed", "response.incomplete":
+	default:
+		return eventData
+	}
+	if !gjson.GetBytes(eventData, "response").Exists() {
+		return eventData
+	}
+
+	normalized, err := sjson.SetBytes(eventData, "response.model", requestedModel)
+	if err != nil {
+		return eventData
+	}
+	return normalized
+}
+
 // xAI executes these x_search subtools server-side but exposes their trace as
 // client-style tool calls. Hide the trace so Responses clients do not execute it again.
 type xaiInternalXSearchResponseFilter struct {

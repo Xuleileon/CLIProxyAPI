@@ -117,6 +117,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 						}
 						continue
 					}
+					eventData = normalizeXAIResponseModel(eventData, prepared.responseModel)
 					normalizedEventName := gjson.GetBytes(eventData, "type").String()
 					switch normalizedEventName {
 					case "response.output_item.done":
