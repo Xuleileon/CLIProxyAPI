@@ -20,6 +20,7 @@ import (
 	cursorproto "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor/proto"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
@@ -364,6 +365,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if from.String() != "" && from.String() != "openai" {
 		var param any
 		result = sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), payload, result, &param)
+		result = normalizeCursorResponsesUsage(from, result)
 	}
 	resp.Payload = result
 	return resp, nil
@@ -570,7 +572,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if needsTranslate {
 			translated := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, payload, sseLine, &streamParam)
 			for _, t := range translated {
-				emitToOut(cliproxyexecutor.StreamChunk{Payload: bytes.Clone(t)})
+				emitToOut(cliproxyexecutor.StreamChunk{Payload: normalizeCursorResponsesUsage(from, bytes.Clone(t))})
 			}
 		} else {
 			emitToOut(cliproxyexecutor.StreamChunk{Payload: []byte(openaiJSON)})
@@ -581,7 +583,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if needsTranslate {
 			done := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, payload, []byte("data: [DONE]\n"), &streamParam)
 			for _, d := range done {
-				emitToOut(cliproxyexecutor.StreamChunk{Payload: bytes.Clone(d)})
+				emitToOut(cliproxyexecutor.StreamChunk{Payload: normalizeCursorResponsesUsage(from, bytes.Clone(d))})
 			}
 		} else {
 			emitToOut(cliproxyexecutor.StreamChunk{Payload: []byte("[DONE]")})
@@ -736,7 +738,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if needsTranslate {
 			translated := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, payload, sseLine, &streamParam)
 			for _, t := range translated {
-				emitToOut(cliproxyexecutor.StreamChunk{Payload: bytes.Clone(t)})
+				emitToOut(cliproxyexecutor.StreamChunk{Payload: normalizeCursorResponsesUsage(from, bytes.Clone(t))})
 			}
 		} else {
 			emitToOut(cliproxyexecutor.StreamChunk{Payload: []byte(openaiJSON)})
@@ -764,6 +766,13 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// Data started flowing — return stream to client
 		return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
 	}
+}
+
+func normalizeCursorResponsesUsage(format sdktranslator.Format, payload []byte) []byte {
+	if format == sdktranslator.FormatOpenAIResponse {
+		return helps.EnsureResponsesUsageDetails(payload)
+	}
+	return payload
 }
 
 // resumeWithToolResults injects tool results into the running processH2SessionFrames
