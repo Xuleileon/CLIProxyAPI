@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
@@ -1432,10 +1433,15 @@ func appendCursorHistorySection(buf *strings.Builder, label, content string) {
 
 func truncateCursorHistoryText(content string) string {
 	const maxHistoryItemBytes = 8000
+	content = strings.ToValidUTF8(content, "\uFFFD")
 	if len(content) <= maxHistoryItemBytes {
 		return content
 	}
-	return content[:maxHistoryItemBytes] + "\n... [truncated]"
+	cut := maxHistoryItemBytes
+	for cut > 0 && !utf8.RuneStart(content[cut]) {
+		cut--
+	}
+	return content[:cut] + "\n... [truncated]"
 }
 
 func extractTextContent(content gjson.Result) string {

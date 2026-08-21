@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -64,7 +65,7 @@ func field(msg *dynamicpb.Message, name string) protoreflect.FieldDescriptor {
 
 func setStr(msg *dynamicpb.Message, name, val string) {
 	if val != "" {
-		msg.Set(field(msg, name), protoreflect.ValueOfString(val))
+		msg.Set(field(msg, name), protoreflect.ValueOfString(strings.ToValidUTF8(val, "\uFFFD")))
 	}
 }
 

@@ -2,6 +2,7 @@ package proto
 
 import (
 	"testing"
+	"unicode/utf8"
 
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -58,6 +59,23 @@ func TestEncodeRunRequestSetsMaxModeTrue(t *testing.T) {
 	md := mustFindBytesField(t, runReq, ARR_ModelDetails)
 	if got, ok := findBoolField(md, MD_MaxMode); !ok || !got {
 		t.Fatalf("ModelDetails.max_mode = %v ok=%v, want true", got, ok)
+	}
+}
+
+func TestSetStrRepairsInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	msg := newMsg("UserMessage")
+	setStr(msg, "text", "before\xffafter")
+	got := msg.Get(field(msg, "text")).String()
+	if !utf8.ValidString(got) {
+		t.Fatal("protobuf string contains invalid UTF-8")
+	}
+	if got != "before\uFFFDafter" {
+		t.Fatalf("protobuf string = %q, want %q", got, "before\uFFFDafter")
+	}
+	if raw := marshal(msg); len(raw) == 0 {
+		t.Fatal("empty protobuf output")
 	}
 }
 

@@ -3,6 +3,7 @@ package executor
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	cursorproto "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor/proto"
 )
@@ -124,5 +125,36 @@ func TestFlattenConversationIntoUserTextPreservesToolCallOrder(t *testing.T) {
 	}
 	if parsed.Turns != nil || parsed.ToolResults != nil {
 		t.Fatalf("structured history was not cleared: turns=%d results=%d", len(parsed.Turns), len(parsed.ToolResults))
+	}
+}
+
+func TestTruncateCursorHistoryTextPreservesUTF8AtByteLimit(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("a", 7999) + "中" + "tail"
+	got := truncateCursorHistoryText(content)
+	if !utf8.ValidString(got) {
+		t.Fatal("truncated history contains invalid UTF-8")
+	}
+	if !strings.HasPrefix(got, strings.Repeat("a", 7999)) {
+		t.Fatal("truncated history lost valid prefix")
+	}
+	if strings.Contains(got, "中") {
+		t.Fatal("partial boundary rune should be omitted")
+	}
+	if !strings.HasSuffix(got, "\n... [truncated]") {
+		t.Fatal("truncation marker missing")
+	}
+}
+
+func TestTruncateCursorHistoryTextRepairsInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	got := truncateCursorHistoryText("before\xffafter")
+	if !utf8.ValidString(got) {
+		t.Fatal("history contains invalid UTF-8")
+	}
+	if got != "before\uFFFDafter" {
+		t.Fatalf("repaired history = %q, want %q", got, "before\uFFFDafter")
 	}
 }
