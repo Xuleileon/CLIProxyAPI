@@ -63,46 +63,17 @@ type savedCheckpoint struct {
 }
 
 type cursorSession struct {
-	stream          *cursorproto.H2Stream
-	pending         []pendingMcpExec
-	toolResultCh    chan []toolResultInfo
-	checkpointReady <-chan struct{}
-	streamDone      <-chan struct{}
-	resuming        bool
-	cancel          context.CancelFunc // cancels the session-scoped heartbeat (NOT tied to HTTP request)
-	createdAt       time.Time
-	authID          string // auth file ID that created this session (for multi-account isolation)
-	conversationID  string // Cursor conversation inherited by fresh tool continuations
-}
-
-func waitForCursorCheckpoint(ctx context.Context, session *cursorSession, results []toolResultInfo) (bool, error) {
-	if session == nil || session.toolResultCh == nil {
-		return false, nil
-	}
-	select {
-	case session.toolResultCh <- results:
-	case <-ctx.Done():
-		return false, ctx.Err()
-	case <-session.streamDone:
-		return false, nil
-	}
-
-	if session.checkpointReady == nil {
-		return false, nil
-	}
-	select {
-	case <-session.checkpointReady:
-		return true, nil
-	case <-ctx.Done():
-		return false, ctx.Err()
-	case <-session.streamDone:
-		select {
-		case <-session.checkpointReady:
-			return true, nil
-		default:
-			return false, nil
-		}
-	}
+	stream         *cursorproto.H2Stream
+	pending        []pendingMcpExec
+	toolResultCh   chan []toolResultInfo
+	resumeOutCh    chan cliproxyexecutor.StreamChunk
+	switchOutput   func(chan cliproxyexecutor.StreamChunk)
+	streamDone     <-chan struct{}
+	resuming       bool
+	cancel         context.CancelFunc // cancels the session-scoped heartbeat (NOT tied to HTTP request)
+	createdAt      time.Time
+	authID         string // auth file ID that created this session (for multi-account isolation)
+	conversationID string // Cursor conversation inherited by fresh tool continuations
 }
 
 type pendingMcpExec struct {
@@ -514,9 +485,8 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 // ExecuteStream handles streaming requests.
 // It supports MCP tool call sessions: when Cursor returns an MCP tool call,
-// the H2 stream stays alive long enough to capture the server checkpoint.
-// The upstream stream stays alive only until the next request can inherit its
-// checkpoint. Tool continuations always use a fresh H2 Run.
+// the H2 stream stays alive while the client executes it. The next HTTP request
+// injects the result into that same Cursor Run and attaches a fresh output channel.
 func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	log.Debugf("cursor ExecuteStream: model=%s sourceFormat=%s payloadLen=%d", req.Model, opts.SourceFormat, len(req.Payload))
 	defer func() {
@@ -552,6 +522,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	parsed := parseOpenAIRequest(payload)
+	adaptCursorTeammateReply(parsed)
 	log.Debugf("cursor: parsed request: model=%s userText=%d chars, turns=%d, tools=%d, toolResults=%d",
 		parsed.Model, len(parsed.UserText), len(parsed.Turns), len(parsed.Tools), len(parsed.ToolResults))
 
@@ -569,9 +540,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	var continuationPending []pendingMcpExec
 	continuationMatched := false
 
-	// Match tool results to the exact pending Cursor tool call. The old H2 stream
-	// is never resumed in place: it can acknowledge the result and then emit only
-	// heartbeats. Instead, inherit its conversation and checkpoint for a fresh Run.
+	// Match tool results to the exact pending Cursor tool call. Reusing the active
+	// H2 Run preserves Cursor's native tool loop and avoids one billed Run per tool.
+	// A saved checkpoint remains the fallback if the live stream has already ended.
 	if len(parsed.ToolResults) > 0 {
 		e.mu.Lock()
 		session, hasSession := e.sessions[sessionKey]
@@ -615,18 +586,21 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if hasSession && session.stream != nil && session.authID == authID {
 			continuationPending = append([]pendingMcpExec(nil), session.pending...)
 			continuationMatched = true
-			log.Debugf("cursor: forwarding tool result to MCP session %s before checkpoint continuation", matchedSessionKey)
-			checkpointReceived, waitErr := waitForCursorCheckpoint(ctx, session, parsed.ToolResults)
+			log.Debugf("cursor: resuming existing Run %s with %d tool results", matchedSessionKey, len(parsed.ToolResults))
+			resumed, resumeErr := e.resumeWithToolResults(ctx, session, parsed.ToolResults)
 			e.mu.Lock()
 			if current := e.sessions[matchedSessionKey]; current == session {
 				delete(e.sessions, matchedSessionKey)
 			}
 			e.mu.Unlock()
-			if waitErr != nil {
-				closeCursorSession(session)
-				return nil, fmt.Errorf("cursor: waiting for checkpoint: %w", waitErr)
+			if resumeErr == nil {
+				return resumed, nil
 			}
-			log.Debugf("cursor: replacing MCP session %s with checkpoint continuation (checkpoint=%t)", matchedSessionKey, checkpointReceived)
+			if ctx.Err() != nil {
+				closeCursorSession(session)
+				return nil, fmt.Errorf("cursor: resume canceled: %w", ctx.Err())
+			}
+			log.Warnf("cursor: existing Run %s could not resume: %v; falling back to checkpoint continuation", matchedSessionKey, resumeErr)
 			closeCursorSession(session)
 		}
 		if hasSession && session.authID != authID {
@@ -723,11 +697,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	var streamParam any
 
-	// Keep the old stream alive at a tool boundary long enough to receive Cursor's
-	// checkpoint. The next HTTP request closes it and starts a fresh continuation.
+	// Keep the upstream Run alive across client-side tool execution. Each downstream
+	// HTTP response gets its own output channel, while tool results share this channel.
 	toolResultCh := make(chan []toolResultInfo, 1)
-	checkpointReady := make(chan struct{})
-	var checkpointReadyOnce sync.Once
 	streamDone := make(chan struct{})
 
 	// The output closes at an MCP tool boundary while the upstream stream remains
@@ -839,18 +811,29 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				// Register the pending tool call before closing the current HTTP
 				// response. The downstream cancellation watcher can then distinguish a
 				// normal tool boundary from a user cancellation without a race.
-				log.Debugf("cursor: saving session %s for MCP tool resume (tool=%s)", sessionKey, exec.ToolName)
+				resumeOut := make(chan cliproxyexecutor.StreamChunk, 64)
+				log.Debugf("cursor: saving session %s for inline MCP resume (tool=%s)", sessionKey, exec.ToolName)
 				e.mu.Lock()
 				e.sessions[sessionKey] = &cursorSession{
-					stream:          stream,
-					pending:         []pendingMcpExec{exec},
-					toolResultCh:    toolResultCh,
-					checkpointReady: checkpointReady,
-					streamDone:      streamDone,
-					cancel:          sessionCancel,
-					createdAt:       time.Now(),
-					authID:          authID,
-					conversationID:  conversationId,
+					stream:       stream,
+					pending:      []pendingMcpExec{exec},
+					toolResultCh: toolResultCh,
+					resumeOutCh:  resumeOut,
+					switchOutput: func(ch chan cliproxyexecutor.StreamChunk) {
+						outMu.Lock()
+						currentOut = ch
+						streamParam = nil
+						chatId = "chatcmpl-" + uuid.New().String()[:28]
+						created = time.Now().Unix()
+						roleSent = false
+						toolCallIndex = 0
+						outMu.Unlock()
+					},
+					streamDone:     streamDone,
+					cancel:         sessionCancel,
+					createdAt:      time.Now(),
+					authID:         authID,
+					conversationID: conversationId,
 				}
 				e.mu.Unlock()
 
@@ -877,7 +860,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					updatedAt: time.Now(),
 				}
 				e.mu.Unlock()
-				checkpointReadyOnce.Do(func() { close(checkpointReady) })
 				log.Debugf("cursor: saved checkpoint (%d bytes) for conv=%s auth=%s", len(cpData), checkpointKey, authID)
 			},
 		)
@@ -943,6 +925,28 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	case <-firstChunkSent:
 		// Data started flowing — return stream to client
 		return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+	}
+}
+
+func (e *CursorExecutor) resumeWithToolResults(ctx context.Context, session *cursorSession, results []toolResultInfo) (*cliproxyexecutor.StreamResult, error) {
+	if session == nil || session.toolResultCh == nil {
+		return nil, fmt.Errorf("session has no tool result channel")
+	}
+	if session.resumeOutCh == nil || session.switchOutput == nil {
+		return nil, fmt.Errorf("session has no resume output")
+	}
+
+	session.switchOutput(session.resumeOutCh)
+	select {
+	case session.toolResultCh <- results:
+		if session.stream != nil {
+			e.closeStreamWhenDownstreamEnds(ctx, session.stream, session.cancel)
+		}
+		return &cliproxyexecutor.StreamResult{Chunks: session.resumeOutCh}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-session.streamDone:
+		return nil, fmt.Errorf("upstream Run ended before tool result delivery")
 	}
 }
 
@@ -1406,6 +1410,23 @@ func parseOpenAIRequest(payload []byte) *parsedOpenAIRequest {
 	p.Tools = gjson.GetBytes(payload, "tools").Array()
 
 	return p
+}
+
+func adaptCursorTeammateReply(parsed *parsedOpenAIRequest) {
+	if parsed == nil || !strings.Contains(parsed.UserText, "<teammate-message") || !strings.Contains(parsed.UserText, `summary="`) {
+		return
+	}
+	hasSendMessage := false
+	for _, tool := range parsed.Tools {
+		if tool.Get("function.name").String() == "SendMessage" {
+			hasSendMessage = true
+			break
+		}
+	}
+	if !hasSendMessage {
+		return
+	}
+	parsed.UserText += "\n\nClaude Code team protocol: a plain assistant response remains only in this teammate's transcript and is not delivered to the sender. Reply by calling the SendMessage tool exactly once, using the recipient requested in the teammate message and putting the complete conclusion in the tool content. Do not only print the conclusion as assistant text."
 }
 
 // flattenConversationIntoUserText flattens the full conversation history
