@@ -38,7 +38,10 @@ func TestPatchManagementHTMLForOpenCodeGoRequiresOAuthPageAnchors(t *testing.T) 
 }
 
 func TestPatchManagementHTMLForOpenCodeGoCurrentBundle(t *testing.T) {
-	panelPath := filepath.Join("..", "..", "static", "management.html")
+	panelPath := os.Getenv("MANAGEMENT_PANEL_TEST_PATH")
+	if panelPath == "" {
+		panelPath = filepath.Join("..", "..", "static", "management.html")
+	}
 	data, errRead := os.ReadFile(panelPath)
 	if errRead != nil {
 		if os.IsNotExist(errRead) {
@@ -47,6 +50,11 @@ func TestPatchManagementHTMLForOpenCodeGoCurrentBundle(t *testing.T) {
 		t.Fatalf("read current management panel: %v", errRead)
 	}
 	patched := patchManagementHTMLForOpenCodeGo(data)
+	if !strings.Contains(string(patched), "createOpenCodeGoConfig") {
+		for i, patch := range currentOpenCodeGoBundlePatches() {
+			t.Logf("current bundle patch %d anchor count = %d, want %d", i, strings.Count(string(data), patch.old), patch.count)
+		}
+	}
 	for _, want := range []string{
 		"saveOpenCodeGo=async",
 		"/opencode-go-api-key",
@@ -58,9 +66,9 @@ func TestPatchManagementHTMLForOpenCodeGoCurrentBundle(t *testing.T) {
 		"case`opencodeGo`",
 		"/auth-files/status",
 		"providerNames:{gemini:`Gemini`,opencodeGo:`OpenCode Go`",
-		"Op.getState().clearCache()",
+		"getState().clearCache()",
 		"data-opencode-go-account",
-		"opencodeGo:n.openCodeGoKeys?.length??0",
+		"openCodeGoKeys?.length??0",
 	} {
 		if !strings.Contains(string(patched), want) {
 			t.Fatalf("current panel patch missing %q", want)
@@ -69,5 +77,10 @@ func TestPatchManagementHTMLForOpenCodeGoCurrentBundle(t *testing.T) {
 	second := patchManagementHTMLForOpenCodeGo(patched)
 	if string(second) != string(patched) {
 		t.Fatal("second current bundle patch changed content")
+	}
+	if outputPath := os.Getenv("MANAGEMENT_PANEL_PATCHED_OUTPUT"); outputPath != "" {
+		if errWrite := os.WriteFile(outputPath, patched, 0o644); errWrite != nil {
+			t.Fatalf("write patched management panel: %v", errWrite)
+		}
 	}
 }

@@ -8,17 +8,18 @@ import (
 )
 
 const (
-	openCodeGoPageStart = "function ej(){"
-	openCodeGoPageEnd   = "function tj(){"
-
 	openCodeGoStateAnchor = "[l,u]=(0,y.useState)({fileName:``,location:``,loading:!1}),d="
 	openCodeGoStatePatch  = "[l,u]=(0,y.useState)({fileName:``,location:``,loading:!1}),[openCodeGoState,setOpenCodeGoState]=(0,y.useState)({apiKey:``,loading:!1,status:``,error:``}),d="
 
-	openCodeGoHandlerAnchor = "},N=(n,r=!1)=>{"
-	openCodeGoHandlerPatch  = "},saveOpenCodeGo=async()=>{let t=openCodeGoState.apiKey.trim();if(!t){r(e(`auth_login.opencode_go_key_required`),`warning`);return}setOpenCodeGoState(a=>({...a,loading:!0,status:``,error:``}));try{let n=await sp.get(`/opencode-go-api-key`),i=Array.isArray(n?.[`opencode-go-api-key`])?n[`opencode-go-api-key`].map(e=>{let t={...e};return delete t[`auth-index`],t}):[];i.some(e=>String(e?.[`api-key`]??``).trim()===t)||i.push({\"api-key\":t}),await sp.put(`/opencode-go-api-key`,i),setOpenCodeGoState(a=>({...a,apiKey:``,loading:!1,status:`success`,error:``})),r(e(`auth_login.opencode_go_key_saved`),`success`)}catch(t){let n=Ec(t);setOpenCodeGoState(a=>({...a,loading:!1,status:`error`,error:n||e(`auth_login.opencode_go_key_save_error`)})),r(`${e(`auth_login.opencode_go_key_save_error`)} ${n||``}`,`error`)}},N=(n,r=!1)=>{"
+	openCodeGoHandlerAnchor       = "},N=(n,r=!1)=>{"
+	openCodeGoHandlerPatch        = "},saveOpenCodeGo=async()=>{let t=openCodeGoState.apiKey.trim();if(!t){r(e(`auth_login.opencode_go_key_required`),`warning`);return}setOpenCodeGoState(a=>({...a,loading:!0,status:``,error:``}));try{let n=await sp.get(`/opencode-go-api-key`),i=Array.isArray(n?.[`opencode-go-api-key`])?n[`opencode-go-api-key`].map(e=>{let t={...e};return delete t[`auth-index`],t}):[];i.some(e=>String(e?.[`api-key`]??``).trim()===t)||i.push({\"api-key\":t}),await sp.put(`/opencode-go-api-key`,i),setOpenCodeGoState(a=>({...a,apiKey:``,loading:!1,status:`success`,error:``})),r(e(`auth_login.opencode_go_key_saved`),`success`)}catch(t){let n=Ec(t);setOpenCodeGoState(a=>({...a,loading:!1,status:`error`,error:n||e(`auth_login.opencode_go_key_save_error`)})),r(`${e(`auth_login.opencode_go_key_save_error`)} ${n||``}`,`error`)}},N=(n,r=!1)=>{"
+	openCodeGoCurrentHandlerPatch = "},saveOpenCodeGo=async()=>{let t=openCodeGoState.apiKey.trim();if(!t){r(e(`auth_login.opencode_go_key_required`),`warning`);return}setOpenCodeGoState(a=>({...a,loading:!0,status:``,error:``}));try{let n=await Tp.get(`/opencode-go-api-key`),i=Array.isArray(n?.[`opencode-go-api-key`])?n[`opencode-go-api-key`].map(e=>{let t={...e};return delete t[`auth-index`],t}):[];i.some(e=>String(e?.[`api-key`]??``).trim()===t)||i.push({\"api-key\":t}),await Tp.put(`/opencode-go-api-key`,i),Xp.getState().clearCache(),setOpenCodeGoState(a=>({...a,apiKey:``,loading:!1,status:`success`,error:``})),r(e(`auth_login.opencode_go_key_saved`),`success`)}catch(t){let n=Dc(t);setOpenCodeGoState(a=>({...a,loading:!1,status:`error`,error:n||e(`auth_login.opencode_go_key_save_error`)})),r(`${e(`auth_login.opencode_go_key_save_error`)} ${n||``}`,`error`)}},N=(n,r=!1)=>{"
 
 	openCodeGoCardAnchor = "(0,H.jsx)(jE,{title:(0,H.jsxs)(`span`,{className:FA.cardTitle,children:[(0,H.jsx)(`img`,{src:bx,alt:``,className:FA.cardTitleIcon}),e(`vertex_import.title`)]})"
 	openCodeGoCard       = "(0,H.jsx)(jE,{title:(0,H.jsxs)(`span`,{className:FA.cardTitle,children:[(0,H.jsx)(`span`,{className:FA.cardTitleIconFallback,\"aria-hidden\":`true`,children:`G`}),(0,H.jsx)(`span`,{children:e(`auth_login.opencode_go_key_title`)})]}),extra:(0,H.jsx)(U,{onClick:saveOpenCodeGo,loading:openCodeGoState.loading,children:e(`auth_login.opencode_go_key_button`)}),children:(0,H.jsxs)(`div`,{className:FA.cardContent,children:[(0,H.jsx)(`div`,{className:FA.cardHint,children:e(`auth_login.opencode_go_key_hint`)}),(0,H.jsxs)(`div`,{className:FA.formItem,children:[(0,H.jsx)(`label`,{className:FA.formItemLabel,children:e(`auth_login.opencode_go_key_label`)}),(0,H.jsx)(`input`,{className:`input`,type:`password`,autoComplete:`off`,value:openCodeGoState.apiKey,onChange:e=>setOpenCodeGoState(t=>({...t,apiKey:e.target.value,status:``,error:``})),placeholder:e(`auth_login.opencode_go_key_placeholder`)}),(0,H.jsx)(`div`,{className:FA.cardHintSecondary,children:e(`auth_login.opencode_go_key_field_hint`)})]}),openCodeGoState.status===`success`&&(0,H.jsx)(`div`,{className:`status-badge success`,children:e(`auth_login.opencode_go_key_saved`)}),openCodeGoState.status===`error`&&(0,H.jsx)(`div`,{className:`status-badge error`,children:openCodeGoState.error||e(`auth_login.opencode_go_key_save_error`)})]})}),"
+
+	openCodeGoCurrentCardAnchor = "(0,H.jsx)(SM,{title:(0,H.jsxs)(`span`,{className:$M.cardTitle,children:[(0,H.jsx)(`img`,{src:oS,alt:``,className:$M.cardTitleIcon}),e(`vertex_import.title`)]})"
+	openCodeGoCurrentCard       = "(0,H.jsx)(SM,{title:(0,H.jsxs)(`span`,{className:$M.cardTitle,children:[(0,H.jsx)(`span`,{className:$M.cardTitleIconFallback,\"aria-hidden\":`true`,children:`G`}),(0,H.jsx)(`span`,{children:e(`auth_login.opencode_go_key_title`)})]}),extra:(0,H.jsx)(U,{onClick:saveOpenCodeGo,loading:openCodeGoState.loading,children:e(`auth_login.opencode_go_key_button`)}),children:(0,H.jsxs)(`div`,{className:$M.cardContent,children:[(0,H.jsx)(`div`,{className:$M.cardHint,children:e(`auth_login.opencode_go_key_hint`)}),(0,H.jsxs)(`div`,{className:$M.formItem,children:[(0,H.jsx)(`label`,{className:$M.formItemLabel,children:e(`auth_login.opencode_go_key_label`)}),(0,H.jsx)(`input`,{className:`input`,type:`password`,autoComplete:`off`,value:openCodeGoState.apiKey,onChange:e=>setOpenCodeGoState(t=>({...t,apiKey:e.target.value,status:``,error:``})),placeholder:e(`auth_login.opencode_go_key_placeholder`)}),(0,H.jsx)(`div`,{className:$M.cardHintSecondary,children:e(`auth_login.opencode_go_key_field_hint`)})]}),openCodeGoState.status===`success`&&(0,H.jsx)(`div`,{className:`status-badge success`,children:e(`auth_login.opencode_go_key_saved`)}),openCodeGoState.status===`error`&&(0,H.jsx)(`div`,{className:`status-badge error`,children:openCodeGoState.error||e(`auth_login.opencode_go_key_save_error`)})]})}),"
 )
 
 // patchManagementHTMLForOpenCodeGo adds the OpenCode Go subscription key form
@@ -31,29 +32,19 @@ func patchManagementHTMLForOpenCodeGo(data []byte) []byte {
 	original := s
 
 	if !strings.Contains(s, "saveOpenCodeGo=async") {
-		pageStart := strings.Index(s, openCodeGoPageStart)
-		if pageStart == -1 {
-			log.Debug("management panel OpenCode Go patch skipped: OAuth page start not found")
-			return data
-		}
-		pageEndOffset := strings.Index(s[pageStart:], openCodeGoPageEnd)
-		if pageEndOffset == -1 {
-			log.Debug("management panel OpenCode Go patch skipped: OAuth page end not found")
-			return data
-		}
-		pageEnd := pageStart + pageEndOffset
-		page := s[pageStart:pageEnd]
-		if strings.Count(page, openCodeGoStateAnchor) != 1 ||
-			strings.Count(page, openCodeGoHandlerAnchor) != 1 ||
-			strings.Count(page, openCodeGoCardAnchor) != 1 {
+		if strings.Count(s, openCodeGoStateAnchor) != 1 || strings.Count(s, openCodeGoHandlerAnchor) != 1 {
 			log.Debug("management panel OpenCode Go patch skipped: OAuth page anchors not found")
-			return data
+		} else if strings.Count(s, openCodeGoCurrentCardAnchor) == 1 {
+			s = strings.Replace(s, openCodeGoStateAnchor, openCodeGoStatePatch, 1)
+			s = strings.Replace(s, openCodeGoHandlerAnchor, openCodeGoCurrentHandlerPatch, 1)
+			s = strings.Replace(s, openCodeGoCurrentCardAnchor, openCodeGoCurrentCard+openCodeGoCurrentCardAnchor, 1)
+		} else if strings.Count(s, openCodeGoCardAnchor) == 1 {
+			s = strings.Replace(s, openCodeGoStateAnchor, openCodeGoStatePatch, 1)
+			s = strings.Replace(s, openCodeGoHandlerAnchor, openCodeGoHandlerPatch, 1)
+			s = strings.Replace(s, openCodeGoCardAnchor, openCodeGoCard+openCodeGoCardAnchor, 1)
+		} else {
+			log.Debug("management panel OpenCode Go patch skipped: OAuth card anchor not found")
 		}
-
-		page = strings.Replace(page, openCodeGoStateAnchor, openCodeGoStatePatch, 1)
-		page = strings.Replace(page, openCodeGoHandlerAnchor, openCodeGoHandlerPatch, 1)
-		page = strings.Replace(page, openCodeGoCardAnchor, openCodeGoCard+openCodeGoCardAnchor, 1)
-		s = s[:pageStart] + page + s[pageEnd:]
 	}
 
 	localePatches := [][2]string{
