@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
@@ -62,16 +63,12 @@ type savedCheckpoint struct {
 }
 
 type cursorSession struct {
-	stream       *cursorproto.H2Stream
-	blobStore    map[string][]byte
-	mcpTools     []cursorproto.McpToolDef
-	pending      []pendingMcpExec
-	cancel       context.CancelFunc // cancels the session-scoped heartbeat (NOT tied to HTTP request)
-	createdAt    time.Time
-	authID       string                                     // auth file ID that created this session (for multi-account isolation)
-	toolResultCh chan []toolResultInfo                      // receives tool results from the next HTTP request
-	resumeOutCh  chan cliproxyexecutor.StreamChunk          // output channel for resumed response
-	switchOutput func(ch chan cliproxyexecutor.StreamChunk) // callback to switch output channel
+	stream         *cursorproto.H2Stream
+	pending        []pendingMcpExec
+	cancel         context.CancelFunc // cancels the session-scoped heartbeat (NOT tied to HTTP request)
+	createdAt      time.Time
+	authID         string // auth file ID that created this session (for multi-account isolation)
+	conversationID string // Cursor conversation inherited by fresh tool continuations
 }
 
 type pendingMcpExec struct {
@@ -149,6 +146,43 @@ func closeCursorSession(session *cursorSession) {
 	if session.stream != nil {
 		session.stream.Close()
 	}
+}
+
+func cloneCursorBlobStore(src map[string][]byte) map[string][]byte {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string][]byte, len(src))
+	for key, value := range src {
+		dst[key] = append([]byte(nil), value...)
+	}
+	return dst
+}
+
+func cloneSavedCursorCheckpoint(src *savedCheckpoint) (*savedCheckpoint, bool) {
+	if src == nil {
+		return nil, false
+	}
+	return &savedCheckpoint{
+		data:      append([]byte(nil), src.data...),
+		blobStore: cloneCursorBlobStore(src.blobStore),
+		authID:    src.authID,
+		updatedAt: src.updatedAt,
+	}, true
+}
+
+func sessionMatchesToolResults(session *cursorSession, results []toolResultInfo) bool {
+	if session == nil {
+		return false
+	}
+	for _, pending := range session.pending {
+		for _, result := range results {
+			if pending.ToolCallId != "" && pending.ToolCallId == result.ToolCallId {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (e *CursorExecutor) hasPendingSessionForStreamLocked(stream *cursorproto.H2Stream) bool {
@@ -379,11 +413,10 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 
 	parsed := parseOpenAIRequest(payload)
-	ccSessId := extractClaudeCodeSessionId(req.Payload)
-	conversationId := deriveConversationId(apiKeyFromContext(ctx), ccSessId, parsed.SystemPrompt)
 	// Non-stream OpenAI chat is request-scoped: Cursor ignores structured turns and
 	// reusing a conversation_id without server checkpoint causes "missing blob" errors
 	// on multi-turn payloads. Flatten history into UserText when present.
+	conversationId := deriveConversationId(apiKeyFromContext(ctx), "", parsed.SystemPrompt)
 	if len(parsed.Turns) > 0 || len(parsed.ToolResults) > 0 {
 		flattenConversationIntoUserText(parsed)
 	}
@@ -391,6 +424,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	requestBytes := cursorproto.EncodeRunRequest(params)
 	framedRequest := cursorproto.FrameConnectMessage(requestBytes, 0)
+	log.Debugf("cursor: encoded Run request bytes=%d userTextBytes=%d checkpoint=%t", len(requestBytes), len(params.UserText), len(params.RawCheckpoint) > 0)
 
 	stream, err := openCursorH2Stream(ctx, e.cfg, auth, accessToken)
 	if err != nil {
@@ -446,9 +480,9 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 // ExecuteStream handles streaming requests.
 // It supports MCP tool call sessions: when Cursor returns an MCP tool call,
-// the H2 stream is kept alive. When Claude Code returns the tool result in
-// the next request, the result is sent back on the same stream (session resume).
-// This mirrors the activeSessions/resumeWithToolResults pattern in cursor-fetch.ts.
+// the H2 stream stays alive long enough to capture the server checkpoint.
+// The upstream stream stays alive only until the next request can inherit its
+// checkpoint. Tool continuations always use a fresh H2 Run.
 func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	log.Debugf("cursor ExecuteStream: model=%s sourceFormat=%s payloadLen=%d", req.Model, opts.SourceFormat, len(req.Payload))
 	defer func() {
@@ -465,11 +499,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, fmt.Errorf("cursor: access token not found")
 	}
 
-	// Extract session_id from metadata BEFORE translation (translation strips metadata)
-	ccSessionId := extractClaudeCodeSessionId(req.Payload)
-	if ccSessionId == "" && len(opts.OriginalRequest) > 0 {
-		ccSessionId = extractClaudeCodeSessionId(opts.OriginalRequest)
-	}
+	// Resolve the downstream conversation identity before translation strips metadata.
+	// Headers are authoritative for Claude Code; body and derived identities are fallbacks.
+	rawSourceSessionID := cursorSourceSessionID(req, opts)
 
 	// Translate input to OpenAI format if needed
 	from := opts.SourceFormat
@@ -489,9 +521,10 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	log.Debugf("cursor: parsed request: model=%s userText=%d chars, turns=%d, tools=%d, toolResults=%d",
 		parsed.Model, len(parsed.UserText), len(parsed.Turns), len(parsed.Tools), len(parsed.ToolResults))
 
-	conversationId := deriveConversationId(apiKeyFromContext(ctx), ccSessionId, parsed.SystemPrompt)
+	sourceSessionID := scopeCursorSourceSessionID(rawSourceSessionID, parsed)
+	conversationId := deriveConversationId(apiKeyFromContext(ctx), sourceSessionID, parsed.SystemPrompt)
 	authID := auth.ID // e.g. "cursor.json" or "cursor-account2.json"
-	log.Debugf("cursor: conversationId=%s authID=%s", conversationId, authID)
+	log.Debugf("cursor: conversationId=%s authID=%s stableSource=%t", conversationId, authID, sourceSessionID != "")
 
 	// Session key includes authID (H2 stream is auth-specific, not transferable).
 	// Checkpoint key uses conversationId only — allows detecting auth migration.
@@ -499,27 +532,35 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	checkpointKey := conversationId
 	needsTranslate := from.String() != "" && from.String() != "openai"
 
-	// Check if we can resume an existing session with tool results
+	var continuationPending []pendingMcpExec
+	continuationMatched := false
+
+	// Match tool results to the exact pending Cursor tool call. The old H2 stream
+	// is never resumed in place: it can acknowledge the result and then emit only
+	// heartbeats. Instead, inherit its conversation and checkpoint for a fresh Run.
 	if len(parsed.ToolResults) > 0 {
 		e.mu.Lock()
 		session, hasSession := e.sessions[sessionKey]
 		matchedSessionKey := sessionKey
-		matchedStateless := false
-		if hasSession {
+		if hasSession && sessionMatchesToolResults(session, parsed.ToolResults) {
 			delete(e.sessions, sessionKey)
+		} else {
+			session = nil
+			hasSession = false
 		}
-		// Stateless OpenAI-compatible clients do not provide Claude Code's session_id,
-		// so every HTTP request has a fresh conversationId. Match the newest returned
-		// tool_call_id to the pending H2 session instead.
-		if !hasSession && ccSessionId == "" {
+		if !hasSession {
 			if matchedKey, matchedSession := e.findSessionByToolResultsLocked(authID, parsed.ToolResults); matchedSession != nil {
 				session = matchedSession
 				hasSession = true
-				matchedStateless = true
 				matchedSessionKey = matchedKey
 				delete(e.sessions, matchedKey)
-				log.Debugf("cursor: matched stateless tool result to session %s", matchedKey)
+				log.Debugf("cursor: matched tool result lineage to session %s", matchedKey)
 			}
+		}
+		if hasSession && session.conversationID != "" {
+			conversationId = session.conversationID
+			sessionKey = authID + ":" + conversationId
+			checkpointKey = conversationId
 		}
 		// If no session found for current auth, check for stale sessions from
 		// a different auth on the same conversation (quota failover scenario).
@@ -538,17 +579,10 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		e.mu.Unlock()
 
 		if hasSession && session.stream != nil && session.authID == authID {
-			if matchedStateless {
-				// Cursor's inline MCP continuation can acknowledge the result but then
-				// emit only heartbeats until the downstream request times out. Stateless
-				// clients already resend the complete tool history, so close the old H2
-				// stream and continue immediately in a fresh request with that history.
-				log.Debugf("cursor: replacing stateless MCP session %s with a fresh continuation", matchedSessionKey)
-				closeCursorSession(session)
-			} else {
-				log.Debugf("cursor: resuming session %s with %d tool results", matchedSessionKey, len(parsed.ToolResults))
-				return e.resumeWithToolResults(ctx, session, parsed, from, to, req, originalPayload, payload, needsTranslate)
-			}
+			continuationPending = append([]pendingMcpExec(nil), session.pending...)
+			continuationMatched = true
+			log.Debugf("cursor: replacing MCP session %s with checkpoint continuation", matchedSessionKey)
+			closeCursorSession(session)
 		}
 		if hasSession && session.authID != authID {
 			log.Warnf("cursor: session %s belongs to auth %s, but request is from %s — skipping resume", matchedSessionKey, session.authID, authID)
@@ -570,27 +604,32 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	e.mu.Unlock()
 
+	hadConversationHistory := len(parsed.ToolResults) > 0 || len(parsed.Turns) > 0
+
 	// Look up saved checkpoint for this conversation (keyed by conversationId only).
 	// Checkpoint is auth-specific: if auth changed (e.g. quota exhaustion failover),
 	// the old checkpoint is useless on the new account — discard and flatten.
 	e.mu.Lock()
-	saved, hasCheckpoint := e.checkpoints[checkpointKey]
+	saved, hasCheckpoint := cloneSavedCursorCheckpoint(e.checkpoints[checkpointKey])
 	e.mu.Unlock()
+
+	useCheckpoint := hasCheckpoint && saved != nil && len(saved.data) > 0 && saved.authID == authID
+	if useCheckpoint && len(parsed.ToolResults) > 0 {
+		if !continuationMatched || !prepareCursorCheckpointContinuation(parsed, continuationPending) {
+			// A checkpoint without exact pending tool lineage may belong to another
+			// concurrent branch sharing a client session ID. Prefer a cold replay.
+			useCheckpoint = false
+			log.Debugf("cursor: checkpoint lacks matching tool lineage for conv=%s; flattening safely", checkpointKey)
+		}
+	}
 
 	params := buildRunRequestParams(parsed, conversationId, req.Model)
 
-	if hasCheckpoint && saved.data != nil && saved.authID == authID {
-		// Same auth — use checkpoint normally
-		log.Debugf("cursor: using saved checkpoint (%d bytes) for conv=%s auth=%s", len(saved.data), checkpointKey, authID)
+	if useCheckpoint {
+		log.Debugf("cursor: using saved checkpoint (%d bytes) for conv=%s auth=%s delta=%t", len(saved.data), checkpointKey, authID, continuationMatched)
 		params.RawCheckpoint = saved.data
-		// Merge saved blobStore into params
-		if params.BlobStore == nil {
-			params.BlobStore = make(map[string][]byte)
-		}
 		for k, v := range saved.blobStore {
-			if _, exists := params.BlobStore[k]; !exists {
-				params.BlobStore[k] = v
-			}
+			params.BlobStore[k] = append([]byte(nil), v...)
 		}
 	} else if hasCheckpoint && saved.data != nil && saved.authID != authID {
 		// Auth changed (quota failover) — checkpoint is not portable across accounts.
@@ -599,11 +638,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		e.mu.Lock()
 		delete(e.checkpoints, checkpointKey)
 		e.mu.Unlock()
-		if len(parsed.ToolResults) > 0 || len(parsed.Turns) > 0 {
+		if hadConversationHistory {
 			flattenConversationIntoUserText(parsed)
 			params = buildRunRequestParams(parsed, conversationId, req.Model)
 		}
-	} else if len(parsed.ToolResults) > 0 || len(parsed.Turns) > 0 {
+	} else if hadConversationHistory {
 		// Fallback: no checkpoint available (cold resume / proxy restart).
 		// Flatten the full conversation history (including tool interactions) into userText.
 		// Cursor's turns encoding is not reliably read by the model, but userText always works.
@@ -613,7 +652,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	requestBytes := cursorproto.EncodeRunRequest(params)
 	framedRequest := cursorproto.FrameConnectMessage(requestBytes, 0)
+	log.Debugf("cursor: encoded Run request bytes=%d userTextBytes=%d checkpoint=%t", len(requestBytes), len(params.UserText), len(params.RawCheckpoint) > 0)
 
+	requestStartedAt := time.Now()
 	stream, err := openCursorH2Stream(ctx, e.cfg, auth, accessToken)
 	if err != nil {
 		return nil, err
@@ -637,14 +678,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	var streamParam any
 
-	// Tool result channel for inline mode. processH2SessionFrames blocks on it
-	// when mcpArgs is received, while continuing to handle KV/heartbeat.
+	// Keep the old stream alive at a tool boundary long enough to receive Cursor's
+	// checkpoint. The next HTTP request closes it and starts a fresh continuation.
 	toolResultCh := make(chan []toolResultInfo, 1)
 
-	// Switchable output: initially writes to `chunks`. After mcpArgs, the
-	// onMcpExec callback closes `chunks` (ending the first HTTP response),
-	// then processH2SessionFrames blocks on toolResultCh. When results arrive,
-	// it switches to `resumeOutCh` (created by resumeWithToolResults).
+	// The output closes at an MCP tool boundary while the upstream stream remains
+	// available for checkpoint and KV messages.
 	var outMu sync.Mutex
 	currentOut := chunks
 
@@ -695,7 +734,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	firstChunkSent := make(chan struct{}, 1) // buffered: goroutine won't block signaling
 
 	origEmitToOut := emitToOut
+	var firstChunkLogOnce sync.Once
 	emitToOut = func(chunk cliproxyexecutor.StreamChunk) {
+		firstChunkLogOnce.Do(func() {
+			log.Debugf("cursor: first downstream chunk after %s conv=%s checkpoint=%t", time.Since(requestStartedAt).Round(time.Millisecond), conversationId, len(params.RawCheckpoint) > 0)
+		})
 		select {
 		case firstChunkSent <- struct{}{}:
 		default:
@@ -704,8 +747,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	go func() {
-		var resumeOutCh chan cliproxyexecutor.StreamChunk
-		_ = resumeOutCh
 		roleSent := false
 		toolCallIndex := 0
 		usage := &cursorTokenUsage{}
@@ -749,33 +790,17 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				// Register the pending tool call before closing the current HTTP
 				// response. The downstream cancellation watcher can then distinguish a
 				// normal tool boundary from a user cancellation without a race.
-				resumeOut := make(chan cliproxyexecutor.StreamChunk, 64)
 				log.Debugf("cursor: saving session %s for MCP tool resume (tool=%s)", sessionKey, exec.ToolName)
 				e.mu.Lock()
 				e.sessions[sessionKey] = &cursorSession{
-					stream:       stream,
-					blobStore:    params.BlobStore,
-					mcpTools:     params.McpTools,
-					pending:      []pendingMcpExec{exec},
-					cancel:       sessionCancel,
-					createdAt:    time.Now(),
-					authID:       authID,
-					toolResultCh: toolResultCh, // reuse same channel across rounds
-					resumeOutCh:  resumeOut,
-					switchOutput: func(ch chan cliproxyexecutor.StreamChunk) {
-						outMu.Lock()
-						currentOut = ch
-						// Reset translator state so the new HTTP response gets
-						// a fresh message_start, content_block_start, etc.
-						streamParam = nil
-						// New response needs its own message ID
-						chatId = "chatcmpl-" + uuid.New().String()[:28]
-						created = time.Now().Unix()
-						outMu.Unlock()
-					},
+					stream:         stream,
+					pending:        []pendingMcpExec{exec},
+					cancel:         sessionCancel,
+					createdAt:      time.Now(),
+					authID:         authID,
+					conversationID: conversationId,
 				}
 				e.mu.Unlock()
-				resumeOutCh = resumeOut
 
 				// Close current output to end the current HTTP SSE response.
 				outMu.Lock()
@@ -785,8 +810,8 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				outMu.Unlock()
 
-				// processH2SessionFrames will now block on toolResultCh (inline wait loop)
-				// while continuing to handle KV messages
+				// processH2SessionFrames now waits while continuing to handle checkpoint,
+				// KV, and heartbeat messages. It is canceled by the fresh continuation.
 			},
 			toolResultCh,
 			usage,
@@ -794,8 +819,8 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				// Save checkpoint keyed by conversationId, tagged with authID for migration detection
 				e.mu.Lock()
 				e.checkpoints[checkpointKey] = &savedCheckpoint{
-					data:      cpData,
-					blobStore: params.BlobStore,
+					data:      append([]byte(nil), cpData...),
+					blobStore: cloneCursorBlobStore(params.BlobStore),
 					authID:    authID,
 					updatedAt: time.Now(),
 				}
@@ -873,45 +898,6 @@ func normalizeCursorResponsesUsage(format sdktranslator.Format, payload []byte) 
 		return helps.EnsureResponsesUsageDetails(payload)
 	}
 	return payload
-}
-
-// resumeWithToolResults injects tool results into the running processH2SessionFrames
-// via the toolResultCh channel. The original goroutine from ExecuteStream is still alive,
-// blocking on toolResultCh. Once we send the results, it sends the MCP result to Cursor
-// and continues processing the response text — all in the same goroutine that has been
-// handling KV messages the whole time.
-func (e *CursorExecutor) resumeWithToolResults(
-	ctx context.Context,
-	session *cursorSession,
-	parsed *parsedOpenAIRequest,
-	from, to sdktranslator.Format,
-	req cliproxyexecutor.Request,
-	originalPayload, payload []byte,
-	needsTranslate bool,
-) (*cliproxyexecutor.StreamResult, error) {
-	log.Debugf("cursor: resumeWithToolResults: injecting %d tool results via channel", len(parsed.ToolResults))
-
-	if session.toolResultCh == nil {
-		return nil, fmt.Errorf("cursor: session has no toolResultCh (stale session?)")
-	}
-	if session.resumeOutCh == nil {
-		return nil, fmt.Errorf("cursor: session has no resumeOutCh")
-	}
-
-	log.Debugf("cursor: resumeWithToolResults: switching output to resumeOutCh and injecting results")
-
-	// Switch the output channel BEFORE injecting results, so that when
-	// processH2SessionFrames unblocks and starts emitting text, it writes
-	// to the resumeOutCh which the new HTTP handler is reading from.
-	if session.switchOutput != nil {
-		session.switchOutput(session.resumeOutCh)
-	}
-
-	// Inject tool results — this unblocks the waiting processH2SessionFrames
-	session.toolResultCh <- parsed.ToolResults
-
-	// Return the resumeOutCh for the new HTTP handler to read from
-	return &cliproxyexecutor.StreamResult{Chunks: session.resumeOutCh}, nil
 }
 
 // --- H2Stream helpers ---
@@ -1420,6 +1406,45 @@ func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 	parsed.ToolResults = nil
 }
 
+func prepareCursorCheckpointContinuation(parsed *parsedOpenAIRequest, pending []pendingMcpExec) bool {
+	if parsed == nil || len(pending) == 0 || len(parsed.ToolResults) == 0 {
+		return false
+	}
+
+	latest := make(map[string]toolResultInfo, len(parsed.ToolResults))
+	for _, result := range parsed.ToolResults {
+		if result.ToolCallId != "" {
+			latest[result.ToolCallId] = result
+		}
+	}
+
+	var buf strings.Builder
+	matched := 0
+	for _, exec := range pending {
+		result, ok := latest[exec.ToolCallId]
+		if !ok {
+			continue
+		}
+		content := truncateCursorHistoryText(result.Content)
+		fmt.Fprintf(&buf, "TOOL_RESULT (call_id: %s, name: %s): %s\n\n", exec.ToolCallId, exec.ToolName, content)
+		matched++
+	}
+	if matched == 0 {
+		return false
+	}
+	if parsed.UserText != "" {
+		buf.WriteString("CURRENT_USER_MESSAGE: ")
+		buf.WriteString(strings.ToValidUTF8(parsed.UserText, "\uFFFD"))
+		buf.WriteString("\n\n")
+	}
+	buf.WriteString("The tool results above complete the pending tool calls. Continue from the saved conversation state.")
+
+	parsed.UserText = buf.String()
+	parsed.Turns = nil
+	parsed.ToolResults = nil
+	return true
+}
+
 func appendCursorHistorySection(buf *strings.Builder, label, content string) {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -1622,16 +1647,59 @@ func extractCCH(systemPrompt string) string {
 	return rest[:end]
 }
 
-// extractClaudeCodeSessionId extracts session_id from Claude Code's metadata.user_id JSON.
-// Format: {"metadata":{"user_id":"{\"session_id\":\"xxx\",\"device_id\":\"yyy\"}"}}
-func extractClaudeCodeSessionId(payload []byte) string {
-	userIdStr := gjson.GetBytes(payload, "metadata.user_id").String()
-	if userIdStr == "" {
-		return ""
+func cursorSourceSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	for _, metadata := range []map[string]any{opts.Metadata, req.Metadata} {
+		if metadata == nil {
+			continue
+		}
+		if value, ok := metadata[cliproxyexecutor.ExecutionSessionMetadataKey].(string); ok {
+			if normalized := cliproxysession.NormalizeExplicitID(value); normalized != "" {
+				return normalized
+			}
+		}
 	}
-	// user_id is a JSON string that needs to be parsed again
-	sid := gjson.Get(userIdStr, "session_id").String()
-	return sid
+
+	for _, name := range []string{
+		"X-Claude-Code-Session-Id",
+		"X-Session-ID",
+		"Session-Id",
+		"Session_id",
+		"X-Session-Affinity",
+	} {
+		if normalized := cliproxysession.NormalizeExplicitID(opts.Headers.Get(name)); normalized != "" {
+			return normalized
+		}
+	}
+
+	for _, payload := range [][]byte{opts.OriginalRequest, req.Payload} {
+		if normalized := cliproxysession.ClaudeMetadataSessionID(payload); normalized != "" {
+			return normalized
+		}
+		for _, path := range []string{"session_id", "sessionId", "conversation_id", "prompt_cache_key"} {
+			if normalized := cliproxysession.NormalizeExplicitID(gjson.GetBytes(payload, path).String()); normalized != "" {
+				return normalized
+			}
+		}
+	}
+
+	if derived := cliproxysession.DerivedID(opts.Metadata); derived != "" {
+		return derived
+	}
+	return cliproxysession.DerivedID(req.Metadata)
+}
+
+func scopeCursorSourceSessionID(sourceSessionID string, parsed *parsedOpenAIRequest) string {
+	if sourceSessionID == "" || parsed == nil {
+		return sourceSessionID
+	}
+	// A Claude Code process may host concurrent subagents. Scope the explicit
+	// client session by the stable conversation root so their checkpoints cannot
+	// overwrite each other, while tool-call lineage preserves later continuations.
+	root := deriveSessionKey("", parsed.Model, parsed.Messages)
+	if root == "" {
+		return sourceSessionID
+	}
+	return sourceSessionID + ":" + root
 }
 
 // deriveConversationId generates a conversation_id for Cursor AgentService.
@@ -1659,22 +1727,14 @@ func deriveSessionKey(clientKey string, model string, messages []gjson.Result) s
 		if role == "user" && firstUserContent == "" {
 			firstUserContent = extractTextContent(msg.Get("content"))
 		} else if role == "system" && systemContent == "" {
-			// System prompt differs per Claude Code session (contains cwd, session_id, etc.)
-			content := extractTextContent(msg.Get("content"))
-			if len(content) > 200 {
-				systemContent = content[:200]
-			} else {
-				systemContent = content
-			}
+			// System prompt differs per Claude Code session (contains cwd, tools, etc.).
+			systemContent = extractTextContent(msg.Get("content"))
 		}
 	}
 	// Include client API key + system prompt hash to prevent session collisions:
 	// - Different users have different API keys
 	// - Different Claude Code sessions have different system prompts (cwd, tools, etc.)
 	input := clientKey + ":" + model + ":" + systemContent + ":" + firstUserContent
-	if len(input) > 500 {
-		input = input[:500]
-	}
 	h := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(h[:])[:16]
 }
