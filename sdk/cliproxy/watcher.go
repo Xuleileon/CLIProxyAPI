@@ -18,6 +18,9 @@ func defaultWatcherFactory(configPath, authDir string, reload func(*config.Confi
 		start: func(ctx context.Context) error {
 			return w.Start(ctx)
 		},
+		startWithInitialAuthSync: func(ctx context.Context, syncInitialAuths func([]*coreauth.Auth)) error {
+			return w.StartWithInitialAuthSync(ctx, syncInitialAuths)
+		},
 		stop: func() error {
 			return w.Stop()
 		},

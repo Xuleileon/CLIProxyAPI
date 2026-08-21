@@ -14,6 +14,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -27,7 +28,7 @@ func matchProvider(provider string, targets []string) (string, bool) {
 	return p, false
 }
 
-func (w *Watcher) start(ctx context.Context) error {
+func (w *Watcher) start(ctx context.Context, syncInitialAuths func([]*coreauth.Auth)) error {
 	if errAddConfig := w.watcher.Add(w.configPath); errAddConfig != nil {
 		log.Errorf("failed to watch config file %s: %v", w.configPath, errAddConfig)
 		return errAddConfig
@@ -42,9 +43,12 @@ func (w *Watcher) start(ctx context.Context) error {
 
 	w.watchKiroIDETokenFile()
 
-	go w.processEvents(ctx)
-
 	w.reloadClients(true, nil, false)
+	if syncInitialAuths != nil {
+		syncInitialAuths(w.SnapshotCoreAuths())
+	}
+
+	go w.processEvents(ctx)
 	return nil
 }
 

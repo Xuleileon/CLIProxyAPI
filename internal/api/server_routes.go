@@ -37,6 +37,29 @@ const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authe
 
 const codexAlphaSearchSourceFormat = "codex-alpha-search"
 
+// livenessMiddleware serves the process liveness probe before request logging
+// and all other middleware. It must remain independent of auth, upstream state,
+// and synchronous log writers so a busy proxy is not mistaken for a dead one.
+func livenessMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.Path != "/livez" {
+			c.Next()
+			return
+		}
+
+		switch c.Request.Method {
+		case http.MethodGet:
+			c.JSON(http.StatusOK, gin.H{"status": "ok"})
+			c.Abort()
+		case http.MethodHead:
+			c.Status(http.StatusOK)
+			c.Abort()
+		default:
+			c.Next()
+		}
+	}
+}
+
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {

@@ -101,8 +101,9 @@ type PluginMultiAuthParser interface {
 
 // WatcherWrapper exposes the subset of watcher methods required by the SDK.
 type WatcherWrapper struct {
-	start func(ctx context.Context) error
-	stop  func() error
+	start                    func(ctx context.Context) error
+	startWithInitialAuthSync func(ctx context.Context, syncInitialAuths func([]*coreauth.Auth)) error
+	stop                     func() error
 
 	setConfig             func(cfg *config.Config)
 	snapshotAuths         func() []*coreauth.Auth
@@ -120,6 +121,24 @@ func (w *WatcherWrapper) Start(ctx context.Context) error {
 		return nil
 	}
 	return w.start(ctx)
+}
+
+// StartWithInitialAuthSync starts the watcher and applies its initial auth
+// snapshot synchronously before filesystem events can be dispatched.
+func (w *WatcherWrapper) StartWithInitialAuthSync(ctx context.Context, syncInitialAuths func([]*coreauth.Auth)) error {
+	if w == nil {
+		return nil
+	}
+	if w.startWithInitialAuthSync != nil {
+		return w.startWithInitialAuthSync(ctx, syncInitialAuths)
+	}
+	if err := w.Start(ctx); err != nil {
+		return err
+	}
+	if syncInitialAuths != nil {
+		syncInitialAuths(w.SnapshotAuths())
+	}
+	return nil
 }
 
 // Stop proxies to the underlying watcher Stop implementation.

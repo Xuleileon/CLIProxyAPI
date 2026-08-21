@@ -669,6 +669,60 @@ func TestReloadClientsCachesAuthHashes(t *testing.T) {
 	}
 }
 
+func TestStartWithInitialAuthSyncBlocksUntilInitialSnapshotApplied(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatalf("create auth directory: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("port: 0\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	w, err := NewWatcher(configPath, authDir, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- w.StartWithInitialAuthSync(ctx, func([]*coreauth.Auth) {
+			close(callbackStarted)
+			<-releaseCallback
+		})
+	}()
+
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("initial auth callback did not start")
+	}
+	select {
+	case errStart := <-startDone:
+		t.Fatalf("watcher start returned before initial auth callback completed: %v", errStart)
+	default:
+	}
+
+	close(releaseCallback)
+	select {
+	case errStart := <-startDone:
+		if errStart != nil {
+			t.Fatalf("StartWithInitialAuthSync: %v", errStart)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watcher start did not return after initial auth callback completed")
+	}
+	if errStop := w.Stop(); errStop != nil {
+		t.Fatalf("Stop: %v", errStop)
+	}
+}
+
 func TestReloadClientsLogsConfigDiffs(t *testing.T) {
 	tmpDir := t.TempDir()
 	oldCfg := &config.Config{AuthDir: tmpDir, Port: 1, Debug: false}

@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -153,6 +154,46 @@ func (s *Service) Run(ctx context.Context) error {
 		})
 	}
 
+	if !homeEnabled {
+		var watcherWrapper *WatcherWrapper
+		reloadCallback := func(newCfg *config.Config) { s.applyWatcherConfigUpdate(newCfg) }
+
+		watcherWrapper, errCreate := s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
+		if errCreate != nil {
+			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
+		}
+		s.watcher = watcherWrapper
+		s.ensureAuthUpdateQueue(ctx)
+		watcherWrapper.SetConfig(s.cfg)
+		s.registerPluginAuthParser()
+
+		watcherCtx, watcherCancel := context.WithCancel(context.Background())
+		s.watcherCancel = watcherCancel
+		errStart := watcherWrapper.StartWithInitialAuthSync(watcherCtx, func(initialAuths []*coreauth.Auth) {
+			updates := make([]watcher.AuthUpdate, 0, len(initialAuths))
+			for _, initialAuth := range initialAuths {
+				if initialAuth == nil || initialAuth.ID == "" {
+					continue
+				}
+				updates = append(updates, watcher.AuthUpdate{
+					Action: watcher.AuthUpdateActionAdd,
+					ID:     initialAuth.ID,
+					Auth:   initialAuth,
+				})
+			}
+			s.handleAuthUpdates(coreauth.WithSkipPersist(ctx), updates)
+			if s.authUpdates != nil {
+				watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
+			}
+		})
+		if errStart != nil {
+			watcherCancel()
+			return fmt.Errorf("cliproxy: failed to start watcher: %w", errStart)
+		}
+		log.Info("file watcher started after initial model registration completed")
+		s.syncPluginModelRuntime(ctx)
+	}
+
 	if s.hooks.OnBeforeStart != nil {
 		s.hooks.OnBeforeStart(s.cfg)
 	}
@@ -173,31 +214,6 @@ func (s *Service) Run(ctx context.Context) error {
 
 	if s.hooks.OnAfterStart != nil {
 		s.hooks.OnAfterStart(s)
-	}
-
-	if !homeEnabled {
-		var watcherWrapper *WatcherWrapper
-		reloadCallback := func(newCfg *config.Config) { s.applyWatcherConfigUpdate(newCfg) }
-
-		watcherWrapper, errCreate := s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
-		if errCreate != nil {
-			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
-		}
-		s.watcher = watcherWrapper
-		s.ensureAuthUpdateQueue(ctx)
-		if s.authUpdates != nil {
-			watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
-		}
-		watcherWrapper.SetConfig(s.cfg)
-		s.registerPluginAuthParser()
-
-		watcherCtx, watcherCancel := context.WithCancel(context.Background())
-		s.watcherCancel = watcherCancel
-		if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
-			return fmt.Errorf("cliproxy: failed to start watcher: %w", errStart)
-		}
-		log.Info("file watcher started for config and auth directory changes")
-		s.syncPluginModelRuntime(ctx)
 	}
 
 	s.registerModelRefreshCallback()

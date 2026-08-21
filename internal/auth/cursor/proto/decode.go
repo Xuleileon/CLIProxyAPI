@@ -111,15 +111,10 @@ func DecodeAgentServerMessage(data []byte) (*DecodedServerMessage, error) {
 			}
 			data = data[n:]
 
-			// Debug: log top-level ASM fields
-			log.Debugf("DecodeAgentServerMessage: found ASM field %d, len=%d", num, len(val))
-
 			switch num {
 			case ASM_InteractionUpdate:
-				log.Debugf("DecodeAgentServerMessage: calling decodeInteractionUpdate")
 				decodeInteractionUpdate(val, msg)
 			case ASM_ExecServerMessage:
-				log.Debugf("DecodeAgentServerMessage: calling decodeExecServerMessage")
 				decodeExecServerMessage(val, msg)
 			case ASM_KvServerMessage:
 				decodeKvServerMessage(val, msg)
@@ -150,15 +145,14 @@ func DecodeAgentServerMessage(data []byte) (*DecodedServerMessage, error) {
 }
 
 func decodeInteractionUpdate(data []byte, msg *DecodedServerMessage) {
-	log.Debugf("decodeInteractionUpdate: input len=%d, hex=%x", len(data), data)
 	for len(data) > 0 {
 		num, typ, n := protowire.ConsumeTag(data)
 		if n < 0 {
-			log.Debugf("decodeInteractionUpdate: invalid tag, remaining=%x", data)
+			previewLen := min(32, len(data))
+			log.Debugf("decodeInteractionUpdate: invalid tag, remaining=%d, preview=%x, truncated=%t", len(data), data[:previewLen], len(data) > previewLen)
 			return
 		}
 		data = data[n:]
-		log.Debugf("decodeInteractionUpdate: field=%d wire=%d remaining=%d bytes", num, typ, len(data))
 
 		if typ == protowire.BytesType {
 			val, n := protowire.ConsumeBytes(data)
@@ -167,17 +161,14 @@ func decodeInteractionUpdate(data []byte, msg *DecodedServerMessage) {
 				return
 			}
 			data = data[n:]
-			log.Debugf("decodeInteractionUpdate: field %d content len=%d, first 20 bytes: %x", num, len(val), val[:min(20, len(val))])
 
 			switch num {
 			case IU_TextDelta:
 				msg.Type = ServerMsgTextDelta
 				msg.Text = decodeStringField(val, TDU_Text)
-				log.Debugf("decodeInteractionUpdate: TextDelta text=%q", msg.Text)
 			case IU_ThinkingDelta:
 				msg.Type = ServerMsgThinkingDelta
 				msg.Text = decodeStringField(val, TKD_Text)
-				log.Debugf("decodeInteractionUpdate: ThinkingDelta text=%q", msg.Text)
 			case IU_ThinkingCompleted:
 				msg.Type = ServerMsgThinkingCompleted
 				log.Debugf("decodeInteractionUpdate: ThinkingCompleted")
@@ -191,7 +182,6 @@ func decodeInteractionUpdate(data []byte, msg *DecodedServerMessage) {
 				// token_delta - extract token count
 				msg.Type = ServerMsgTokenDelta
 				msg.TokenDelta = decodeVarintField(val, 1)
-				log.Debugf("decodeInteractionUpdate: TokenDeltaUpdate tokens=%d", msg.TokenDelta)
 			case 13:
 				// heartbeat from server
 				msg.Type = ServerMsgHeartbeat

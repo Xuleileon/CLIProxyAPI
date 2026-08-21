@@ -489,6 +489,40 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestLivezBypassesDownstreamMiddleware(t *testing.T) {
+	var downstreamCalls atomic.Int32
+	server := newTestServerWithOptions(t, WithMiddleware(func(c *gin.Context) {
+		downstreamCalls.Add(1)
+		c.Next()
+	}))
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req := httptest.NewRequest(method, "/livez", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s /livez status = %d, want %d", method, rr.Code, http.StatusOK)
+		}
+		if method == http.MethodHead && rr.Body.Len() != 0 {
+			t.Fatalf("HEAD /livez body = %q, want empty", rr.Body.String())
+		}
+	}
+	if got := downstreamCalls.Load(); got != 0 {
+		t.Fatalf("downstream middleware calls = %d, want 0", got)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /healthz status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if got := downstreamCalls.Load(); got != 1 {
+		t.Fatalf("downstream middleware calls after /healthz = %d, want 1", got)
+	}
+}
+
 func TestCodexLiveRoutesRequireAuthAndAreRegistered(t *testing.T) {
 	server := newTestServer(t)
 

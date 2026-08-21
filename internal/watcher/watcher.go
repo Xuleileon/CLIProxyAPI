@@ -121,7 +121,14 @@ func NewWatcher(configPath, authDir string, reloadCallback func(*config.Config))
 
 // Start begins watching the configuration file and authentication directory
 func (w *Watcher) Start(ctx context.Context) error {
-	return w.start(ctx)
+	return w.start(ctx, nil)
+}
+
+// StartWithInitialAuthSync starts the watcher after synchronously handing the
+// initial auth snapshot to the caller. Filesystem events are processed only
+// after the callback returns, which closes the startup registration race.
+func (w *Watcher) StartWithInitialAuthSync(ctx context.Context, syncInitialAuths func([]*coreauth.Auth)) error {
+	return w.start(ctx, syncInitialAuths)
 }
 
 // Stop stops the file watcher
