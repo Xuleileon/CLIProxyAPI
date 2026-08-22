@@ -82,6 +82,7 @@ func TestClassifyCursorTransportErrors(t *testing.T) {
 	}{
 		{name: "graceful shutdown", err: errors.New("http2: Transport received Server's graceful shutdown GOAWAY"), wantStatus: http.StatusServiceUnavailable},
 		{name: "unexpected eof", err: io.ErrUnexpectedEOF, wantStatus: http.StatusBadGateway},
+		{name: "peer h2 internal error", err: errors.New("stream error: stream ID 3; INTERNAL_ERROR; received from peer"), wantStatus: http.StatusBadGateway},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			classified := classifyCursorError(test.err)

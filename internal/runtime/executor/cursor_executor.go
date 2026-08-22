@@ -413,7 +413,8 @@ func classifyCursorError(err error) error {
 		return cursorStatusErr{code: 429, msg: err.Error()}
 	case strings.Contains(msg, "server is shutting down") || strings.Contains(msg, "goaway"):
 		return cursorStatusErr{code: 503, msg: err.Error()}
-	case strings.Contains(msg, "rst_stream") || strings.Contains(msg, "connection reset") ||
+	case strings.Contains(msg, "rst_stream") || strings.Contains(msg, "stream error: stream id") ||
+		strings.Contains(msg, "connection reset") ||
 		strings.Contains(msg, "broken pipe") || errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe):
 		return cursorStatusErr{code: 502, msg: err.Error()}
@@ -2249,15 +2250,17 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 	modelID, maxMode := normalizeCursorModel(modelID)
 
 	params := &cursorproto.RunRequestParams{
-		ModelId:        modelID,
-		MaxMode:        maxMode,
-		SystemPrompt:   parsed.SystemPrompt,
-		UserText:       parsed.UserText,
-		MessageId:      uuid.New().String(),
-		ConversationId: conversationId,
-		Images:         parsed.Images,
-		Turns:          parsed.Turns,
-		BlobStore:      make(map[string][]byte),
+		ModelId:                 modelID,
+		MaxMode:                 maxMode,
+		SystemPrompt:            parsed.SystemPrompt,
+		UserText:                parsed.UserText,
+		MessageId:               uuid.New().String(),
+		ConversationId:          conversationId,
+		Images:                  parsed.Images,
+		Turns:                   parsed.Turns,
+		AgentMode:               cursorproto.AgentModeAsk,
+		ExcludeWorkspaceContext: true,
+		BlobStore:               make(map[string][]byte),
 	}
 
 	// Convert OpenAI tools to McpToolDefs
@@ -2268,6 +2271,9 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 			Description: fn.Get("description").String(),
 			InputSchema: json.RawMessage(fn.Get("parameters").Raw),
 		})
+	}
+	if len(params.McpTools) > 0 {
+		params.AgentMode = cursorproto.AgentModeAgent
 	}
 
 	return params

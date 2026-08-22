@@ -31,7 +31,8 @@ const (
 	ARR_McpTools          = 4 // McpTools
 	ARR_ConversationId    = 5 // string (optional)
 	// field 6: mcp_file_system_options, field 7: skill_options, field 8: custom_system_prompt
-	ARR_RequestedModel = 9 // RequestedModel (optional)
+	ARR_RequestedModel          = 9  // RequestedModel (optional)
+	ARR_ExcludeWorkspaceContext = 12 // bool (optional)
 )
 
 // ConversationStateStructure (msg 83)
@@ -42,6 +43,7 @@ const (
 	CSS_PendingToolCalls       = 4  // repeated string
 	CSS_Turns                  = 8  // repeated bytes (CURRENT field for turns)
 	CSS_PreviousWorkspaceUris  = 9  // repeated string
+	CSS_Mode                   = 10 // AgentMode (optional)
 	CSS_SelfSummaryCount       = 17 // uint32
 	CSS_ReadPaths              = 18 // repeated string
 )

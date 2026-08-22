@@ -62,6 +62,50 @@ func TestEncodeRunRequestSetsMaxModeTrue(t *testing.T) {
 	}
 }
 
+func TestEncodeRunRequestSetsModeAndWorkspaceIsolation(t *testing.T) {
+	t.Parallel()
+
+	raw := EncodeRunRequest(&RunRequestParams{
+		ModelId:                 "composer-2.5",
+		UserText:                "hi",
+		MessageId:               "msg-1",
+		AgentMode:               AgentModeAsk,
+		ExcludeWorkspaceContext: true,
+		BlobStore:               map[string][]byte{},
+	})
+	runReq := mustFindBytesField(t, raw, ACM_RunRequest)
+	state := mustFindBytesField(t, runReq, ARR_ConversationState)
+	if got, ok := findVarintField(state, CSS_Mode); !ok || got != uint64(AgentModeAsk) {
+		t.Fatalf("ConversationStateStructure.mode = %d ok=%v, want %d", got, ok, AgentModeAsk)
+	}
+	if got, ok := findBoolField(runReq, ARR_ExcludeWorkspaceContext); !ok || !got {
+		t.Fatalf("AgentRunRequest.exclude_workspace_context = %v ok=%v, want true", got, ok)
+	}
+}
+
+func TestEncodeRunRequestOverridesCheckpointMode(t *testing.T) {
+	t.Parallel()
+
+	checkpoint := protowire.AppendTag(nil, CSS_Mode, protowire.VarintType)
+	checkpoint = protowire.AppendVarint(checkpoint, uint64(AgentModeAgent))
+	raw := EncodeRunRequest(&RunRequestParams{
+		ModelId:                 "composer-2.5",
+		UserText:                "hi",
+		MessageId:               "msg-1",
+		AgentMode:               AgentModeAsk,
+		ExcludeWorkspaceContext: true,
+		RawCheckpoint:           checkpoint,
+	})
+	runReq := mustFindBytesField(t, raw, ACM_RunRequest)
+	state := mustFindBytesField(t, runReq, ARR_ConversationState)
+	if got, ok := findLastVarintField(state, CSS_Mode); !ok || got != uint64(AgentModeAsk) {
+		t.Fatalf("last ConversationStateStructure.mode = %d ok=%v, want %d", got, ok, AgentModeAsk)
+	}
+	if got, ok := findBoolField(runReq, ARR_ExcludeWorkspaceContext); !ok || !got {
+		t.Fatalf("AgentRunRequest.exclude_workspace_context = %v ok=%v, want true", got, ok)
+	}
+}
+
 func TestSetStrRepairsInvalidUTF8(t *testing.T) {
 	t.Parallel()
 
@@ -109,30 +153,64 @@ func mustFindBytesField(t *testing.T, b []byte, num protowire.Number) []byte {
 }
 
 func findBoolField(b []byte, num protowire.Number) (bool, bool) {
+	v, ok := findVarintField(b, num)
+	return v != 0, ok
+}
+
+func findVarintField(b []byte, num protowire.Number) (uint64, bool) {
 	for len(b) > 0 {
 		n, typ, nTag := protowire.ConsumeTag(b)
 		if nTag < 0 {
-			return false, false
+			return 0, false
 		}
 		b = b[nTag:]
 		if typ == protowire.VarintType {
 			v, nVal := protowire.ConsumeVarint(b)
 			if nVal < 0 {
-				return false, false
+				return 0, false
 			}
 			b = b[nVal:]
 			if n == num {
-				return v != 0, true
+				return v, true
 			}
 			continue
 		}
 		nSkip := protowire.ConsumeFieldValue(n, typ, b)
 		if nSkip < 0 {
-			return false, false
+			return 0, false
 		}
 		b = b[nSkip:]
 	}
-	return false, false
+	return 0, false
+}
+
+func findLastVarintField(b []byte, num protowire.Number) (uint64, bool) {
+	var found uint64
+	var ok bool
+	for len(b) > 0 {
+		n, typ, nTag := protowire.ConsumeTag(b)
+		if nTag < 0 {
+			return 0, false
+		}
+		b = b[nTag:]
+		if typ == protowire.VarintType {
+			v, nVal := protowire.ConsumeVarint(b)
+			if nVal < 0 {
+				return 0, false
+			}
+			b = b[nVal:]
+			if n == num {
+				found, ok = v, true
+			}
+			continue
+		}
+		nSkip := protowire.ConsumeFieldValue(n, typ, b)
+		if nSkip < 0 {
+			return 0, false
+		}
+		b = b[nSkip:]
+	}
+	return found, ok
 }
 
 func findStringField(b []byte, num protowire.Number) (string, bool) {
