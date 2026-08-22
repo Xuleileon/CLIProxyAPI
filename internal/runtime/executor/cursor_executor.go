@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -44,6 +45,8 @@ const (
 	cursorHeartbeatInterval = 5 * time.Second
 	cursorSessionTTL        = 5 * time.Minute
 	cursorCheckpointTTL     = 30 * time.Minute
+	cursorDefaultActiveRuns = 16
+	cursorDefaultQueuedRuns = 64
 )
 
 // CursorExecutor handles requests to the Cursor API via Connect+Protobuf protocol.
@@ -53,6 +56,10 @@ type CursorExecutor struct {
 	mu          sync.Mutex
 	sessions    map[string]*cursorSession
 	checkpoints map[string]*savedCheckpoint // keyed by conversationId
+	admissionMu sync.Mutex
+	admissions  map[string]*helps.BoundedAdmission
+	activeRuns  int
+	queuedRuns  int
 }
 
 // savedCheckpoint stores the server's conversation_checkpoint_update for reuse.
@@ -109,11 +116,15 @@ const (
 
 // NewCursorExecutor constructs a new executor instance.
 func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
+	activeRuns, queuedRuns := cursorAdmissionLimits(cfg)
 	e := &CursorExecutor{
 		cfg:         cfg,
 		h2Pool:      cursorproto.NewH2StreamPool(),
 		sessions:    make(map[string]*cursorSession),
 		checkpoints: make(map[string]*savedCheckpoint),
+		admissions:  make(map[string]*helps.BoundedAdmission),
+		activeRuns:  activeRuns,
+		queuedRuns:  queuedRuns,
 	}
 	go e.cleanupLoop()
 	return e
@@ -121,6 +132,56 @@ func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
 
 // Identifier implements ProviderExecutor.
 func (e *CursorExecutor) Identifier() string { return cursorAuthType }
+
+func cursorAdmissionLimits(cfg *config.Config) (int, int) {
+	activeRuns := cursorDefaultActiveRuns
+	queuedRuns := cursorDefaultQueuedRuns
+	if cfg == nil {
+		return activeRuns, queuedRuns
+	}
+	if cfg.Cursor.MaxConcurrentRuns > 0 {
+		activeRuns = cfg.Cursor.MaxConcurrentRuns
+	}
+	if cfg.Cursor.MaxQueuedRuns > 0 {
+		queuedRuns = cfg.Cursor.MaxQueuedRuns
+	}
+	return activeRuns, queuedRuns
+}
+
+func (e *CursorExecutor) acquireRun(ctx context.Context, auth *cliproxyauth.Auth, accessToken string) (func(), error) {
+	if e == nil {
+		return func() {}, nil
+	}
+	authKey := "anonymous"
+	if auth != nil && strings.TrimSpace(auth.ID) != "" {
+		authKey = strings.TrimSpace(auth.ID)
+	} else if accessToken != "" {
+		digest := sha256.Sum256([]byte(accessToken))
+		authKey = hex.EncodeToString(digest[:8])
+	}
+
+	e.admissionMu.Lock()
+	if e.admissions == nil {
+		e.admissions = make(map[string]*helps.BoundedAdmission)
+	}
+	gate := e.admissions[authKey]
+	if gate == nil {
+		activeRuns := e.activeRuns
+		queuedRuns := e.queuedRuns
+		if activeRuns <= 0 || queuedRuns <= 0 {
+			activeRuns, queuedRuns = cursorAdmissionLimits(e.cfg)
+		}
+		gate = helps.NewBoundedAdmission(activeRuns, queuedRuns)
+		e.admissions[authKey] = gate
+	}
+	e.admissionMu.Unlock()
+
+	release, err := gate.Acquire(ctx)
+	if errors.Is(err, helps.ErrAdmissionQueueFull) {
+		return nil, cliproxyauth.NewRequestScopedError("cursor: local Run queue is full; retry later", http.StatusServiceUnavailable)
+	}
+	return release, err
+}
 
 // CloseExecutionSession implements ExecutionSessionCloser.
 func (e *CursorExecutor) CloseExecutionSession(sessionID string) {
@@ -295,6 +356,25 @@ func (e cursorStatusErr) Error() string              { return e.msg }
 func (e cursorStatusErr) StatusCode() int            { return e.code }
 func (e cursorStatusErr) RetryAfter() *time.Duration { return nil } // no retry-after info from Cursor; conductor uses exponential backoff
 
+type cursorStreamFailureKind uint8
+
+const (
+	cursorStreamFailureCanceled cursorStreamFailureKind = iota
+	cursorStreamFailureRetry
+	cursorStreamFailureTerminal
+)
+
+func classifyCursorStreamFailure(streamErr, sessionErr error, dataSent bool) (cursorStreamFailureKind, error) {
+	if sessionErr != nil {
+		return cursorStreamFailureCanceled, sessionErr
+	}
+	classified := classifyCursorError(fmt.Errorf("cursor: upstream stream failed: %w", streamErr))
+	if dataSent {
+		return cursorStreamFailureTerminal, classified
+	}
+	return cursorStreamFailureRetry, classified
+}
+
 // classifyCursorError maps Cursor Connect/H2 errors to HTTP status codes.
 // Layer 1: precise match on ConnectError.Code (gRPC standard codes).
 // Layer 2: fuzzy string match for H2 frame errors and unknown formats.
@@ -331,7 +411,11 @@ func classifyCursorError(err error) error {
 	case strings.Contains(msg, "rate limit") || strings.Contains(msg, "quota") ||
 		strings.Contains(msg, "too many"):
 		return cursorStatusErr{code: 429, msg: err.Error()}
-	case strings.Contains(msg, "rst_stream") || strings.Contains(msg, "goaway"):
+	case strings.Contains(msg, "server is shutting down") || strings.Contains(msg, "goaway"):
+		return cursorStatusErr{code: 503, msg: err.Error()}
+	case strings.Contains(msg, "rst_stream") || strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe):
 		return cursorStatusErr{code: 502, msg: err.Error()}
 	}
 
@@ -457,6 +541,11 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	requestBytes := cursorproto.EncodeRunRequest(params)
 	framedRequest := cursorproto.FrameConnectMessage(requestBytes, 0)
 	log.Debugf("cursor: encoded Run request bytes=%d userTextBytes=%d checkpoint=%t conv=%s", len(requestBytes), len(params.UserText), len(params.RawCheckpoint) > 0, conversationId)
+	releaseRun, err := e.acquireRun(ctx, auth, accessToken)
+	if err != nil {
+		return resp, err
+	}
+	defer releaseRun()
 
 	stream, err := e.openCursorH2Stream(ctx, auth, accessToken)
 	if err != nil {
@@ -490,7 +579,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		nil,
 		usage,
 		nil, // onCheckpoint - non-streaming doesn't persist
-	); streamErr != nil && contentText.Len() == 0 && reasoningText.Len() == 0 {
+	); streamErr != nil {
 		return resp, classifyCursorError(fmt.Errorf("cursor: stream error: %w", streamErr))
 	}
 
@@ -700,15 +789,21 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	requestBytes := cursorproto.EncodeRunRequest(params)
 	framedRequest := cursorproto.FrameConnectMessage(requestBytes, 0)
 	log.Debugf("cursor: encoded Run request bytes=%d userTextBytes=%d checkpoint=%t conv=%s", len(requestBytes), len(params.UserText), len(params.RawCheckpoint) > 0, conversationId)
+	releaseRun, err := e.acquireRun(ctx, auth, accessToken)
+	if err != nil {
+		return nil, err
+	}
 
 	requestStartedAt := time.Now()
 	stream, err := e.openCursorH2Stream(ctx, auth, accessToken)
 	if err != nil {
+		releaseRun()
 		return nil, err
 	}
 
 	if err := stream.Write(framedRequest); err != nil {
 		stream.Close()
+		releaseRun()
 		return nil, fmt.Errorf("cursor: failed to send request: %w", err)
 	}
 
@@ -779,22 +874,20 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// If the stream fails before any chunk is emitted (e.g. quota exceeded),
 	// ExecuteStream returns an error so the conductor retries with a different auth.
 	streamErrCh := make(chan error, 1)
-	firstChunkSent := make(chan struct{}, 1) // buffered: goroutine won't block signaling
+	firstChunkReady := make(chan struct{})
+	var dataSent atomic.Bool
 
 	origEmitToOut := emitToOut
-	var firstChunkLogOnce sync.Once
 	emitToOut = func(chunk cliproxyexecutor.StreamChunk) {
-		firstChunkLogOnce.Do(func() {
+		if dataSent.CompareAndSwap(false, true) {
 			log.Debugf("cursor: first downstream chunk after %s conv=%s checkpoint=%t", time.Since(requestStartedAt).Round(time.Millisecond), conversationId, len(params.RawCheckpoint) > 0)
-		})
-		select {
-		case firstChunkSent <- struct{}{}:
-		default:
+			close(firstChunkReady)
 		}
 		origEmitToOut(chunk)
 	}
 
 	go func() {
+		defer releaseRun()
 		defer close(streamDone)
 		roleSent := false
 		toolCallIndex := 0
@@ -897,15 +990,40 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// processH2SessionFrames returned — stream is done.
 		// Check if error happened before any chunks were emitted.
 		if streamErr != nil {
-			select {
-			case <-firstChunkSent:
+			failureKind, failureErr := classifyCursorStreamFailure(streamErr, sessionCtx.Err(), dataSent.Load())
+			switch failureKind {
+			case cursorStreamFailureCanceled:
+				// The downstream request or session owner canceled this Run. Do not
+				// turn a local cancellation into either a successful terminal event
+				// or an upstream retry.
+				log.Debugf("cursor: stream canceled locally (auth=%s conv=%s): %v", authID, conversationId, streamErr)
+				outMu.Lock()
+				if currentOut != nil {
+					close(currentOut)
+					currentOut = nil
+				}
+				outMu.Unlock()
+				stream.Close()
+				return
+			case cursorStreamFailureTerminal:
 				// Chunks were already sent to client — can't transparently retry.
-				// Next request will failover via conductor's cooldown mechanism.
+				// Surface a terminal stream error and never append stop/[DONE], which
+				// would incorrectly turn a truncated response into success.
 				log.Warnf("cursor: stream error after data sent (auth=%s conv=%s): %v", authID, conversationId, streamErr)
-			default:
+				emitToOut(cliproxyexecutor.StreamChunk{Err: failureErr})
+				outMu.Lock()
+				if currentOut != nil {
+					close(currentOut)
+					currentOut = nil
+				}
+				outMu.Unlock()
+				sessionCancel()
+				stream.Close()
+				return
+			case cursorStreamFailureRetry:
 				// No data sent yet — propagate error for transparent conductor retry.
 				log.Warnf("cursor: stream error before data sent (auth=%s conv=%s): %v — signaling retry", authID, conversationId, streamErr)
-				streamErrCh <- streamErr
+				streamErrCh <- failureErr
 				outMu.Lock()
 				if currentOut != nil {
 					close(currentOut)
@@ -951,10 +1069,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// return an error so the conductor retries with a different auth.
 	select {
 	case streamErr := <-streamErrCh:
-		return nil, classifyCursorError(fmt.Errorf("cursor: stream failed before response: %w", streamErr))
-	case <-firstChunkSent:
+		return nil, streamErr
+	case <-firstChunkReady:
 		// Data started flowing — return stream to client
 		return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+	case <-ctx.Done():
+		sessionCancel()
+		stream.Close()
+		return nil, ctx.Err()
 	}
 }
 
@@ -1151,7 +1273,7 @@ func processH2SessionFrames(
 		case data, ok := <-stream.Data():
 			if !ok {
 				log.Debugf("cursor: processH2SessionFrames[%s]: exiting: stream data channel closed", stream.ID())
-				return stream.Err() // may be RST_STREAM, GOAWAY, or nil for clean close
+				return cursorStreamClosedError(stream)
 			}
 			buf.Write(data)
 
@@ -1355,7 +1477,7 @@ func processH2SessionFrames(
 
 		case <-stream.Done():
 			log.Debugf("cursor: processH2SessionFrames exiting: stream done")
-			return stream.Err()
+			return cursorStreamClosedError(stream)
 		}
 	}
 }

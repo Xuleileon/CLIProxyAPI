@@ -137,6 +137,9 @@ type Config struct {
 	// XAI configures provider-wide xAI request behavior.
 	XAI XAIConfig `yaml:"xai" json:"xai"`
 
+	// Cursor configures provider-wide Cursor request admission.
+	Cursor CursorConfig `yaml:"cursor" json:"cursor"`
+
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
 

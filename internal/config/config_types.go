@@ -137,6 +137,15 @@ type XAIConfig struct {
 	InjectXSearch bool `yaml:"inject-x-search" json:"inject-x-search"`
 }
 
+// CursorConfig configures provider-wide Cursor request admission.
+type CursorConfig struct {
+	// MaxConcurrentRuns limits active Cursor Runs per credential. A Run keeps its
+	// slot while waiting for downstream tool results.
+	MaxConcurrentRuns int `yaml:"max-concurrent-runs" json:"max-concurrent-runs"`
+	// MaxQueuedRuns bounds callers waiting for a per-credential Run slot.
+	MaxQueuedRuns int `yaml:"max-queued-runs" json:"max-queued-runs"`
+}
+
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
 	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
