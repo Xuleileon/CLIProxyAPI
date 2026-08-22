@@ -78,10 +78,6 @@ func TestBuildRunRequestParams_SelectsModeFromToolCapability(t *testing.T) {
 	if withoutTools.AgentMode != cursorproto.AgentModeAsk {
 		t.Fatalf("mode without tools = %d, want ask", withoutTools.AgentMode)
 	}
-	if !withoutTools.ExcludeWorkspaceContext {
-		t.Fatal("workspace context must be excluded for API requests")
-	}
-
 	withTools := buildRunRequestParams(parseOpenAIRequest([]byte(`{"model":"composer-2.5","messages":[],"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)), "conv-agent", "composer-2.5")
 	if withTools.AgentMode != cursorproto.AgentModeAgent {
 		t.Fatalf("mode with tools = %d, want agent", withTools.AgentMode)

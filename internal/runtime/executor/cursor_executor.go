@@ -2250,17 +2250,16 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 	modelID, maxMode := normalizeCursorModel(modelID)
 
 	params := &cursorproto.RunRequestParams{
-		ModelId:                 modelID,
-		MaxMode:                 maxMode,
-		SystemPrompt:            parsed.SystemPrompt,
-		UserText:                parsed.UserText,
-		MessageId:               uuid.New().String(),
-		ConversationId:          conversationId,
-		Images:                  parsed.Images,
-		Turns:                   parsed.Turns,
-		AgentMode:               cursorproto.AgentModeAsk,
-		ExcludeWorkspaceContext: true,
-		BlobStore:               make(map[string][]byte),
+		ModelId:        modelID,
+		MaxMode:        maxMode,
+		SystemPrompt:   parsed.SystemPrompt,
+		UserText:       parsed.UserText,
+		MessageId:      uuid.New().String(),
+		ConversationId: conversationId,
+		Images:         parsed.Images,
+		Turns:          parsed.Turns,
+		AgentMode:      cursorproto.AgentModeAsk,
+		BlobStore:      make(map[string][]byte),
 	}
 
 	// Convert OpenAI tools to McpToolDefs

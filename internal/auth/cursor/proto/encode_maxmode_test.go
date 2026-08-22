@@ -62,24 +62,20 @@ func TestEncodeRunRequestSetsMaxModeTrue(t *testing.T) {
 	}
 }
 
-func TestEncodeRunRequestSetsModeAndWorkspaceIsolation(t *testing.T) {
+func TestEncodeRunRequestSetsMode(t *testing.T) {
 	t.Parallel()
 
 	raw := EncodeRunRequest(&RunRequestParams{
-		ModelId:                 "composer-2.5",
-		UserText:                "hi",
-		MessageId:               "msg-1",
-		AgentMode:               AgentModeAsk,
-		ExcludeWorkspaceContext: true,
-		BlobStore:               map[string][]byte{},
+		ModelId:   "composer-2.5",
+		UserText:  "hi",
+		MessageId: "msg-1",
+		AgentMode: AgentModeAsk,
+		BlobStore: map[string][]byte{},
 	})
 	runReq := mustFindBytesField(t, raw, ACM_RunRequest)
 	state := mustFindBytesField(t, runReq, ARR_ConversationState)
 	if got, ok := findVarintField(state, CSS_Mode); !ok || got != uint64(AgentModeAsk) {
 		t.Fatalf("ConversationStateStructure.mode = %d ok=%v, want %d", got, ok, AgentModeAsk)
-	}
-	if got, ok := findBoolField(runReq, ARR_ExcludeWorkspaceContext); !ok || !got {
-		t.Fatalf("AgentRunRequest.exclude_workspace_context = %v ok=%v, want true", got, ok)
 	}
 }
 
@@ -89,20 +85,16 @@ func TestEncodeRunRequestOverridesCheckpointMode(t *testing.T) {
 	checkpoint := protowire.AppendTag(nil, CSS_Mode, protowire.VarintType)
 	checkpoint = protowire.AppendVarint(checkpoint, uint64(AgentModeAgent))
 	raw := EncodeRunRequest(&RunRequestParams{
-		ModelId:                 "composer-2.5",
-		UserText:                "hi",
-		MessageId:               "msg-1",
-		AgentMode:               AgentModeAsk,
-		ExcludeWorkspaceContext: true,
-		RawCheckpoint:           checkpoint,
+		ModelId:       "composer-2.5",
+		UserText:      "hi",
+		MessageId:     "msg-1",
+		AgentMode:     AgentModeAsk,
+		RawCheckpoint: checkpoint,
 	})
 	runReq := mustFindBytesField(t, raw, ACM_RunRequest)
 	state := mustFindBytesField(t, runReq, ARR_ConversationState)
 	if got, ok := findLastVarintField(state, CSS_Mode); !ok || got != uint64(AgentModeAsk) {
 		t.Fatalf("last ConversationStateStructure.mode = %d ok=%v, want %d", got, ok, AgentModeAsk)
-	}
-	if got, ok := findBoolField(runReq, ARR_ExcludeWorkspaceContext); !ok || !got {
-		t.Fatalf("AgentRunRequest.exclude_workspace_context = %v ok=%v, want true", got, ok)
 	}
 }
 

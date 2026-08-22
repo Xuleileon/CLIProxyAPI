@@ -34,10 +34,8 @@ type RunRequestParams struct {
 	Turns          []TurnData
 	McpTools       []McpToolDef
 	AgentMode      AgentMode
-	// ExcludeWorkspaceContext keeps API requests isolated from Cursor IDE context.
-	ExcludeWorkspaceContext bool
-	BlobStore               map[string][]byte // hex(sha256) -> data, populated during encoding
-	RawCheckpoint           []byte            // if non-nil, use as conversation_state directly (from server checkpoint)
+	BlobStore      map[string][]byte // hex(sha256) -> data, populated during encoding
+	RawCheckpoint  []byte            // if non-nil, use as conversation_state directly (from server checkpoint)
 }
 
 type AgentMode int32
@@ -260,17 +258,6 @@ func EncodeRunRequest(p *RunRequestParams) []byte {
 		setMsg(arr, "mcp_tools", mcpTools)
 	}
 
-	// The embedded descriptor predates exclude_workspace_context. Append the
-	// official wire field after dynamic encoding, then wrap AgentClientMessage.
-	if p.ExcludeWorkspaceContext {
-		arrBytes := marshal(arr)
-		arrBytes = protowire.AppendTag(arrBytes, ARR_ExcludeWorkspaceContext, protowire.VarintType)
-		arrBytes = protowire.AppendVarint(arrBytes, 1)
-		var acmBuf []byte
-		acmBuf = protowire.AppendTag(acmBuf, ACM_RunRequest, protowire.BytesType)
-		return protowire.AppendBytes(acmBuf, arrBytes)
-	}
-
 	// --- AgentClientMessage ---
 	acm := newMsg("AgentClientMessage")
 	setMsg(acm, "run_request", arr)
@@ -379,10 +366,6 @@ func encodeRunRequestWithCheckpoint(p *RunRequestParams) []byte {
 	// field 9: requested_model = RequestedModel
 	arrBuf = protowire.AppendTag(arrBuf, ARR_RequestedModel, protowire.BytesType)
 	arrBuf = protowire.AppendBytes(arrBuf, rmBytes)
-	if p.ExcludeWorkspaceContext {
-		arrBuf = protowire.AppendTag(arrBuf, ARR_ExcludeWorkspaceContext, protowire.VarintType)
-		arrBuf = protowire.AppendVarint(arrBuf, 1)
-	}
 
 	// Wrap in AgentClientMessage field 1 (run_request)
 	var acmBuf []byte

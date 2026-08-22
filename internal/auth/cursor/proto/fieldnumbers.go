@@ -31,8 +31,7 @@ const (
 	ARR_McpTools          = 4 // McpTools
 	ARR_ConversationId    = 5 // string (optional)
 	// field 6: mcp_file_system_options, field 7: skill_options, field 8: custom_system_prompt
-	ARR_RequestedModel          = 9  // RequestedModel (optional)
-	ARR_ExcludeWorkspaceContext = 12 // bool (optional)
+	ARR_RequestedModel = 9 // RequestedModel (optional)
 )
 
 // ConversationStateStructure (msg 83)
