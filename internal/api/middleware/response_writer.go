@@ -27,7 +27,7 @@ type RequestInfo struct {
 	Body                []byte                      // Body is the raw request body.
 	RequestID           string                      // RequestID is the unique identifier for the request.
 	Timestamp           time.Time                   // Timestamp is when the request was received.
-	deferredBodyCapture *deferredRequestBodyCapture // deferredBodyCapture spools large error-only request bodies.
+	deferredBodyCapture *deferredRequestBodyCapture // deferredBodyCapture retains a bounded prefix of large error-only request bodies.
 }
 
 // ResponseWriterWrapper wraps the standard gin.ResponseWriter to intercept and log response data.

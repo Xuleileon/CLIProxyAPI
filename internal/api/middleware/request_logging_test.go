@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
@@ -107,21 +108,21 @@ func TestShouldCaptureRequestBody(t *testing.T) {
 			want:          false,
 		},
 		{
-			name:          "small known size json in error-only mode",
+			name:          "small known size json deferred in error-only mode",
 			loggerEnabled: false,
 			req: &http.Request{
 				Body:          io.NopCloser(strings.NewReader("{}")),
 				ContentLength: 2,
 				Header:        http.Header{"Content-Type": []string{"application/json"}},
 			},
-			want: true,
+			want: false,
 		},
 		{
 			name:          "large known size skipped in error-only mode",
 			loggerEnabled: false,
 			req: &http.Request{
 				Body:          io.NopCloser(strings.NewReader("x")),
-				ContentLength: maxErrorOnlyCapturedRequestBodyBytes + 1,
+				ContentLength: maxDeferredErrorRequestBodyBytes + 1,
 				Header:        http.Header{"Content-Type": []string{"application/json"}},
 			},
 			want: false,
@@ -159,12 +160,11 @@ func TestShouldCaptureRequestBody(t *testing.T) {
 func TestDeferredRequestBodyCaptureDoesNotDrainUnreadBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	logger := logging.NewFileRequestLogger(false, t.TempDir(), "", 10)
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("remaining-body"))
 	request.ContentLength = -1
 	request.Header.Set("Content-Type", "application/json")
 	requestInfo := &RequestInfo{Headers: map[string][]string{"Content-Type": {"application/json"}}}
-	capture := attachDeferredRequestBodyCapture(request, logger, requestInfo, false, false)
+	capture := attachDeferredRequestBodyCapture(request, requestInfo, false, false)
 	if capture == nil {
 		t.Fatal("deferred request body capture was not attached")
 	}
@@ -193,12 +193,74 @@ func TestDeferredRequestBodyCaptureDoesNotDrainUnreadBody(t *testing.T) {
 	}
 }
 
+func TestRequestLoggingMiddlewareLargeSuccessDoesNotSpoolRequestBodyToDisk(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logsDir := t.TempDir()
+	logger := logging.NewFileRequestLogger(false, logsDir, "", 10)
+	payload := bytes.Repeat([]byte("x"), int(maxDeferredErrorRequestBodyBytes)+1)
+	bodyRead := make(chan struct{})
+	release := make(chan struct{})
+	releaseHandler := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}
+	defer releaseHandler()
+
+	router := gin.New()
+	router.Use(RequestLoggingMiddleware(logger))
+	router.POST("/v1/responses", func(c *gin.Context) {
+		if _, errRead := io.Copy(io.Discard, c.Request.Body); errRead != nil {
+			c.Status(http.StatusInternalServerError)
+			return
+		}
+		close(bodyRead)
+		<-release
+		c.Status(http.StatusOK)
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		router.ServeHTTP(response, request)
+	}()
+
+	select {
+	case <-bodyRead:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish reading the large request body")
+	}
+	entries, errReadDir := os.ReadDir(logsDir)
+	if errReadDir != nil {
+		t.Fatalf("read logs dir: %v", errReadDir)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("large successful request created temporary log files: %v", entries)
+	}
+
+	releaseHandler()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not finish")
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("response status = %d, want %d", response.Code, http.StatusOK)
+	}
+}
+
 func TestRequestLoggingMiddlewareCapturesLargeErrorRequestAndDeferredAPIRequest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	logsDir := t.TempDir()
 	logger := logging.NewFileRequestLogger(false, logsDir, "", 10)
-	payload := append([]byte(`{"marker":"large-error-body","padding":"`), bytes.Repeat([]byte("x"), int(maxErrorOnlyCapturedRequestBodyBytes))...)
+	payload := append([]byte(`{"marker":"large-error-body","padding":"`), bytes.Repeat([]byte("x"), int(maxDeferredErrorRequestBodyBytes))...)
 	payload = append(payload, []byte(`"}`)...)
 	upstreamBody := []byte(`{"model":"upstream-model","input":"translated"}`)
 
@@ -250,8 +312,14 @@ func TestRequestLoggingMiddlewareCapturesLargeErrorRequestAndDeferredAPIRequest(
 	if errReadLog != nil {
 		t.Fatalf("read error log: %v", errReadLog)
 	}
-	if !bytes.Contains(content, payload) {
-		t.Fatal("error log does not contain the complete large request body")
+	if bytes.Contains(content, payload) {
+		t.Fatal("error log unexpectedly contains the complete large request body")
+	}
+	if !bytes.Contains(content, payload[:maxDeferredErrorRequestBodyBytes]) {
+		t.Fatal("error log does not contain the bounded request body prefix")
+	}
+	if !bytes.Contains(content, []byte("[REQUEST BODY TRUNCATED: captured first 262144 bytes]")) {
+		t.Fatal("error log does not identify the truncated request body")
 	}
 	if !bytes.Contains(content, []byte("=== API REQUEST 1 ===")) {
 		t.Fatal("error log does not contain the deferred API request section")
