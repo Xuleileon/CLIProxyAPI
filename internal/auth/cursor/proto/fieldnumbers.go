@@ -198,6 +198,7 @@ const (
 	ESM_BackgroundShellSpawn = 16 // BackgroundShellSpawnArgs
 	ESM_FetchArgs            = 20 // FetchArgs
 	ESM_WriteShellStdinArgs  = 23 // WriteShellStdinArgs
+	ESM_ExecuteHookArgs      = 27 // ExecuteHookArgs
 )
 
 // ExecClientMessage
@@ -218,6 +219,7 @@ const (
 	ECM_BackgroundShellSpawnRes = 16
 	ECM_FetchResult             = 20
 	ECM_WriteShellStdinResult   = 23
+	ECM_ExecuteHookResult       = 27
 )
 
 // McpArgs

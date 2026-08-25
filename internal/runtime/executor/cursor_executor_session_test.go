@@ -10,10 +10,101 @@ import (
 	"unicode/utf8"
 
 	cursorproto "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor/proto"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	claudetoopenai "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/claude"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"google.golang.org/protobuf/encoding/protowire"
 )
+
+func TestCursorCheckpointSurvivesExecutorRestart(t *testing.T) {
+	t.Parallel()
+	authDir := t.TempDir()
+	conversationID := "conversation-restart"
+	authID := "cursor-account"
+
+	first := NewCursorExecutor(&config.Config{AuthDir: authDir})
+	generation := first.beginCursorCheckpointGeneration(conversationID, authID)
+	first.saveCursorCheckpoint(conversationID, authID, generation, []byte("checkpoint"), map[string][]byte{"blob": []byte("image")})
+
+	second := NewCursorExecutor(&config.Config{AuthDir: authDir})
+	loaded, ok := second.loadCursorCheckpoint(conversationID, authID)
+	if !ok || string(loaded.data) != "checkpoint" || string(loaded.blobStore["blob"]) != "image" {
+		t.Fatalf("restored checkpoint = ok %t, value %#v", ok, loaded)
+	}
+}
+
+func TestCursorCheckpointGenerationRejectsLateFramesAndKeepsLateBlobs(t *testing.T) {
+	t.Parallel()
+	executor := NewCursorExecutor(&config.Config{AuthDir: t.TempDir()})
+	conversationID := "conversation-generation"
+	authID := "cursor-account"
+	oldGeneration := executor.beginCursorCheckpointGeneration(conversationID, authID)
+	executor.saveCursorCheckpoint(conversationID, authID, oldGeneration, []byte("old"), nil)
+
+	currentGeneration := executor.beginCursorCheckpointGeneration(conversationID, authID)
+	executor.saveCursorCheckpoint(conversationID, authID, currentGeneration, []byte("current"), nil)
+	executor.saveCursorCheckpoint(conversationID, authID, oldGeneration, []byte("late-old"), map[string][]byte{"wrong": []byte("wrong")})
+	executor.updateCursorCheckpointBlob(conversationID, authID, oldGeneration, "wrong", []byte("wrong"))
+	executor.updateCursorCheckpointBlob(conversationID, authID, currentGeneration, "late", []byte("image"))
+
+	loaded, ok := executor.loadCursorCheckpoint(conversationID, authID)
+	if !ok || string(loaded.data) != "current" {
+		t.Fatalf("current checkpoint = ok %t, value %#v", ok, loaded)
+	}
+	if _, exists := loaded.blobStore["wrong"]; exists {
+		t.Fatalf("superseded generation mutated checkpoint: %#v", loaded.blobStore)
+	}
+	if string(loaded.blobStore["late"]) != "image" {
+		t.Fatalf("late checkpoint blob was not retained: %#v", loaded.blobStore)
+	}
+
+	restarted := NewCursorExecutor(&config.Config{AuthDir: executor.cfg.AuthDir})
+	persisted, ok := restarted.loadCursorCheckpoint(conversationID, authID)
+	if !ok || string(persisted.data) != "current" || string(persisted.blobStore["late"]) != "image" {
+		t.Fatalf("persisted generation = ok %t, value %#v", ok, persisted)
+	}
+}
+
+func TestCursorCheckpointMemoryIsolatedByAuth(t *testing.T) {
+	t.Parallel()
+	executor := NewCursorExecutor(&config.Config{AuthDir: t.TempDir()})
+	conversationID := "shared-conversation"
+	firstGeneration := executor.beginCursorCheckpointGeneration(conversationID, "account-a")
+	secondGeneration := executor.beginCursorCheckpointGeneration(conversationID, "account-b")
+	executor.saveCursorCheckpoint(conversationID, "account-a", firstGeneration, []byte("checkpoint-a"), nil)
+	executor.saveCursorCheckpoint(conversationID, "account-b", secondGeneration, []byte("checkpoint-b"), nil)
+
+	first, firstOK := executor.loadCursorCheckpoint(conversationID, "account-a")
+	second, secondOK := executor.loadCursorCheckpoint(conversationID, "account-b")
+	if !firstOK || !secondOK || string(first.data) != "checkpoint-a" || string(second.data) != "checkpoint-b" {
+		t.Fatalf("auth-scoped checkpoints = first(%t, %q) second(%t, %q)", firstOK, first.data, secondOK, second.data)
+	}
+}
+
+func TestCursorVisibleInputEstimateExcludesImagesBlobsAndCheckpoint(t *testing.T) {
+	t.Parallel()
+	largeBinary := bytes.Repeat([]byte{0xff}, 2<<20)
+	params := &cursorproto.RunRequestParams{
+		SystemPrompt:  "system",
+		UserText:      "current",
+		Turns:         []cursorproto.TurnData{{UserText: "old-user", AssistantText: "old-assistant"}},
+		McpTools:      []cursorproto.McpToolDef{{Name: "read", Description: "file", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+		Images:        []cursorproto.ImageData{{MimeType: "image/png", Data: largeBinary}},
+		RawCheckpoint: largeBinary,
+		BlobStore:     map[string][]byte{"blob": largeBinary},
+	}
+	// The checkpoint already represents system and historical turns; only the
+	// new text delta and tool declarations are sent alongside it.
+	want := len("current") + len("read") + len("file") + len(`{"type":"object"}`)
+	if got := cursorVisibleInputBytes(params); got != want {
+		t.Fatalf("visible input bytes = %d, want %d", got, want)
+	}
+	params.RawCheckpoint = nil
+	want += len("system") + len("old-user") + len("old-assistant")
+	if got := cursorVisibleInputBytes(params); got != want {
+		t.Fatalf("cold visible input bytes = %d, want %d", got, want)
+	}
+}
 
 func TestResumeWithToolResultsReusesExistingOutput(t *testing.T) {
 	t.Parallel()
@@ -361,92 +452,6 @@ func TestBuildRunRequestParamsHonorsToolChoice(t *testing.T) {
 	}
 }
 
-func TestPrepareCursorCheckpointContinuationKeepsOnlyPendingDelta(t *testing.T) {
-	t.Parallel()
-
-	parsed := &parsedOpenAIRequest{
-		UserText: "steer after tool",
-		Turns:    []cursorproto.TurnData{{UserText: "old prompt", AssistantText: "old answer"}},
-		ToolResults: []toolResultInfo{
-			{ToolCallId: "tool-old", Content: "large old history"},
-			{ToolCallId: "tool-current", Content: "stale duplicate"},
-			{ToolCallId: "tool-current", Content: strings.Repeat("中", 5000)},
-		},
-	}
-	pending := []pendingMcpExec{{ToolCallId: "tool-current", ToolName: "read"}}
-
-	if !prepareCursorCheckpointContinuation(parsed, pending) {
-		t.Fatal("checkpoint continuation was not prepared")
-	}
-	if !utf8.ValidString(parsed.UserText) {
-		t.Fatal("checkpoint delta contains invalid UTF-8")
-	}
-	for _, unwanted := range []string{"large old history", "stale duplicate", "old prompt", "old answer"} {
-		if strings.Contains(parsed.UserText, unwanted) {
-			t.Fatalf("checkpoint delta retained old history %q", unwanted)
-		}
-	}
-	for _, want := range []string{
-		"TOOL_RESULT (call_id: tool-current, name: read, status: success)",
-		"CURRENT_USER_MESSAGE: steer after tool",
-		"Continue from the saved conversation state.",
-	} {
-		if !strings.Contains(parsed.UserText, want) {
-			t.Fatalf("checkpoint delta missing %q: %s", want, parsed.UserText)
-		}
-	}
-	if len(parsed.UserText) > 8300 {
-		t.Fatalf("checkpoint delta is too large: %d bytes", len(parsed.UserText))
-	}
-	if parsed.Turns != nil || parsed.ToolResults != nil {
-		t.Fatalf("checkpoint delta retained structured history: turns=%d results=%d", len(parsed.Turns), len(parsed.ToolResults))
-	}
-}
-
-func TestPrepareCursorCheckpointContinuationRejectsUnmatchedLineage(t *testing.T) {
-	t.Parallel()
-
-	parsed := &parsedOpenAIRequest{ToolResults: []toolResultInfo{{ToolCallId: "tool-other", Content: "result"}}}
-	if prepareCursorCheckpointContinuation(parsed, []pendingMcpExec{{ToolCallId: "tool-current"}}) {
-		t.Fatal("unmatched tool result unexpectedly prepared a checkpoint continuation")
-	}
-	if len(parsed.ToolResults) != 1 || parsed.UserText != "" {
-		t.Fatal("unmatched continuation mutated the parsed request")
-	}
-}
-
-func TestPrepareCursorCheckpointContinuationRequiresCompleteBatchAndPreservesErrors(t *testing.T) {
-	t.Parallel()
-
-	parsed := &parsedOpenAIRequest{ToolResults: []toolResultInfo{
-		{ToolCallId: "tool-a", Content: "permission denied", Images: []cursorproto.ImageData{{MimeType: "image/png", Data: []byte("image")}}, StructuredContent: json.RawMessage(`{"reason":"denied"}`), IsError: true},
-	}}
-	pending := []pendingMcpExec{
-		{ToolCallId: "tool-a", ToolName: "read"},
-		{ToolCallId: "tool-b", ToolName: "grep"},
-	}
-	if prepareCursorCheckpointContinuation(parsed, pending) {
-		t.Fatal("partial checkpoint tool result batch was accepted")
-	}
-	if parsed.UserText != "" || len(parsed.ToolResults) != 1 || len(parsed.Images) != 0 {
-		t.Fatal("rejected partial batch mutated the request")
-	}
-
-	parsed.ToolResults = append(parsed.ToolResults, toolResultInfo{ToolCallId: "tool-b", Content: "no matches"})
-	if !prepareCursorCheckpointContinuation(parsed, pending) {
-		t.Fatal("complete checkpoint tool result batch was rejected")
-	}
-	if !strings.Contains(parsed.UserText, "TOOL_RESULT (call_id: tool-a, name: read, status: error)") {
-		t.Fatalf("checkpoint continuation lost error status: %s", parsed.UserText)
-	}
-	if !strings.Contains(parsed.UserText, "TOOL_RESULT (call_id: tool-b, name: grep, status: success)") {
-		t.Fatalf("checkpoint continuation lost success status: %s", parsed.UserText)
-	}
-	if !strings.Contains(parsed.UserText, `STRUCTURED_CONTENT: {"reason":"denied"}`) {
-		t.Fatalf("checkpoint continuation lost structured content: %s", parsed.UserText)
-	}
-}
-
 func TestCursorSourceSessionIDPriority(t *testing.T) {
 	t.Parallel()
 
@@ -679,7 +684,7 @@ func TestWaitForCursorToolResultsQueuesLateParallelExecBatch(t *testing.T) {
 	go func() {
 		results, queued, err := waitForCursorToolResults(
 			context.Background(), stream, &bytes.Buffer{}, map[string][]byte{}, tools,
-			toolResultCh, nil, nil,
+			toolResultCh, nil, nil, nil,
 		)
 		outcomeCh <- waitResult{results: results, queued: queued, err: err}
 	}()
@@ -734,7 +739,7 @@ func TestWaitForCursorToolResultsQueuesLateAgentBatch(t *testing.T) {
 	go func() {
 		_, queued, err := waitForCursorToolResults(
 			context.Background(), stream, &bytes.Buffer{}, map[string][]byte{}, nil,
-			toolResultCh, nil, nil,
+			toolResultCh, nil, nil, nil,
 		)
 		outcomeCh <- waitResult{queued: queued, err: err}
 	}()
@@ -786,7 +791,7 @@ func TestWaitForCursorToolResultsQueuesFragmentedLateAgentCall(t *testing.T) {
 	go func() {
 		_, queued, err := waitForCursorToolResults(
 			context.Background(), stream, &bytes.Buffer{}, map[string][]byte{}, nil,
-			toolResultCh, nil, nil,
+			toolResultCh, nil, nil, nil,
 		)
 		outcomeCh <- waitResult{queued: queued, err: err}
 	}()
@@ -803,6 +808,34 @@ func TestWaitForCursorToolResultsQueuesFragmentedLateAgentCall(t *testing.T) {
 	}
 	if len(outcome.queued) != 1 || outcome.queued[0].ToolCallId != "tool-agent-fragmented" {
 		t.Fatalf("fragmented queued batch = %#v", outcome.queued)
+	}
+}
+
+func TestWaitForCursorToolResultsAcknowledgesPreCompact(t *testing.T) {
+	t.Parallel()
+	stream := &fakeCursorToolResultStream{dataCh: make(chan []byte), doneCh: make(chan struct{})}
+	toolResultCh := make(chan []toolResultInfo)
+	outcomeCh := make(chan error, 1)
+	go func() {
+		_, _, err := waitForCursorToolResults(
+			context.Background(), stream, &bytes.Buffer{}, map[string][]byte{}, nil,
+			toolResultCh, nil, nil, nil,
+		)
+		outcomeCh <- err
+	}()
+
+	stream.dataCh <- testCursorPreCompactServerFrame(91, "exec-pre-compact")
+	toolResultCh <- []toolResultInfo{{ToolCallId: "tool-current", Content: "done"}}
+	if err := <-outcomeCh; err != nil {
+		t.Fatalf("waitForCursorToolResults() error = %v", err)
+	}
+	if len(stream.writes) != 2 {
+		t.Fatalf("pre-compact writes = %d, want result + close", len(stream.writes))
+	}
+	wantResult := cursorproto.FrameConnectMessage(cursorproto.EncodeExecPreCompactResult(91, "exec-pre-compact", ""), 0)
+	wantClose := cursorproto.FrameConnectMessage(cursorproto.EncodeExecStreamClose(91), 0)
+	if !bytes.Equal(stream.writes[0], wantResult) || !bytes.Equal(stream.writes[1], wantClose) {
+		t.Fatalf("unexpected pre-compact acknowledgement: %#v", stream.writes)
 	}
 }
 
@@ -830,6 +863,17 @@ func testCursorMCPServerFrame(messageID uint32, execID, toolCallID, toolName str
 	exec = appendCursorTestBytes(exec, cursorproto.ESM_McpArgs, args)
 	exec = appendCursorTestString(exec, cursorproto.ESM_ExecId, execID)
 
+	serverMessage := appendCursorTestBytes(nil, cursorproto.ASM_ExecServerMessage, exec)
+	return cursorproto.FrameConnectMessage(serverMessage, 0)
+}
+
+func testCursorPreCompactServerFrame(messageID uint32, execID string) []byte {
+	preCompact := appendCursorTestString(nil, 1, "automatic")
+	hookArgs := appendCursorTestBytes(nil, 1, preCompact)
+	var exec []byte
+	exec = appendCursorTestVarint(exec, cursorproto.ESM_Id, uint64(messageID))
+	exec = appendCursorTestBytes(exec, cursorproto.ESM_ExecuteHookArgs, hookArgs)
+	exec = appendCursorTestString(exec, cursorproto.ESM_ExecId, execID)
 	serverMessage := appendCursorTestBytes(nil, cursorproto.ASM_ExecServerMessage, exec)
 	return cursorproto.FrameConnectMessage(serverMessage, 0)
 }
@@ -890,26 +934,6 @@ func TestParseOpenAIRequestPreservesToolResultImages(t *testing.T) {
 	}
 	if result.Images[0].MimeType != "image/png" || !bytes.Equal(result.Images[0].Data, []byte{1, 2, 3, 4}) {
 		t.Fatalf("tool result image = %#v", result.Images[0])
-	}
-}
-
-func TestPrepareCursorCheckpointContinuationPreservesMatchedImages(t *testing.T) {
-	t.Parallel()
-
-	oldImage := cursorproto.ImageData{MimeType: "image/png", Data: []byte("old")}
-	currentImage := cursorproto.ImageData{MimeType: "image/png", Data: []byte("current")}
-	parsed := &parsedOpenAIRequest{
-		ToolResults: []toolResultInfo{
-			{ToolCallId: "tool-old", Content: "old", Images: []cursorproto.ImageData{oldImage}},
-			{ToolCallId: "tool-current", Content: "current", Images: []cursorproto.ImageData{currentImage}},
-		},
-	}
-
-	if !prepareCursorCheckpointContinuation(parsed, []pendingMcpExec{{ToolCallId: "tool-current", ToolName: "read"}}) {
-		t.Fatal("checkpoint continuation was not prepared")
-	}
-	if len(parsed.Images) != 1 || !bytes.Equal(parsed.Images[0].Data, currentImage.Data) {
-		t.Fatalf("checkpoint images = %#v, want only current image", parsed.Images)
 	}
 }
 

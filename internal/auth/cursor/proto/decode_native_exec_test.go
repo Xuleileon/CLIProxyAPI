@@ -39,6 +39,29 @@ func TestDecodeGrepArgsPreservesGlobAndToolCallID(t *testing.T) {
 	}
 }
 
+func TestDecodeExecuteHookArgsRecognizesOnlyPreCompact(t *testing.T) {
+	preCompactRequest := appendStringField(nil, 1, "automatic")
+	hookArgs := appendBytesField(nil, 1, preCompactRequest)
+
+	msg, err := DecodeAgentServerMessage(wrapExecServerMessage(27, "exec-pre-compact", ESM_ExecuteHookArgs, hookArgs))
+	if err != nil {
+		t.Fatalf("DecodeAgentServerMessage() error = %v", err)
+	}
+	if msg.Type != ServerMsgExecPreCompact || msg.ExecMsgId != 27 || msg.ExecId != "exec-pre-compact" {
+		t.Fatalf("decoded pre-compact hook = %#v", msg)
+	}
+
+	nonPreCompactRequest := appendBytesField(nil, 2, []byte("not-pre-compact"))
+	nonPreCompactArgs := appendBytesField(nil, 1, nonPreCompactRequest)
+	msg, err = DecodeAgentServerMessage(wrapExecServerMessage(28, "exec-other-hook", ESM_ExecuteHookArgs, nonPreCompactArgs))
+	if err != nil {
+		t.Fatalf("DecodeAgentServerMessage() error = %v", err)
+	}
+	if msg.Type != ServerMsgExecOther || msg.ExecFieldNumber != ESM_ExecuteHookArgs {
+		t.Fatalf("decoded non-pre-compact hook = %#v", msg)
+	}
+}
+
 func wrapExecServerMessage(id uint32, execID string, argsField protowire.Number, args []byte) []byte {
 	var exec []byte
 	exec = appendVarintField(exec, ESM_Id, uint64(id))

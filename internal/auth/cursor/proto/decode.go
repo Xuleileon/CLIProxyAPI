@@ -31,6 +31,7 @@ const (
 	ServerMsgExecShellStream                       // Rejected: shell stream
 	ServerMsgExecBgShellSpawn                      // Rejected: background shell
 	ServerMsgExecWriteShellStdin                   // Rejected: write shell stdin
+	ServerMsgExecPreCompact                        // Acknowledge the pre-compact hook
 	ServerMsgExecOther                             // Other exec types (respond with empty)
 	ServerMsgTurnEnded                             // Turn has ended (no more output)
 	ServerMsgHeartbeat                             // Server heartbeat
@@ -349,6 +350,13 @@ func decodeExecServerMessage(data []byte, msg *DecodedServerMessage) {
 				decodeShellArgs(val, msg) // same structure
 			case ESM_WriteShellStdinArgs:
 				msg.Type = ServerMsgExecWriteShellStdin
+			case ESM_ExecuteHookArgs:
+				if isPreCompactExecuteHookArgs(val) {
+					msg.Type = ServerMsgExecPreCompact
+				} else if msg.Type == ServerMsgUnknown {
+					msg.Type = ServerMsgExecOther
+					msg.ExecFieldNumber = int(num)
+				}
 			default:
 				// Unknown exec types - only set if we haven't identified the type yet
 				// (other fields like span_context (19) come after the exec type field)
@@ -366,6 +374,57 @@ func decodeExecServerMessage(data []byte, msg *DecodedServerMessage) {
 			data = data[n:]
 		}
 	}
+}
+
+// isPreCompactExecuteHookArgs identifies ExecuteHookArgs.request.pre_compact.
+// Other hooks retain the generic exec fallback path.
+func isPreCompactExecuteHookArgs(data []byte) bool {
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return false
+		}
+		data = data[n:]
+
+		if typ != protowire.BytesType {
+			n = protowire.ConsumeFieldValue(num, typ, data)
+			if n < 0 {
+				return false
+			}
+			data = data[n:]
+			continue
+		}
+
+		value, n := protowire.ConsumeBytes(data)
+		if n < 0 {
+			return false
+		}
+		data = data[n:]
+		if num != 1 { // ExecuteHookArgs.request
+			continue
+		}
+
+		for len(value) > 0 {
+			requestField, requestType, requestN := protowire.ConsumeTag(value)
+			if requestN < 0 {
+				return false
+			}
+			value = value[requestN:]
+			if requestType == protowire.BytesType {
+				_, requestN = protowire.ConsumeBytes(value)
+			} else {
+				requestN = protowire.ConsumeFieldValue(requestField, requestType, value)
+			}
+			if requestN < 0 {
+				return false
+			}
+			if requestField == 1 && requestType == protowire.BytesType { // ExecuteHookRequest.pre_compact
+				return true
+			}
+			value = value[requestN:]
+		}
+	}
+	return false
 }
 
 func decodeMcpArgs(data []byte, msg *DecodedServerMessage) {

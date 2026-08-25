@@ -968,6 +968,37 @@ func EncodeExecWriteShellStdinError(execMsgId uint32, execId string, errMsg stri
 	return encodeExecClientMsg(execMsgId, execId, "write_shell_stdin_result", result)
 }
 
+// EncodeExecPreCompactResult acknowledges the pre-compact lifecycle hook.
+func EncodeExecPreCompactResult(execMsgId uint32, execId, userMessage string) []byte {
+	// The embedded descriptor predates ExecuteHook*. Encode the verified wire
+	// layout directly so a descriptor refresh cannot change this acknowledgement.
+	var preCompact []byte // PreCompactRequestResponse
+	if userMessage != "" {
+		preCompact = protowire.AppendTag(preCompact, 1, protowire.BytesType)
+		preCompact = protowire.AppendString(preCompact, strings.ToValidUTF8(userMessage, "\uFFFD"))
+	}
+
+	var hookResponse []byte // ExecuteHookResponse.pre_compact = 1
+	hookResponse = protowire.AppendTag(hookResponse, 1, protowire.BytesType)
+	hookResponse = protowire.AppendBytes(hookResponse, preCompact)
+
+	var hookResult []byte // ExecuteHookResult.response = 1
+	hookResult = protowire.AppendTag(hookResult, 1, protowire.BytesType)
+	hookResult = protowire.AppendBytes(hookResult, hookResponse)
+
+	var exec []byte // ExecClientMessage
+	exec = protowire.AppendTag(exec, ECM_Id, protowire.VarintType)
+	exec = protowire.AppendVarint(exec, uint64(execMsgId))
+	exec = protowire.AppendTag(exec, ECM_ExecId, protowire.BytesType)
+	exec = protowire.AppendString(exec, strings.ToValidUTF8(execId, "\uFFFD"))
+	exec = protowire.AppendTag(exec, ECM_ExecuteHookResult, protowire.BytesType)
+	exec = protowire.AppendBytes(exec, hookResult)
+
+	var client []byte // AgentClientMessage.exec_client_message = 2
+	client = protowire.AppendTag(client, ACM_ExecClientMessage, protowire.BytesType)
+	return protowire.AppendBytes(client, exec)
+}
+
 // encodeExecClientMsg wraps an exec result in AgentClientMessage.
 // Mirrors sendExec() in cursor-fetch.ts.
 func encodeExecClientMsg(id uint32, execId string, resultFieldName string, resultMsg *dynamicpb.Message) []byte {

@@ -56,19 +56,24 @@ type CursorExecutor struct {
 	h2Pool      *cursorproto.H2StreamPool
 	mu          sync.Mutex
 	sessions    map[string]*cursorSession
-	checkpoints map[string]*savedCheckpoint // keyed by conversationId
-	admissionMu sync.Mutex
-	admissions  map[string]*helps.BoundedAdmission
-	activeRuns  int
-	queuedRuns  int
+	checkpoints map[string]*savedCheckpoint // keyed by auth ID + conversation ID
+	// checkpointGenerations prevents a superseded H2 Run from overwriting a
+	// newer checkpoint for the same downstream conversation.
+	checkpointGenerations map[string]string
+	checkpointStore       *helps.CursorCheckpointStore
+	admissionMu           sync.Mutex
+	admissions            map[string]*helps.BoundedAdmission
+	activeRuns            int
+	queuedRuns            int
 }
 
 // savedCheckpoint stores the server's conversation_checkpoint_update for reuse.
 type savedCheckpoint struct {
-	data      []byte            // raw ConversationStateStructure protobuf bytes
-	blobStore map[string][]byte // blobs referenced by the checkpoint
-	authID    string            // auth that produced this checkpoint (checkpoint is auth-specific)
-	updatedAt time.Time
+	data       []byte            // raw ConversationStateStructure protobuf bytes
+	blobStore  map[string][]byte // blobs referenced by the checkpoint
+	authID     string            // auth that produced this checkpoint (checkpoint is auth-specific)
+	generation string            // H2 Run generation that produced this checkpoint
+	updatedAt  time.Time
 }
 
 type cursorSession struct {
@@ -118,14 +123,20 @@ const (
 // NewCursorExecutor constructs a new executor instance.
 func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
 	activeRuns, queuedRuns := cursorAdmissionLimits(cfg)
+	authDir := ""
+	if cfg != nil {
+		authDir = cfg.AuthDir
+	}
 	e := &CursorExecutor{
-		cfg:         cfg,
-		h2Pool:      cursorproto.NewH2StreamPool(),
-		sessions:    make(map[string]*cursorSession),
-		checkpoints: make(map[string]*savedCheckpoint),
-		admissions:  make(map[string]*helps.BoundedAdmission),
-		activeRuns:  activeRuns,
-		queuedRuns:  queuedRuns,
+		cfg:                   cfg,
+		h2Pool:                cursorproto.NewH2StreamPool(),
+		sessions:              make(map[string]*cursorSession),
+		checkpoints:           make(map[string]*savedCheckpoint),
+		checkpointGenerations: make(map[string]string),
+		checkpointStore:       helps.NewCursorCheckpointStore(authDir, cursorCheckpointTTL),
+		admissions:            make(map[string]*helps.BoundedAdmission),
+		activeRuns:            activeRuns,
+		queuedRuns:            queuedRuns,
 	}
 	go e.cleanupLoop()
 	return e
@@ -221,9 +232,13 @@ func (e *CursorExecutor) cleanupLoop() {
 		for k, cp := range e.checkpoints {
 			if time.Since(cp.updatedAt) > cursorCheckpointTTL {
 				delete(e.checkpoints, k)
+				delete(e.checkpointGenerations, k)
 			}
 		}
 		e.mu.Unlock()
+		if err := e.checkpointStore.Cleanup(time.Now()); err != nil {
+			log.WithError(err).Warn("cursor: failed to clean persisted checkpoints")
+		}
 		for _, session := range expired {
 			closeCursorSession(session)
 		}
@@ -258,11 +273,122 @@ func cloneSavedCursorCheckpoint(src *savedCheckpoint) (*savedCheckpoint, bool) {
 		return nil, false
 	}
 	return &savedCheckpoint{
-		data:      append([]byte(nil), src.data...),
-		blobStore: cloneCursorBlobStore(src.blobStore),
-		authID:    src.authID,
-		updatedAt: src.updatedAt,
+		data:       append([]byte(nil), src.data...),
+		blobStore:  cloneCursorBlobStore(src.blobStore),
+		authID:     src.authID,
+		generation: src.generation,
+		updatedAt:  src.updatedAt,
 	}, true
+}
+
+func cursorCheckpointMemoryKey(conversationID, authID string) string {
+	return authID + "\x00" + conversationID
+}
+
+func (e *CursorExecutor) loadCursorCheckpoint(conversationID, authID string) (*savedCheckpoint, bool) {
+	memoryKey := cursorCheckpointMemoryKey(conversationID, authID)
+	e.mu.Lock()
+	checkpoint, ok := cloneSavedCursorCheckpoint(e.checkpoints[memoryKey])
+	e.mu.Unlock()
+	if ok {
+		return checkpoint, true
+	}
+
+	snapshot, ok, err := e.checkpointStore.Load(conversationID, authID)
+	if err != nil {
+		log.WithError(err).Warn("cursor: failed to load persisted checkpoint")
+		return nil, false
+	}
+	if !ok {
+		return nil, false
+	}
+	checkpoint = &savedCheckpoint{
+		data:      append([]byte(nil), snapshot.Data...),
+		blobStore: cloneCursorBlobStore(snapshot.Blobs),
+		authID:    authID,
+		updatedAt: snapshot.UpdatedAt,
+	}
+	e.mu.Lock()
+	if current := e.checkpoints[memoryKey]; current == nil || current.updatedAt.Before(checkpoint.updatedAt) {
+		e.checkpoints[memoryKey] = checkpoint
+	} else {
+		checkpoint = current
+	}
+	checkpoint, ok = cloneSavedCursorCheckpoint(checkpoint)
+	e.mu.Unlock()
+	if ok {
+		log.Debugf("cursor: restored persisted checkpoint (%d bytes) for conv=%s auth=%s", len(checkpoint.data), conversationID, authID)
+	}
+	return checkpoint, ok
+}
+
+func (e *CursorExecutor) beginCursorCheckpointGeneration(conversationID, authID string) string {
+	generation := uuid.NewString()
+	memoryKey := cursorCheckpointMemoryKey(conversationID, authID)
+	e.mu.Lock()
+	if e.checkpointGenerations == nil {
+		e.checkpointGenerations = make(map[string]string)
+	}
+	e.checkpointGenerations[memoryKey] = generation
+	e.mu.Unlock()
+	return generation
+}
+
+func (e *CursorExecutor) saveCursorCheckpoint(conversationID, authID, generation string, data []byte, blobs map[string][]byte) {
+	if len(data) == 0 {
+		return
+	}
+	now := time.Now()
+	checkpoint := &savedCheckpoint{
+		data:       append([]byte(nil), data...),
+		blobStore:  cloneCursorBlobStore(blobs),
+		authID:     authID,
+		generation: generation,
+		updatedAt:  now,
+	}
+	memoryKey := cursorCheckpointMemoryKey(conversationID, authID)
+	e.mu.Lock()
+	if e.checkpointGenerations[memoryKey] != generation {
+		e.mu.Unlock()
+		log.Debugf("cursor: ignored checkpoint from superseded generation conv=%s", conversationID)
+		return
+	}
+	e.checkpoints[memoryKey] = checkpoint
+	e.mu.Unlock()
+	if err := e.checkpointStore.Save(conversationID, authID, helps.CursorCheckpointSnapshot{
+		Data:      checkpoint.data,
+		Blobs:     checkpoint.blobStore,
+		UpdatedAt: now,
+	}); err != nil {
+		log.WithError(err).Warn("cursor: failed to persist checkpoint")
+	}
+}
+
+func (e *CursorExecutor) updateCursorCheckpointBlob(conversationID, authID, generation, key string, data []byte) {
+	if key == "" {
+		return
+	}
+	memoryKey := cursorCheckpointMemoryKey(conversationID, authID)
+	e.mu.Lock()
+	checkpoint := e.checkpoints[memoryKey]
+	if checkpoint == nil || checkpoint.generation != generation || e.checkpointGenerations[memoryKey] != generation {
+		e.mu.Unlock()
+		return
+	}
+	if checkpoint.blobStore == nil {
+		checkpoint.blobStore = make(map[string][]byte)
+	}
+	checkpoint.blobStore[key] = append([]byte(nil), data...)
+	checkpoint.updatedAt = time.Now()
+	snapshot, _ := cloneSavedCursorCheckpoint(checkpoint)
+	e.mu.Unlock()
+	if err := e.checkpointStore.Save(conversationID, authID, helps.CursorCheckpointSnapshot{
+		Data:      snapshot.data,
+		Blobs:     snapshot.blobStore,
+		UpdatedAt: snapshot.updatedAt,
+	}); err != nil {
+		log.WithError(err).Warn("cursor: failed to persist checkpoint blob")
+	}
 }
 
 func sessionMatchesToolResults(session *cursorSession, results []toolResultInfo) bool {
@@ -644,7 +770,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Collect content and reasoning separately (Codex-compatible split).
 	var contentText, reasoningText strings.Builder
 	usage := &cursorTokenUsage{}
-	usage.setInputEstimate(len(payload))
+	usage.setInputEstimate(cursorVisibleInputBytes(params))
 	firstOutputLatencyMS := int64(-1)
 	if streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, nil,
 		func(text string, isThinking bool) {
@@ -660,7 +786,8 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		nil,
 		nil,
 		usage,
-		nil, // onCheckpoint - non-streaming doesn't persist
+		nil, // onCheckpoint - non-streaming is request-scoped
+		nil, // onBlobSet
 	); streamErr != nil {
 		log.WithFields(log.Fields{
 			"conversation":     conversationId,
@@ -671,16 +798,21 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}).Warn("cursor run terminal")
 		return resp, classifyCursorError(fmt.Errorf("cursor: stream error: %w", streamErr))
 	}
+	inTok, outTok := usage.get()
 	log.WithFields(log.Fields{
-		"conversation":     conversationId,
-		"terminal_outcome": "turn_ended",
-		"duration_ms":      time.Since(requestStartedAt).Milliseconds(),
-		"first_output_ms":  firstOutputLatencyMS,
+		"conversation":          conversationId,
+		"terminal_outcome":      "turn_ended",
+		"duration_ms":           time.Since(requestStartedAt).Milliseconds(),
+		"first_output_ms":       firstOutputLatencyMS,
+		"input_tokens_estimate": inTok,
+		"input_usage_source":    "visible_text_estimate",
+		"output_token_delta":    outTok,
+		"output_usage_source":   "cursor_token_delta",
+		"input_wire_bytes":      len(requestBytes),
 	}).Info("cursor run terminal")
 
 	id := "chatcmpl-" + uuid.New().String()[:28]
 	created := time.Now().Unix()
-	inTok, outTok := usage.get()
 	openaiResp := buildCursorOpenAIChatCompletion(id, created, parsed.Model, contentText.String(), reasoningText.String(), inTok, outTok)
 
 	// Translate response back to source format if needed
@@ -753,7 +885,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	checkpointKey := conversationId
 	needsTranslate := from.String() != "" && from.String() != "openai"
 
-	var continuationPending []pendingMcpExec
 	continuationMatched := false
 	partialSessionKey := ""
 	partialMatched := 0
@@ -813,7 +944,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 
 		if hasSession && session.stream != nil && session.authID == authID {
-			continuationPending = append([]pendingMcpExec(nil), session.pending...)
 			continuationMatched = true
 			log.Debugf("cursor: resuming existing Run %s with %d tool results", matchedSessionKey, len(parsed.ToolResults))
 			resumed, resumeErr := e.resumeWithToolResults(ctx, session, parsed.ToolResults)
@@ -856,21 +986,19 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	requestTurns := len(parsed.Turns)
 	hadConversationHistory := requestToolResults > 0 || requestTurns > 0
 
-	// Look up saved checkpoint for this conversation (keyed by conversationId only).
-	// Checkpoint is auth-specific: if auth changed (e.g. quota exhaustion failover),
-	// the old checkpoint is useless on the new account — discard and flatten.
-	e.mu.Lock()
-	saved, hasCheckpoint := cloneSavedCursorCheckpoint(e.checkpoints[checkpointKey])
-	e.mu.Unlock()
+	// Checkpoints are scoped by both conversation and auth. Cursor state is not
+	// portable across accounts, so auth failover intentionally starts cold.
+	saved, hasCheckpoint := e.loadCursorCheckpoint(checkpointKey, authID)
 
 	useCheckpoint := hasCheckpoint && saved != nil && len(saved.data) > 0 && saved.authID == authID
 	if useCheckpoint && len(parsed.ToolResults) > 0 {
-		if !continuationMatched || !prepareCursorCheckpointContinuation(parsed, continuationPending) {
-			// A checkpoint without exact pending tool lineage may belong to another
-			// concurrent branch sharing a client session ID. Prefer a cold replay.
-			useCheckpoint = false
-			log.Debugf("cursor: checkpoint lacks matching tool lineage for conv=%s; flattening safely", checkpointKey)
-		}
+		// Cursor exposes no native message that can attach external tool results
+		// to a restarted opaque checkpoint. Never disguise them as a new user
+		// message beside that checkpoint; replay the complete transcript cold so
+		// tool/result provenance stays explicit. The active H2 path above remains
+		// the exact continuation path.
+		useCheckpoint = false
+		log.Debugf("cursor: tool result arrived without a resumable H2 Run for conv=%s matched=%t; replaying full context", checkpointKey, continuationMatched)
 	}
 
 	params, errParams := buildRunRequestParams(parsed, conversationId, req.Model)
@@ -889,27 +1017,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		params.RawCheckpoint = saved.data
 		for k, v := range saved.blobStore {
 			params.BlobStore[k] = append([]byte(nil), v...)
-		}
-	} else if hasCheckpoint && saved.data != nil && saved.authID != authID {
-		// Auth changed (quota failover) — checkpoint is not portable across accounts.
-		// Discard and flatten conversation history into userText.
-		log.Infof("cursor: auth migrated (%s → %s) for conv=%s, discarding checkpoint and flattening context", saved.authID, authID, checkpointKey)
-		e.mu.Lock()
-		delete(e.checkpoints, checkpointKey)
-		e.mu.Unlock()
-		if hadConversationHistory {
-			log.WithFields(log.Fields{
-				"conversation":         conversationId,
-				"continuation_mode":    "cold_auth_migration",
-				"semantic_degradation": true,
-				"turns":                len(parsed.Turns),
-				"tool_results":         len(parsed.ToolResults),
-			}).Warn("cursor continuation flattened into user text")
-			flattenConversationIntoUserText(parsed)
-			params, errParams = buildRunRequestParams(parsed, conversationId, req.Model)
-			if errParams != nil {
-				return nil, errParams
-			}
 		}
 	} else if hadConversationHistory {
 		// Fallback: no checkpoint available (cold resume / proxy restart).
@@ -949,6 +1056,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		releaseRun()
 		return nil, fmt.Errorf("cursor: failed to send request: %w", err)
 	}
+	runGeneration := e.beginCursorCheckpointGeneration(checkpointKey, authID)
 
 	// Use a session-scoped context for the heartbeat that is NOT tied to the HTTP request.
 	// This ensures the heartbeat survives across request boundaries during MCP tool execution.
@@ -962,7 +1070,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	created := time.Now().Unix()
 
 	var streamParam any
-
 	// Keep the upstream Run alive across client-side tool execution. Each downstream
 	// HTTP response gets its own output channel, while tool results share this channel.
 	toolResultCh := make(chan []toolResultInfo, 1)
@@ -1039,7 +1146,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		roleSent := false
 		toolCallIndex := 0
 		usage := &cursorTokenUsage{}
-		usage.setInputEstimate(len(payload))
+		usage.setInputEstimate(cursorVisibleInputBytes(params))
 
 		streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, params.McpTools,
 			func(text string, isThinking bool) {
@@ -1121,16 +1228,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			toolResultCh,
 			usage,
 			func(cpData []byte) {
-				// Save checkpoint keyed by conversationId, tagged with authID for migration detection
-				e.mu.Lock()
-				e.checkpoints[checkpointKey] = &savedCheckpoint{
-					data:      append([]byte(nil), cpData...),
-					blobStore: cloneCursorBlobStore(params.BlobStore),
-					authID:    authID,
-					updatedAt: time.Now(),
-				}
-				e.mu.Unlock()
+				e.saveCursorCheckpoint(checkpointKey, authID, runGeneration, cpData, params.BlobStore)
 				log.Debugf("cursor: saved checkpoint (%d bytes) for conv=%s auth=%s", len(cpData), checkpointKey, authID)
+			},
+			func(blobKey string, blobData []byte) {
+				e.updateCursorCheckpointBlob(checkpointKey, authID, runGeneration, blobKey, blobData)
 			},
 		)
 
@@ -1206,16 +1308,21 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				return
 			}
 		}
+		inputTok, outputTok := usage.get()
 		log.WithFields(log.Fields{
-			"conversation":     conversationId,
-			"terminal_outcome": "turn_ended",
-			"data_sent":        dataSent.Load(),
-			"duration_ms":      time.Since(requestStartedAt).Milliseconds(),
-			"first_output_ms":  firstChunkLatencyMS.Load(),
+			"conversation":          conversationId,
+			"terminal_outcome":      "turn_ended",
+			"data_sent":             dataSent.Load(),
+			"duration_ms":           time.Since(requestStartedAt).Milliseconds(),
+			"first_output_ms":       firstChunkLatencyMS.Load(),
+			"input_tokens_estimate": inputTok,
+			"input_usage_source":    "visible_text_estimate",
+			"output_token_delta":    outputTok,
+			"output_usage_source":   "cursor_token_delta",
+			"input_wire_bytes":      len(requestBytes),
 		}).Info("cursor run terminal")
 
 		// Include token usage in the final stop chunk
-		inputTok, outputTok := usage.get()
 		// Build the stop chunk with usage embedded in the choices array level
 		fr := `"stop"`
 		openaiJSON := fmt.Sprintf(`{"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":%s}],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
@@ -1400,11 +1507,14 @@ func cursorH2Heartbeat(ctx context.Context, stream *cursorproto.H2Stream) {
 
 // --- Response processing ---
 
-// cursorTokenUsage tracks token counts from Cursor's TokenDeltaUpdate messages.
+// cursorTokenUsage tracks token counts exposed to downstream clients. Cursor
+// does not expose authoritative input usage, so input is estimated only from
+// model-visible text that CPA adds to this Run. Opaque checkpoints, images,
+// blobs, and protobuf overhead are deliberately excluded.
 type cursorTokenUsage struct {
 	mu             sync.Mutex
 	outputTokens   int64
-	inputTokensEst int64 // estimated from request payload size
+	inputTokensEst int64
 }
 
 func (u *cursorTokenUsage) addOutput(delta int64) {
@@ -1423,6 +1533,23 @@ func (u *cursorTokenUsage) setInputEstimate(payloadBytes int) {
 	}
 }
 
+func cursorVisibleInputBytes(params *cursorproto.RunRequestParams) int {
+	if params == nil {
+		return 0
+	}
+	size := len(params.UserText)
+	if len(params.RawCheckpoint) == 0 {
+		size += len(params.SystemPrompt)
+		for _, turn := range params.Turns {
+			size += len(turn.UserText) + len(turn.AssistantText)
+		}
+	}
+	for _, tool := range params.McpTools {
+		size += len(tool.Name) + len(tool.Description) + len(tool.InputSchema)
+	}
+	return size
+}
+
 func (u *cursorTokenUsage) get() (input, output int64) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -1439,6 +1566,7 @@ func processH2SessionFrames(
 	toolResultCh <-chan []toolResultInfo, // nil for no tool result injection; non-nil to wait for results
 	tokenUsage *cursorTokenUsage, // tracks accumulated token usage (may be nil)
 	onCheckpoint func(data []byte), // called when server sends conversation_checkpoint_update
+	onBlobSet func(key string, data []byte), // called after a server KV blob is stored
 ) error {
 	var buf bytes.Buffer
 	rejectReason := "Tool not available in this environment. Use the MCP tools provided instead."
@@ -1530,7 +1658,12 @@ func processH2SessionFrames(
 						blobKey := cursorproto.BlobIdHex(msg.BlobId)
 						blobStore[blobKey] = append([]byte(nil), msg.BlobData...)
 						resp := cursorproto.EncodeKvSetBlobResult(msg.KvId)
-						stream.Write(cursorproto.FrameConnectMessage(resp, 0))
+						if err := stream.Write(cursorproto.FrameConnectMessage(resp, 0)); err != nil {
+							return fmt.Errorf("cursor: acknowledge stored KV blob: %w", err)
+						}
+						if onBlobSet != nil {
+							onBlobSet(blobKey, msg.BlobData)
+						}
 
 					case cursorproto.ServerMsgExecRequestCtx:
 						resp := cursorproto.EncodeExecRequestContextResult(msg.ExecMsgId, msg.ExecId, mcpTools)
@@ -1595,6 +1728,11 @@ func processH2SessionFrames(
 						if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
 							return err
 						}
+					case cursorproto.ServerMsgExecPreCompact:
+						messages := [][]byte{cursorproto.EncodeExecPreCompactResult(msg.ExecMsgId, msg.ExecId, "")}
+						if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
+							return fmt.Errorf("cursor: acknowledge pre-compact hook: %w", err)
+						}
 					case cursorproto.ServerMsgExecOther:
 						if err := writeCursorExecMessages(stream, [][]byte{cursorproto.EncodeExecStreamClose(msg.ExecMsgId)}); err != nil {
 							return err
@@ -1623,7 +1761,7 @@ func processH2SessionFrames(
 					return nil
 				}
 				log.Debugf("cursor: waiting for %d downstream tool results on active Run", len(pendingBatch))
-				toolResults, queuedBatch, err := waitForCursorToolResults(ctx, stream, &buf, blobStore, mcpTools, toolResultCh, tokenUsage, onCheckpoint)
+				toolResults, queuedBatch, err := waitForCursorToolResults(ctx, stream, &buf, blobStore, mcpTools, toolResultCh, tokenUsage, onCheckpoint, onBlobSet)
 				if err != nil {
 					return err
 				}
@@ -1676,6 +1814,7 @@ func waitForCursorToolResults(
 	toolResultCh <-chan []toolResultInfo,
 	tokenUsage *cursorTokenUsage,
 	onCheckpoint func(data []byte),
+	onBlobSet func(key string, data []byte),
 ) ([]toolResultInfo, []pendingMcpExec, error) {
 	rejectReason := "Tool not available in this environment. Use the MCP tools provided instead."
 	// Do not reject supported execs that arrive while the downstream client is
@@ -1727,6 +1866,9 @@ func waitForCursorToolResults(
 					if err := stream.Write(cursorproto.FrameConnectMessage(cursorproto.EncodeKvSetBlobResult(msg.KvId), 0)); err != nil {
 						return nil, nil, err
 					}
+					if onBlobSet != nil {
+						onBlobSet(blobKey, msg.BlobData)
+					}
 				case cursorproto.ServerMsgExecRequestCtx:
 					messages := [][]byte{cursorproto.EncodeExecRequestContextResult(msg.ExecMsgId, msg.ExecId, mcpTools)}
 					if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
@@ -1774,6 +1916,11 @@ func waitForCursorToolResults(
 					}
 				case cursorproto.ServerMsgExecWriteShellStdin:
 					messages := [][]byte{cursorproto.EncodeExecWriteShellStdinError(msg.ExecMsgId, msg.ExecId, rejectReason)}
+					if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
+						return nil, nil, err
+					}
+				case cursorproto.ServerMsgExecPreCompact:
+					messages := [][]byte{cursorproto.EncodeExecPreCompactResult(msg.ExecMsgId, msg.ExecId, "")}
 					if err := writeCursorExecMessages(stream, appendCursorExecClose(messages, msg.ExecMsgId)); err != nil {
 						return nil, nil, err
 					}
@@ -2435,52 +2582,6 @@ func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 	// Clear turns and tool results since they're now in UserText
 	parsed.Turns = nil
 	parsed.ToolResults = nil
-}
-
-func prepareCursorCheckpointContinuation(parsed *parsedOpenAIRequest, pending []pendingMcpExec) bool {
-	if parsed == nil || len(pending) == 0 || len(parsed.ToolResults) == 0 {
-		return false
-	}
-
-	latest := make(map[string]toolResultInfo, len(parsed.ToolResults))
-	for _, result := range parsed.ToolResults {
-		if result.ToolCallId != "" {
-			latest[result.ToolCallId] = result
-		}
-	}
-	for _, exec := range pending {
-		if _, ok := latest[exec.ToolCallId]; !ok {
-			return false
-		}
-	}
-
-	var buf strings.Builder
-	matched := 0
-	for _, exec := range pending {
-		result := latest[exec.ToolCallId]
-		content := truncateCursorHistoryText(cursorFallbackToolResultContent(result, result.Content))
-		status := "success"
-		if result.IsError {
-			status = "error"
-		}
-		fmt.Fprintf(&buf, "TOOL_RESULT (call_id: %s, name: %s, status: %s): %s\n\n", exec.ToolCallId, exec.ToolName, status, content)
-		parsed.Images = appendUniqueCursorImages(parsed.Images, result.Images)
-		matched++
-	}
-	if matched == 0 {
-		return false
-	}
-	if parsed.UserText != "" {
-		buf.WriteString("CURRENT_USER_MESSAGE: ")
-		buf.WriteString(strings.ToValidUTF8(parsed.UserText, "\uFFFD"))
-		buf.WriteString("\n\n")
-	}
-	buf.WriteString("The tool results above complete the pending tool calls. Continue from the saved conversation state.")
-
-	parsed.UserText = buf.String()
-	parsed.Turns = nil
-	parsed.ToolResults = nil
-	return true
 }
 
 func cursorFallbackToolResultContent(result toolResultInfo, fallback string) string {

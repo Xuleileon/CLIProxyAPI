@@ -1,11 +1,57 @@
 package proto
 
 import (
+	"bytes"
 	"testing"
 	"unicode/utf8"
 
 	"google.golang.org/protobuf/encoding/protowire"
 )
+
+func TestEncodeRunRequestCarriesSelectedImages(t *testing.T) {
+	t.Parallel()
+	images := []ImageData{
+		{MimeType: "image/png", Data: []byte{1, 2, 3}},
+		{MimeType: "image/jpeg", Data: []byte{4, 5, 6}},
+	}
+	checkpoint := protowire.AppendTag(nil, CSS_Mode, protowire.VarintType)
+	checkpoint = protowire.AppendVarint(checkpoint, uint64(AgentModeAgent))
+	for _, test := range []struct {
+		name       string
+		checkpoint []byte
+	}{
+		{name: "cold"},
+		{name: "checkpoint", checkpoint: checkpoint},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw := EncodeRunRequest(&RunRequestParams{
+				ModelId:       "composer-2.5-fast",
+				UserText:      "inspect",
+				MessageId:     "message",
+				Images:        images,
+				RawCheckpoint: test.checkpoint,
+				BlobStore:     map[string][]byte{},
+			})
+			runRequest := mustFindBytesField(t, raw, ACM_RunRequest)
+			action := mustFindBytesField(t, runRequest, ARR_Action)
+			userAction := mustFindBytesField(t, action, CA_UserMessageAction)
+			userMessage := mustFindBytesField(t, userAction, UMA_UserMessage)
+			selectedContext := mustFindBytesField(t, userMessage, UM_SelectedContext)
+			selectedImages := findAllBytesFields(t, selectedContext, SC_SelectedImages)
+			if len(selectedImages) != len(images) {
+				t.Fatalf("selected images = %d, want %d", len(selectedImages), len(images))
+			}
+			for index, selectedImage := range selectedImages {
+				if mime, ok := findStringField(selectedImage, SI_MimeType); !ok || mime != images[index].MimeType {
+					t.Fatalf("image %d mime = %q, found=%t", index, mime, ok)
+				}
+				if data := mustFindBytesField(t, selectedImage, SI_Data); !bytes.Equal(data, images[index].Data) {
+					t.Fatalf("image %d data = %v, want %v", index, data, images[index].Data)
+				}
+			}
+		})
+	}
+}
 
 func TestEncodeRunRequestSetsMaxModeFalse(t *testing.T) {
 	raw := EncodeRunRequest(&RunRequestParams{
@@ -142,6 +188,35 @@ func mustFindBytesField(t *testing.T, b []byte, num protowire.Number) []byte {
 	}
 	t.Fatalf("field %d not found", num)
 	return nil
+}
+
+func findAllBytesFields(t *testing.T, b []byte, num protowire.Number) [][]byte {
+	t.Helper()
+	var values [][]byte
+	for len(b) > 0 {
+		n, typ, nTag := protowire.ConsumeTag(b)
+		if nTag < 0 {
+			t.Fatal("bad tag in protobuf blob")
+		}
+		b = b[nTag:]
+		if typ == protowire.BytesType {
+			value, nValue := protowire.ConsumeBytes(b)
+			if nValue < 0 {
+				t.Fatal("bad bytes field")
+			}
+			b = b[nValue:]
+			if n == num {
+				values = append(values, append([]byte(nil), value...))
+			}
+			continue
+		}
+		nSkip := protowire.ConsumeFieldValue(n, typ, b)
+		if nSkip < 0 {
+			t.Fatal("bad field value")
+		}
+		b = b[nSkip:]
+	}
+	return values
 }
 
 func findBoolField(b []byte, num protowire.Number) (bool, bool) {
