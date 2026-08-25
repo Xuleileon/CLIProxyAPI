@@ -1003,19 +1003,21 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// If no session found for current auth, check for stale sessions from
 		// a different auth on the same conversation (quota failover scenario).
 		// Clean them up since the H2 stream belongs to the old account.
-		if !hasSession {
+		if !hasSession && partialSessionKey == "" {
 			if oldKey := e.findSessionByConversationLocked(conversationId); oldKey != "" {
 				oldSession := e.sessions[oldKey]
-				log.Infof("cursor: cleaning up stale session from auth %s for conv=%s (auth migrated to %s)", oldSession.authID, conversationId, authID)
-				oldSession.cancel()
-				if oldSession.stream != nil {
-					oldSession.stream.Close()
+				if oldSession.authID != authID {
+					log.Infof("cursor: cleaning up stale session from auth %s for conv=%s (auth migrated to %s)", oldSession.authID, conversationId, authID)
+					oldSession.cancel()
+					if oldSession.stream != nil {
+						oldSession.stream.Close()
+					}
+					delete(e.sessions, oldKey)
 				}
-				delete(e.sessions, oldKey)
 			}
 		}
 		e.mu.Unlock()
-		if partialSessionKey != "" {
+		if partialSessionKey != "" && parsed.UserText == "" {
 			log.Warnf("cursor: incomplete tool result batch session=%s matched=%d pending=%d", partialSessionKey, partialMatched, partialPending)
 			return nil, cliproxyauth.NewRequestScopedError(
 				fmt.Sprintf("cursor: incomplete tool result batch: received %d of %d pending results", partialMatched, partialPending),
@@ -1191,6 +1193,20 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 
+	sendUsageChunkSwitchable := func(finishReason string, inputTokens, outputTokens int64) {
+		openaiJSON := fmt.Sprintf(`{"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":%s}],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
+			chatId, created, parsed.Model, jsonString(finishReason), inputTokens, outputTokens, inputTokens+outputTokens)
+		sseLine := []byte("data: " + openaiJSON + "\n")
+		if needsTranslate {
+			translated := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, payload, sseLine, &streamParam)
+			for _, item := range translated {
+				emitToOut(cliproxyexecutor.StreamChunk{Payload: normalizeCursorResponsesUsage(from, bytes.Clone(item))})
+			}
+			return
+		}
+		emitToOut(cliproxyexecutor.StreamChunk{Payload: []byte(openaiJSON)})
+	}
+
 	sendDoneSwitchable := func() {
 		if needsTranslate {
 			done := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, payload, []byte("data: [DONE]\n"), &streamParam)
@@ -1264,7 +1280,8 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 						sendChunkSwitchable(toolCallJSON, "")
 					}
 				}
-				sendChunkSwitchable(`{}`, `"tool_calls"`)
+				inputDelta, outputDelta := usage.takeUnreported()
+				sendUsageChunkSwitchable("tool_calls", inputDelta, outputDelta)
 				sendDoneSwitchable()
 
 				// Register the pending tool call before closing the current HTTP
@@ -1408,20 +1425,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			"input_wire_bytes":      len(requestBytes),
 		}).Info("cursor run terminal")
 
-		// Include token usage in the final stop chunk
-		// Build the stop chunk with usage embedded in the choices array level
-		fr := `"stop"`
-		openaiJSON := fmt.Sprintf(`{"id":"%s","object":"chat.completion.chunk","created":%d,"model":"%s","choices":[{"index":0,"delta":{},"finish_reason":%s}],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`,
-			chatId, created, parsed.Model, fr, inputTok, outputTok, inputTok+outputTok)
-		sseLine := []byte("data: " + openaiJSON + "\n")
-		if needsTranslate {
-			translated := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, payload, sseLine, &streamParam)
-			for _, t := range translated {
-				emitToOut(cliproxyexecutor.StreamChunk{Payload: normalizeCursorResponsesUsage(from, bytes.Clone(t))})
-			}
-		} else {
-			emitToOut(cliproxyexecutor.StreamChunk{Payload: []byte(openaiJSON)})
-		}
+		// Each downstream HTTP leg reports only the usage not already attached to a
+		// previous tool boundary. The upstream Cursor Run is continuous, so emitting
+		// cumulative totals on every leg would double-count the same model work.
+		inputDelta, outputDelta := usage.takeUnreported()
+		sendUsageChunkSwitchable("stop", inputDelta, outputDelta)
 		sendDoneSwitchable()
 
 		// Close whatever output channel is still active
@@ -1598,9 +1606,11 @@ func cursorH2Heartbeat(ctx context.Context, stream *cursorproto.H2Stream) {
 // model-visible text that CPA adds to this Run. Opaque checkpoints, images,
 // blobs, and protobuf overhead are deliberately excluded.
 type cursorTokenUsage struct {
-	mu             sync.Mutex
-	outputTokens   int64
-	inputTokensEst int64
+	mu                   sync.Mutex
+	outputTokens         int64
+	inputTokensEst       int64
+	reportedOutputTokens int64
+	reportedInputTokens  int64
 }
 
 func (u *cursorTokenUsage) addOutput(delta int64) {
@@ -1640,6 +1650,22 @@ func (u *cursorTokenUsage) get() (input, output int64) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.inputTokensEst, u.outputTokens
+}
+
+func (u *cursorTokenUsage) takeUnreported() (input, output int64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	input = u.inputTokensEst - u.reportedInputTokens
+	output = u.outputTokens - u.reportedOutputTokens
+	if input < 0 {
+		input = 0
+	}
+	if output < 0 {
+		output = 0
+	}
+	u.reportedInputTokens = u.inputTokensEst
+	u.reportedOutputTokens = u.outputTokens
+	return input, output
 }
 
 func processH2SessionFrames(

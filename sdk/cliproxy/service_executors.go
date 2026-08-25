@@ -313,6 +313,19 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 	case "kilo":
 		s.coreManager.RegisterExecutor(executor.NewKiloExecutor(cfg))
 	case "cursor":
+		// Cursor keeps live H2 Runs and checkpoint state on the executor. Auth-file
+		// refreshes for any provider rescan every auth entry, so replacing an
+		// unchanged Cursor executor here would cancel unrelated active Composer
+		// sessions. Config reloads still pass forceReplace=true and intentionally
+		// rebuild the executor with the new configuration.
+		if !forceReplace {
+			existingExecutor, hasExecutor := s.coreManager.Executor("cursor")
+			if hasExecutor {
+				if _, isCursorExecutor := existingExecutor.(*executor.CursorExecutor); isCursorExecutor {
+					return
+				}
+			}
+		}
 		s.coreManager.RegisterExecutor(executor.NewCursorExecutor(cfg))
 	case "github-copilot":
 		s.coreManager.RegisterExecutor(executor.NewGitHubCopilotExecutor(cfg))
