@@ -2,6 +2,7 @@ package helps
 
 import (
 	"bytes"
+	"encoding/gob"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,6 +14,7 @@ func TestCursorCheckpointStoreRoundTripAndIsolation(t *testing.T) {
 	snapshot := CursorCheckpointSnapshot{
 		Data:      []byte("checkpoint"),
 		Blobs:     map[string][]byte{"blob": []byte("image")},
+		Pending:   []CursorCheckpointPendingTool{{ToolCallID: "tool-1", ToolName: "read"}},
 		UpdatedAt: time.Now(),
 	}
 	if err := store.Save("conversation-a", "auth-a", snapshot); err != nil {
@@ -32,6 +34,9 @@ func TestCursorCheckpointStoreRoundTripAndIsolation(t *testing.T) {
 	}
 	if !bytes.Equal(loaded.Data, snapshot.Data) || !bytes.Equal(loaded.Blobs["blob"], snapshot.Blobs["blob"]) {
 		t.Fatalf("loaded snapshot = %#v", loaded)
+	}
+	if len(loaded.Pending) != 1 || loaded.Pending[0] != snapshot.Pending[0] {
+		t.Fatalf("loaded pending lineage = %#v", loaded.Pending)
 	}
 	loaded.Data[0] = 'X'
 	loaded.Blobs["blob"][0] = 'X'
@@ -134,6 +139,33 @@ func TestCursorCheckpointStoreRejectsTampering(t *testing.T) {
 	}
 	if _, ok, err := store.Load("conversation", "auth"); err == nil || ok {
 		t.Fatalf("tampered Load() = ok %t, error %v", ok, err)
+	}
+}
+
+func TestCursorCheckpointStoreRejectsAmbiguousVersionOne(t *testing.T) {
+	store := newTestCursorCheckpointStore(t, time.Hour)
+	var plaintext bytes.Buffer
+	if err := gob.NewEncoder(&plaintext).Encode(&cursorCheckpointDiskSnapshot{
+		Version:       1,
+		UpdatedAtUnix: time.Now().UnixNano(),
+		Data:          []byte("legacy-without-pending-state"),
+	}); err != nil {
+		t.Fatalf("encode legacy snapshot: %v", err)
+	}
+	key, err := store.encryptionKey()
+	if err != nil {
+		t.Fatalf("encryptionKey() error = %v", err)
+	}
+	path := store.snapshotPath("conversation", "auth")
+	sealed, err := sealCursorCheckpoint(key, filepath.Base(path), plaintext.Bytes())
+	if err != nil {
+		t.Fatalf("seal legacy snapshot: %v", err)
+	}
+	if err = os.WriteFile(path, append([]byte(cursorCheckpointStoreMagic), sealed...), 0o600); err != nil {
+		t.Fatalf("write legacy snapshot: %v", err)
+	}
+	if _, ok, err := store.Load("conversation", "auth"); err != nil || ok {
+		t.Fatalf("legacy Load() = ok %t, error %v", ok, err)
 	}
 }
 

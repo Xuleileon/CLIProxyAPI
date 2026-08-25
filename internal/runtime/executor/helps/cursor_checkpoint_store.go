@@ -31,7 +31,15 @@ const (
 type CursorCheckpointSnapshot struct {
 	Data      []byte
 	Blobs     map[string][]byte
+	Pending   []CursorCheckpointPendingTool
 	UpdatedAt time.Time
+}
+
+// CursorCheckpointPendingTool is the minimum non-sensitive lineage needed to
+// tell whether an opaque checkpoint still waits for external tool results.
+type CursorCheckpointPendingTool struct {
+	ToolCallID string
+	ToolName   string
 }
 
 type cursorCheckpointDiskSnapshot struct {
@@ -39,6 +47,7 @@ type cursorCheckpointDiskSnapshot struct {
 	UpdatedAtUnix int64
 	Data          []byte
 	Blobs         map[string][]byte
+	Pending       []CursorCheckpointPendingTool
 }
 
 // CursorCheckpointStore keeps the latest opaque checkpoint across proxy
@@ -104,10 +113,11 @@ func (s *CursorCheckpointStore) Save(conversationID, authID string, snapshot Cur
 	}
 
 	disk := cursorCheckpointDiskSnapshot{
-		Version:       1,
+		Version:       2,
 		UpdatedAtUnix: snapshot.UpdatedAt.UnixNano(),
 		Data:          snapshot.Data,
 		Blobs:         snapshot.Blobs,
+		Pending:       snapshot.Pending,
 	}
 	var plaintext bytes.Buffer
 	if err := gob.NewEncoder(&plaintext).Encode(&disk); err != nil {
@@ -301,12 +311,15 @@ func (s *CursorCheckpointStore) loadFile(path string) (CursorCheckpointSnapshot,
 		return CursorCheckpointSnapshot{}, false, fmt.Errorf("decode cursor checkpoint: %w", err)
 	}
 	updatedAt := time.Unix(0, disk.UpdatedAtUnix)
-	if disk.Version != 1 || len(disk.Data) == 0 || time.Since(updatedAt) > s.ttl {
+	// Version 1 did not record whether the checkpoint still waited for a tool
+	// result, so reusing it after restart is ambiguous and therefore unsafe.
+	if disk.Version != 2 || len(disk.Data) == 0 || time.Since(updatedAt) > s.ttl {
 		return CursorCheckpointSnapshot{}, false, nil
 	}
 	return CursorCheckpointSnapshot{
 		Data:      append([]byte(nil), disk.Data...),
 		Blobs:     cloneCursorCheckpointBlobs(disk.Blobs),
+		Pending:   append([]CursorCheckpointPendingTool(nil), disk.Pending...),
 		UpdatedAt: updatedAt,
 	}, true, nil
 }
@@ -418,6 +431,9 @@ func cursorCheckpointSnapshotSize(snapshot CursorCheckpointSnapshot) int {
 	size := len(snapshot.Data)
 	for key, value := range snapshot.Blobs {
 		size += len(key) + len(value)
+	}
+	for _, pending := range snapshot.Pending {
+		size += len(pending.ToolCallID) + len(pending.ToolName)
 	}
 	return size
 }

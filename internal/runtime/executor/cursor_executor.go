@@ -71,6 +71,7 @@ type CursorExecutor struct {
 type savedCheckpoint struct {
 	data       []byte            // raw ConversationStateStructure protobuf bytes
 	blobStore  map[string][]byte // blobs referenced by the checkpoint
+	pending    []pendingMcpExec  // external tool calls still pending in this checkpoint
 	authID     string            // auth that produced this checkpoint (checkpoint is auth-specific)
 	generation string            // H2 Run generation that produced this checkpoint
 	updatedAt  time.Time
@@ -275,6 +276,7 @@ func cloneSavedCursorCheckpoint(src *savedCheckpoint) (*savedCheckpoint, bool) {
 	return &savedCheckpoint{
 		data:       append([]byte(nil), src.data...),
 		blobStore:  cloneCursorBlobStore(src.blobStore),
+		pending:    cloneCursorCheckpointPending(src.pending),
 		authID:     src.authID,
 		generation: src.generation,
 		updatedAt:  src.updatedAt,
@@ -305,6 +307,7 @@ func (e *CursorExecutor) loadCursorCheckpoint(conversationID, authID string) (*s
 	checkpoint = &savedCheckpoint{
 		data:      append([]byte(nil), snapshot.Data...),
 		blobStore: cloneCursorBlobStore(snapshot.Blobs),
+		pending:   cursorPendingFromStore(snapshot.Pending),
 		authID:    authID,
 		updatedAt: snapshot.UpdatedAt,
 	}
@@ -334,7 +337,7 @@ func (e *CursorExecutor) beginCursorCheckpointGeneration(conversationID, authID 
 	return generation
 }
 
-func (e *CursorExecutor) saveCursorCheckpoint(conversationID, authID, generation string, data []byte, blobs map[string][]byte) {
+func (e *CursorExecutor) saveCursorCheckpoint(conversationID, authID, generation string, data []byte, blobs map[string][]byte, pending []pendingMcpExec) {
 	if len(data) == 0 {
 		return
 	}
@@ -342,6 +345,7 @@ func (e *CursorExecutor) saveCursorCheckpoint(conversationID, authID, generation
 	checkpoint := &savedCheckpoint{
 		data:       append([]byte(nil), data...),
 		blobStore:  cloneCursorBlobStore(blobs),
+		pending:    cloneCursorCheckpointPending(pending),
 		authID:     authID,
 		generation: generation,
 		updatedAt:  now,
@@ -358,6 +362,7 @@ func (e *CursorExecutor) saveCursorCheckpoint(conversationID, authID, generation
 	if err := e.checkpointStore.Save(conversationID, authID, helps.CursorCheckpointSnapshot{
 		Data:      checkpoint.data,
 		Blobs:     checkpoint.blobStore,
+		Pending:   cursorPendingToStore(checkpoint.pending),
 		UpdatedAt: now,
 	}); err != nil {
 		log.WithError(err).Warn("cursor: failed to persist checkpoint")
@@ -385,10 +390,84 @@ func (e *CursorExecutor) updateCursorCheckpointBlob(conversationID, authID, gene
 	if err := e.checkpointStore.Save(conversationID, authID, helps.CursorCheckpointSnapshot{
 		Data:      snapshot.data,
 		Blobs:     snapshot.blobStore,
+		Pending:   cursorPendingToStore(snapshot.pending),
 		UpdatedAt: snapshot.updatedAt,
 	}); err != nil {
 		log.WithError(err).Warn("cursor: failed to persist checkpoint blob")
 	}
+}
+
+func (e *CursorExecutor) updateCursorCheckpointPending(conversationID, authID, generation string, pending []pendingMcpExec) {
+	if len(pending) == 0 {
+		// Do not clear an older checkpoint's pending marker until Cursor emits a
+		// newer checkpoint after the tool results were accepted.
+		return
+	}
+	memoryKey := cursorCheckpointMemoryKey(conversationID, authID)
+	e.mu.Lock()
+	checkpoint := e.checkpoints[memoryKey]
+	if checkpoint == nil || checkpoint.generation != generation || e.checkpointGenerations[memoryKey] != generation {
+		e.mu.Unlock()
+		return
+	}
+	checkpoint.pending = cloneCursorCheckpointPending(pending)
+	checkpoint.updatedAt = time.Now()
+	snapshot, _ := cloneSavedCursorCheckpoint(checkpoint)
+	e.mu.Unlock()
+	if err := e.checkpointStore.Save(conversationID, authID, helps.CursorCheckpointSnapshot{
+		Data:      snapshot.data,
+		Blobs:     snapshot.blobStore,
+		Pending:   cursorPendingToStore(snapshot.pending),
+		UpdatedAt: snapshot.updatedAt,
+	}); err != nil {
+		log.WithError(err).Warn("cursor: failed to persist checkpoint tool lineage")
+	}
+}
+
+func cloneCursorCheckpointPending(src []pendingMcpExec) []pendingMcpExec {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]pendingMcpExec, 0, len(src))
+	for _, pending := range src {
+		if pending.ToolCallId != "" {
+			dst = append(dst, pendingMcpExec{ToolCallId: pending.ToolCallId, ToolName: pending.ToolName})
+		}
+	}
+	return dst
+}
+
+func cursorPendingToStore(src []pendingMcpExec) []helps.CursorCheckpointPendingTool {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]helps.CursorCheckpointPendingTool, 0, len(src))
+	for _, pending := range src {
+		if pending.ToolCallId != "" {
+			dst = append(dst, helps.CursorCheckpointPendingTool{ToolCallID: pending.ToolCallId, ToolName: pending.ToolName})
+		}
+	}
+	return dst
+}
+
+func cursorPendingFromStore(src []helps.CursorCheckpointPendingTool) []pendingMcpExec {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]pendingMcpExec, 0, len(src))
+	for _, pending := range src {
+		if pending.ToolCallID != "" {
+			dst = append(dst, pendingMcpExec{ToolCallId: pending.ToolCallID, ToolName: pending.ToolName})
+		}
+	}
+	return dst
+}
+
+func cursorCheckpointNeedsColdToolReplay(checkpoint *savedCheckpoint, matchedFailedLiveRun bool, toolResultCount int) bool {
+	if checkpoint == nil {
+		return false
+	}
+	return len(checkpoint.pending) > 0 || (matchedFailedLiveRun && toolResultCount > 0)
 }
 
 func sessionMatchesToolResults(session *cursorSession, results []toolResultInfo) bool {
@@ -788,6 +867,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		usage,
 		nil, // onCheckpoint - non-streaming is request-scoped
 		nil, // onBlobSet
+		nil, // onPendingChange
 	); streamErr != nil {
 		log.WithFields(log.Fields{
 			"conversation":     conversationId,
@@ -991,14 +1071,15 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	saved, hasCheckpoint := e.loadCursorCheckpoint(checkpointKey, authID)
 
 	useCheckpoint := hasCheckpoint && saved != nil && len(saved.data) > 0 && saved.authID == authID
-	if useCheckpoint && len(parsed.ToolResults) > 0 {
+	checkpointNeedsToolReplay := useCheckpoint && cursorCheckpointNeedsColdToolReplay(saved, continuationMatched, len(parsed.ToolResults))
+	if checkpointNeedsToolReplay {
 		// Cursor exposes no native message that can attach external tool results
 		// to a restarted opaque checkpoint. Never disguise them as a new user
 		// message beside that checkpoint; replay the complete transcript cold so
 		// tool/result provenance stays explicit. The active H2 path above remains
 		// the exact continuation path.
 		useCheckpoint = false
-		log.Debugf("cursor: tool result arrived without a resumable H2 Run for conv=%s matched=%t; replaying full context", checkpointKey, continuationMatched)
+		log.Debugf("cursor: checkpoint still needs external tool replay for conv=%s pending=%d matched_live=%t; replaying full context", checkpointKey, len(saved.pending), continuationMatched)
 	}
 
 	params, errParams := buildRunRequestParams(parsed, conversationId, req.Model)
@@ -1070,6 +1151,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	created := time.Now().Unix()
 
 	var streamParam any
+	var checkpointPending []pendingMcpExec
 	// Keep the upstream Run alive across client-side tool execution. Each downstream
 	// HTTP response gets its own output channel, while tool results share this channel.
 	toolResultCh := make(chan []toolResultInfo, 1)
@@ -1228,11 +1310,15 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			toolResultCh,
 			usage,
 			func(cpData []byte) {
-				e.saveCursorCheckpoint(checkpointKey, authID, runGeneration, cpData, params.BlobStore)
+				e.saveCursorCheckpoint(checkpointKey, authID, runGeneration, cpData, params.BlobStore, checkpointPending)
 				log.Debugf("cursor: saved checkpoint (%d bytes) for conv=%s auth=%s", len(cpData), checkpointKey, authID)
 			},
 			func(blobKey string, blobData []byte) {
 				e.updateCursorCheckpointBlob(checkpointKey, authID, runGeneration, blobKey, blobData)
+			},
+			func(pending []pendingMcpExec) {
+				checkpointPending = cloneCursorCheckpointPending(pending)
+				e.updateCursorCheckpointPending(checkpointKey, authID, runGeneration, checkpointPending)
 			},
 		)
 
@@ -1567,6 +1653,7 @@ func processH2SessionFrames(
 	tokenUsage *cursorTokenUsage, // tracks accumulated token usage (may be nil)
 	onCheckpoint func(data []byte), // called when server sends conversation_checkpoint_update
 	onBlobSet func(key string, data []byte), // called after a server KV blob is stored
+	onPendingChange func(pending []pendingMcpExec), // records which external calls the current upstream state awaits
 ) error {
 	var buf bytes.Buffer
 	rejectReason := "Tool not available in this environment. Use the MCP tools provided instead."
@@ -1756,6 +1843,9 @@ func processH2SessionFrames(
 			}
 
 			for len(pendingBatch) > 0 {
+				if onPendingChange != nil {
+					onPendingChange(pendingBatch)
+				}
 				onToolExec(append([]pendingMcpExec(nil), pendingBatch...))
 				if toolResultCh == nil {
 					return nil
@@ -1782,6 +1872,9 @@ func processH2SessionFrames(
 				// running. Claude clients require each assistant tool batch to finish
 				// before returning its results, so expose queued calls in the next turn.
 				pendingBatch = queuedBatch
+			}
+			if onPendingChange != nil {
+				onPendingChange(nil)
 			}
 			if turnEnded {
 				return nil

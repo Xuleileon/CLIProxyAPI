@@ -24,12 +24,16 @@ func TestCursorCheckpointSurvivesExecutorRestart(t *testing.T) {
 
 	first := NewCursorExecutor(&config.Config{AuthDir: authDir})
 	generation := first.beginCursorCheckpointGeneration(conversationID, authID)
-	first.saveCursorCheckpoint(conversationID, authID, generation, []byte("checkpoint"), map[string][]byte{"blob": []byte("image")})
+	pending := []pendingMcpExec{{ToolCallId: "tool-1", ToolName: "read", Args: `{"path":"secret"}`}}
+	first.saveCursorCheckpoint(conversationID, authID, generation, []byte("checkpoint"), map[string][]byte{"blob": []byte("image")}, pending)
 
 	second := NewCursorExecutor(&config.Config{AuthDir: authDir})
 	loaded, ok := second.loadCursorCheckpoint(conversationID, authID)
 	if !ok || string(loaded.data) != "checkpoint" || string(loaded.blobStore["blob"]) != "image" {
 		t.Fatalf("restored checkpoint = ok %t, value %#v", ok, loaded)
+	}
+	if len(loaded.pending) != 1 || loaded.pending[0].ToolCallId != "tool-1" || loaded.pending[0].ToolName != "read" || loaded.pending[0].Args != "" {
+		t.Fatalf("restored checkpoint lineage = %#v", loaded.pending)
 	}
 }
 
@@ -39,11 +43,11 @@ func TestCursorCheckpointGenerationRejectsLateFramesAndKeepsLateBlobs(t *testing
 	conversationID := "conversation-generation"
 	authID := "cursor-account"
 	oldGeneration := executor.beginCursorCheckpointGeneration(conversationID, authID)
-	executor.saveCursorCheckpoint(conversationID, authID, oldGeneration, []byte("old"), nil)
+	executor.saveCursorCheckpoint(conversationID, authID, oldGeneration, []byte("old"), nil, nil)
 
 	currentGeneration := executor.beginCursorCheckpointGeneration(conversationID, authID)
-	executor.saveCursorCheckpoint(conversationID, authID, currentGeneration, []byte("current"), nil)
-	executor.saveCursorCheckpoint(conversationID, authID, oldGeneration, []byte("late-old"), map[string][]byte{"wrong": []byte("wrong")})
+	executor.saveCursorCheckpoint(conversationID, authID, currentGeneration, []byte("current"), nil, []pendingMcpExec{{ToolCallId: "tool-current", ToolName: "read"}})
+	executor.saveCursorCheckpoint(conversationID, authID, oldGeneration, []byte("late-old"), map[string][]byte{"wrong": []byte("wrong")}, nil)
 	executor.updateCursorCheckpointBlob(conversationID, authID, oldGeneration, "wrong", []byte("wrong"))
 	executor.updateCursorCheckpointBlob(conversationID, authID, currentGeneration, "late", []byte("image"))
 
@@ -71,13 +75,48 @@ func TestCursorCheckpointMemoryIsolatedByAuth(t *testing.T) {
 	conversationID := "shared-conversation"
 	firstGeneration := executor.beginCursorCheckpointGeneration(conversationID, "account-a")
 	secondGeneration := executor.beginCursorCheckpointGeneration(conversationID, "account-b")
-	executor.saveCursorCheckpoint(conversationID, "account-a", firstGeneration, []byte("checkpoint-a"), nil)
-	executor.saveCursorCheckpoint(conversationID, "account-b", secondGeneration, []byte("checkpoint-b"), nil)
+	executor.saveCursorCheckpoint(conversationID, "account-a", firstGeneration, []byte("checkpoint-a"), nil, nil)
+	executor.saveCursorCheckpoint(conversationID, "account-b", secondGeneration, []byte("checkpoint-b"), nil, nil)
 
 	first, firstOK := executor.loadCursorCheckpoint(conversationID, "account-a")
 	second, secondOK := executor.loadCursorCheckpoint(conversationID, "account-b")
 	if !firstOK || !secondOK || string(first.data) != "checkpoint-a" || string(second.data) != "checkpoint-b" {
 		t.Fatalf("auth-scoped checkpoints = first(%t, %q) second(%t, %q)", firstOK, first.data, secondOK, second.data)
+	}
+}
+
+func TestCursorCheckpointPendingStateClearsOnlyOnNewCheckpoint(t *testing.T) {
+	t.Parallel()
+	executor := NewCursorExecutor(&config.Config{AuthDir: t.TempDir()})
+	conversationID := "conversation-pending"
+	authID := "cursor-account"
+	generation := executor.beginCursorCheckpointGeneration(conversationID, authID)
+	executor.saveCursorCheckpoint(conversationID, authID, generation, []byte("before-result"), nil, []pendingMcpExec{{ToolCallId: "tool-1", ToolName: "read"}})
+	executor.updateCursorCheckpointPending(conversationID, authID, generation, nil)
+
+	pending, ok := executor.loadCursorCheckpoint(conversationID, authID)
+	if !ok || len(pending.pending) != 1 {
+		t.Fatalf("older checkpoint lost pending marker: ok=%t checkpoint=%#v", ok, pending)
+	}
+	executor.saveCursorCheckpoint(conversationID, authID, generation, []byte("after-result"), nil, nil)
+	completed, ok := executor.loadCursorCheckpoint(conversationID, authID)
+	if !ok || len(completed.pending) != 0 || string(completed.data) != "after-result" {
+		t.Fatalf("new checkpoint did not clear pending marker: ok=%t checkpoint=%#v", ok, completed)
+	}
+}
+
+func TestCursorCheckpointColdReplayDecision(t *testing.T) {
+	t.Parallel()
+	completed := &savedCheckpoint{data: []byte("checkpoint")}
+	pending := &savedCheckpoint{data: []byte("checkpoint"), pending: []pendingMcpExec{{ToolCallId: "tool-1"}}}
+	if cursorCheckpointNeedsColdToolReplay(completed, false, 132) {
+		t.Fatal("completed checkpoint rejected only because request contains historical tool results")
+	}
+	if !cursorCheckpointNeedsColdToolReplay(pending, false, 0) {
+		t.Fatal("checkpoint waiting for a tool result was considered restart-safe")
+	}
+	if !cursorCheckpointNeedsColdToolReplay(completed, true, 1) {
+		t.Fatal("failed live continuation was considered restart-safe")
 	}
 }
 
