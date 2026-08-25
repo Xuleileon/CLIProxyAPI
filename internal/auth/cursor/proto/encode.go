@@ -516,16 +516,33 @@ func EncodeExecRequestContextResult(execMsgId uint32, execId string, tools []Mcp
 
 // EncodeExecMcpResult responds with MCP tool result.
 func EncodeExecMcpResult(execMsgId uint32, execId string, content string, isError bool) []byte {
-	textContent := newMsg("McpTextContent")
-	setStr(textContent, "text", content)
+	return EncodeExecMcpResultWithImages(execMsgId, execId, content, nil, isError)
+}
 
-	contentItem := newMsg("McpToolResultContentItem")
-	setMsg(contentItem, "text", textContent)
-
+// EncodeExecMcpResultWithImages preserves the native MCP text and image content
+// items returned by downstream clients.
+func EncodeExecMcpResultWithImages(execMsgId uint32, execId, content string, images []ImageData, isError bool) []byte {
 	success := newMsg("McpSuccess")
 	contentField := field(success, "content")
 	contentList := success.Mutable(contentField).List()
-	contentList.Append(protoreflect.ValueOfMessage(contentItem.ProtoReflect()))
+	if content != "" || len(images) == 0 {
+		textContent := newMsg("McpTextContent")
+		setStr(textContent, "text", content)
+		contentItem := newMsg("McpToolResultContentItem")
+		setMsg(contentItem, "text", textContent)
+		contentList.Append(protoreflect.ValueOfMessage(contentItem.ProtoReflect()))
+	}
+	for _, image := range images {
+		if len(image.Data) == 0 {
+			continue
+		}
+		imageContent := newMsg("McpImageContent")
+		setBytes(imageContent, "data", image.Data)
+		setStr(imageContent, "mime_type", image.MimeType)
+		contentItem := newMsg("McpToolResultContentItem")
+		setMsg(contentItem, "image", imageContent)
+		contentList.Append(protoreflect.ValueOfMessage(contentItem.ProtoReflect()))
+	}
 	setBool(success, "is_error", isError)
 
 	result := newMsg("McpResult")
@@ -617,6 +634,12 @@ func EncodeExecShellStreamResult(execMsgId uint32, execId, workDir, content stri
 }
 
 func EncodeExecReadResult(execMsgId uint32, execId, path, content string, isError bool) []byte {
+	return EncodeExecReadResultWithData(execMsgId, execId, path, content, nil, isError)
+}
+
+// EncodeExecReadResultWithData uses ReadSuccess.data for binary files. Cursor's
+// native read protocol models text and binary output as a oneof.
+func EncodeExecReadResultWithData(execMsgId uint32, execId, path, content string, data []byte, isError bool) []byte {
 	result := newMsg("ReadResult")
 	if isError {
 		readErr := newMsg("ReadError")
@@ -626,9 +649,14 @@ func EncodeExecReadResult(execMsgId uint32, execId, path, content string, isErro
 	} else {
 		success := newMsg("ReadSuccess")
 		setStr(success, "path", path)
-		setStr(success, "content", content)
-		setInt32(success, "total_lines", int32(textLineCount(content)))
-		setInt64(success, "file_size", int64(len(content)))
+		if len(data) > 0 {
+			setBytes(success, "data", data)
+			setInt64(success, "file_size", int64(len(data)))
+		} else {
+			setStr(success, "content", content)
+			setInt32(success, "total_lines", int32(textLineCount(content)))
+			setInt64(success, "file_size", int64(len(content)))
+		}
 		setMsg(result, "success", success)
 	}
 	return encodeExecClientMsg(execMsgId, execId, "read_result", result)

@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	cursorproto "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor/proto"
+	claudetoopenai "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/claude"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -713,4 +714,144 @@ func TestApplyOriginalToolResultErrorsPreservesClaudeErrorFlag(t *testing.T) {
 	if parsed.ToolResults[0].IsError || !parsed.ToolResults[1].IsError {
 		t.Fatalf("tool result error flags = %#v", parsed.ToolResults)
 	}
+}
+
+func TestParseOpenAIRequestPreservesToolResultImages(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"model":"composer-2.5-fast",
+		"messages":[
+			{"role":"assistant","content":"","tool_calls":[{"id":"tool-image","type":"function","function":{"name":"read","arguments":"{\"path\":\"shot.png\"}"}}]},
+			{"role":"tool","tool_call_id":"tool-image","content":[
+				{"type":"text","text":"Read image file [image/png]"},
+				{"type":"image_url","image_url":{"url":"data:image/png;base64,AQIDBA=="}}
+			]}
+		]
+	}`)
+
+	parsed := parseOpenAIRequest(payload)
+	if len(parsed.ToolResults) != 1 {
+		t.Fatalf("tool results = %d, want 1", len(parsed.ToolResults))
+	}
+	result := parsed.ToolResults[0]
+	if result.Content != "Read image file [image/png]" {
+		t.Fatalf("tool result text = %q", result.Content)
+	}
+	if len(result.Images) != 1 {
+		t.Fatalf("tool result images = %d, want 1", len(result.Images))
+	}
+	if result.Images[0].MimeType != "image/png" || !bytes.Equal(result.Images[0].Data, []byte{1, 2, 3, 4}) {
+		t.Fatalf("tool result image = %#v", result.Images[0])
+	}
+}
+
+func TestPrepareCursorCheckpointContinuationPreservesMatchedImages(t *testing.T) {
+	t.Parallel()
+
+	oldImage := cursorproto.ImageData{MimeType: "image/png", Data: []byte("old")}
+	currentImage := cursorproto.ImageData{MimeType: "image/png", Data: []byte("current")}
+	parsed := &parsedOpenAIRequest{
+		ToolResults: []toolResultInfo{
+			{ToolCallId: "tool-old", Content: "old", Images: []cursorproto.ImageData{oldImage}},
+			{ToolCallId: "tool-current", Content: "current", Images: []cursorproto.ImageData{currentImage}},
+		},
+	}
+
+	if !prepareCursorCheckpointContinuation(parsed, []pendingMcpExec{{ToolCallId: "tool-current", ToolName: "read"}}) {
+		t.Fatal("checkpoint continuation was not prepared")
+	}
+	if len(parsed.Images) != 1 || !bytes.Equal(parsed.Images[0].Data, currentImage.Data) {
+		t.Fatalf("checkpoint images = %#v, want only current image", parsed.Images)
+	}
+}
+
+func TestFlattenConversationIntoUserTextPreservesImages(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"model":"composer-2.5-fast",
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"inspect"},{"type":"image_url","image_url":{"url":"data:image/png;base64,b2xk"}}]},
+			{"role":"assistant","content":"done","tool_calls":[{"id":"tool-image","type":"function","function":{"name":"read","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"tool-image","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,bmV3"}}]},
+			{"role":"user","content":"summarize"}
+		]
+	}`)
+
+	parsed := parseOpenAIRequest(payload)
+	flattenConversationIntoUserText(parsed)
+	if len(parsed.Images) != 2 {
+		t.Fatalf("flattened images = %d, want 2", len(parsed.Images))
+	}
+	if parsed.Images[0].MimeType != "image/png" || parsed.Images[1].MimeType != "image/jpeg" {
+		t.Fatalf("flattened image order = %#v", parsed.Images)
+	}
+}
+
+func TestClaudeToolResultImageReachesCursorReadBinaryOutput(t *testing.T) {
+	t.Parallel()
+
+	claudePayload := []byte(`{
+		"model":"composer-2.5-fast",
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"tool-image","name":"read","input":{"path":"shot.png"}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-image","content":[
+				{"type":"text","text":"Read image file [image/png]"},
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQIDBA=="}}
+			]}]}
+		]
+	}`)
+
+	translated := claudetoopenai.ConvertClaudeRequestToOpenAI("composer-2.5-fast", claudePayload, true)
+	parsed := parseOpenAIRequest(translated)
+	if len(parsed.ToolResults) != 1 || len(parsed.ToolResults[0].Images) != 1 {
+		t.Fatalf("translated tool result = %#v", parsed.ToolResults)
+	}
+
+	messages := encodeCursorExecCompletion(pendingMcpExec{
+		ExecMsgId:  9,
+		ExecId:     "exec-read",
+		ToolCallId: "tool-image",
+		Path:       "shot.png",
+		Kind:       cursorExecRead,
+	}, parsed.ToolResults[0])
+	if len(messages) != 2 {
+		t.Fatalf("encoded messages = %d, want result and stream close", len(messages))
+	}
+	exec := mustFindCursorBytesField(t, messages[0], cursorproto.ACM_ExecClientMessage)
+	readResult := mustFindCursorBytesField(t, exec, cursorproto.ECM_ReadResult)
+	readSuccess := mustFindCursorBytesField(t, readResult, 1)
+	if got := mustFindCursorBytesField(t, readSuccess, 5); !bytes.Equal(got, []byte{1, 2, 3, 4}) {
+		t.Fatalf("read binary output = %v", got)
+	}
+}
+
+func mustFindCursorBytesField(t *testing.T, raw []byte, want protowire.Number) []byte {
+	t.Helper()
+	for len(raw) > 0 {
+		number, wireType, tagLen := protowire.ConsumeTag(raw)
+		if tagLen < 0 {
+			t.Fatalf("consume tag: %v", protowire.ParseError(tagLen))
+		}
+		raw = raw[tagLen:]
+		if wireType != protowire.BytesType {
+			valueLen := protowire.ConsumeFieldValue(number, wireType, raw)
+			if valueLen < 0 {
+				t.Fatalf("consume field %d: %v", number, protowire.ParseError(valueLen))
+			}
+			raw = raw[valueLen:]
+			continue
+		}
+		value, valueLen := protowire.ConsumeBytes(raw)
+		if valueLen < 0 {
+			t.Fatalf("consume bytes field %d: %v", number, protowire.ParseError(valueLen))
+		}
+		if number == want {
+			return value
+		}
+		raw = raw[valueLen:]
+	}
+	t.Fatalf("bytes field %d not found", want)
+	return nil
 }

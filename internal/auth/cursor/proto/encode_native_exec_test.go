@@ -39,3 +39,28 @@ func TestEncodeExecNativeResultsUseExpectedOneofs(t *testing.T) {
 		})
 	}
 }
+
+func TestEncodeExecReadResultWithDataUsesBinaryOutput(t *testing.T) {
+	raw := EncodeExecReadResultWithData(7, "exec-read", "shot.png", "metadata", []byte{1, 2, 3, 4}, false)
+	exec := mustFindBytesField(t, raw, ACM_ExecClientMessage)
+	readResult := mustFindBytesField(t, exec, ECM_ReadResult)
+	readSuccess := mustFindBytesField(t, readResult, 1)
+	if got := mustFindBytesField(t, readSuccess, 5); string(got) != string([]byte{1, 2, 3, 4}) {
+		t.Fatalf("read data = %v", got)
+	}
+}
+
+func TestEncodeExecMcpResultWithImagesUsesNativeImageContent(t *testing.T) {
+	raw := EncodeExecMcpResultWithImages(8, "exec-mcp", "", []ImageData{{MimeType: "image/png", Data: []byte{5, 6, 7}}}, false)
+	exec := mustFindBytesField(t, raw, ACM_ExecClientMessage)
+	mcpResult := mustFindBytesField(t, exec, ECM_McpResult)
+	mcpSuccess := mustFindBytesField(t, mcpResult, 1)
+	contentItem := mustFindBytesField(t, mcpSuccess, 1)
+	imageContent := mustFindBytesField(t, contentItem, 2)
+	if got := mustFindBytesField(t, imageContent, 1); string(got) != string([]byte{5, 6, 7}) {
+		t.Fatalf("MCP image data = %v", got)
+	}
+	if got := mustFindBytesField(t, imageContent, 2); string(got) != "image/png" {
+		t.Fatalf("MCP image MIME = %q", got)
+	}
+}

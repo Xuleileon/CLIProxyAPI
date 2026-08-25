@@ -1659,13 +1659,17 @@ func encodeCursorExecCompletion(pending pendingMcpExec, result toolResultInfo) [
 	var messages [][]byte
 	switch pending.Kind {
 	case cursorExecMCP:
-		messages = append(messages, cursorproto.EncodeExecMcpResult(pending.ExecMsgId, pending.ExecId, result.Content, result.IsError))
+		messages = append(messages, cursorproto.EncodeExecMcpResultWithImages(pending.ExecMsgId, pending.ExecId, result.Content, result.Images, result.IsError))
 	case cursorExecShell:
 		messages = append(messages, cursorproto.EncodeExecShellResult(pending.ExecMsgId, pending.ExecId, pending.Command, pending.WorkDir, result.Content, result.IsError))
 	case cursorExecShellStream:
 		messages = append(messages, cursorproto.EncodeExecShellStreamResult(pending.ExecMsgId, pending.ExecId, pending.WorkDir, result.Content, result.IsError)...)
 	case cursorExecRead:
-		messages = append(messages, cursorproto.EncodeExecReadResult(pending.ExecMsgId, pending.ExecId, pending.Path, result.Content, result.IsError))
+		var data []byte
+		if len(result.Images) > 0 {
+			data = result.Images[0].Data
+		}
+		messages = append(messages, cursorproto.EncodeExecReadResultWithData(pending.ExecMsgId, pending.ExecId, pending.Path, result.Content, data, result.IsError))
 	case cursorExecWrite:
 		messages = append(messages, cursorproto.EncodeExecWriteResult(pending.ExecMsgId, pending.ExecId, pending.Path, pending.FileText, result.Content, result.IsError))
 	case cursorExecDelete:
@@ -1902,6 +1906,7 @@ type parsedOpenAIRequest struct {
 type toolResultInfo struct {
 	ToolCallId string
 	Content    string
+	Images     []cursorproto.ImageData
 	IsError    bool
 }
 
@@ -1938,6 +1943,7 @@ func parseOpenAIRequest(payload []byte) *parsedOpenAIRequest {
 			p.ToolResults = append(p.ToolResults, toolResultInfo{
 				ToolCallId: msg.Get("tool_call_id").String(),
 				Content:    extractTextContent(msg.Get("content")),
+				Images:     extractImages(msg.Get("content")),
 			})
 		case "user":
 			if pendingUser != "" {
@@ -2061,6 +2067,12 @@ func rejectCursorTeammateTaskOutput(toolName, args string) string {
 // This is the fallback for cold resume when no checkpoint is available.
 // Cursor reliably reads UserText but ignores structured turns.
 func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
+	allImages := make([]cursorproto.ImageData, 0, len(parsed.Images))
+	for _, message := range parsed.Messages {
+		allImages = appendUniqueCursorImages(allImages, extractImages(message.Get("content")))
+	}
+	parsed.Images = appendUniqueCursorImages(allImages, parsed.Images)
+
 	var buf strings.Builder
 	currentUserIndex := -1
 	if parsed.UserText != "" {
@@ -2135,6 +2147,7 @@ func prepareCursorCheckpointContinuation(parsed *parsedOpenAIRequest, pending []
 		}
 		content := truncateCursorHistoryText(result.Content)
 		fmt.Fprintf(&buf, "TOOL_RESULT (call_id: %s, name: %s): %s\n\n", exec.ToolCallId, exec.ToolName, content)
+		parsed.Images = appendUniqueCursorImages(parsed.Images, result.Images)
 		matched++
 	}
 	if matched == 0 {
@@ -2210,6 +2223,28 @@ func extractImages(content gjson.Result) []cursorproto.ImageData {
 		}
 	}
 	return images
+}
+
+func appendUniqueCursorImages(dst, src []cursorproto.ImageData) []cursorproto.ImageData {
+	seen := make(map[string]struct{}, len(dst)+len(src))
+	for _, image := range dst {
+		hash := sha256.Sum256(image.Data)
+		seen[image.MimeType+":"+hex.EncodeToString(hash[:])] = struct{}{}
+	}
+	for _, image := range src {
+		if len(image.Data) == 0 {
+			continue
+		}
+		hash := sha256.Sum256(image.Data)
+		key := image.MimeType + ":" + hex.EncodeToString(hash[:])
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		image.Data = append([]byte(nil), image.Data...)
+		dst = append(dst, image)
+		seen[key] = struct{}{}
+	}
+	return dst
 }
 
 func parseDataURL(url string) *cursorproto.ImageData {
