@@ -181,6 +181,35 @@ func TestSessionMatchesToolResultsRequiresExactPendingID(t *testing.T) {
 	}
 }
 
+func TestSessionMatchesToolResultsRequiresCompletePendingBatch(t *testing.T) {
+	t.Parallel()
+
+	session := &cursorSession{pending: []pendingMcpExec{
+		{ToolCallId: "tool-a"},
+		{ToolCallId: "tool-b"},
+	}}
+	if sessionMatchesToolResults(session, []toolResultInfo{{ToolCallId: "tool-a"}}) {
+		t.Fatal("partial tool result batch matched the active session")
+	}
+	if !sessionMatchesToolResults(session, []toolResultInfo{
+		{ToolCallId: "tool-old"},
+		{ToolCallId: "tool-b"},
+		{ToolCallId: "tool-a"},
+	}) {
+		t.Fatal("complete out-of-order tool result batch did not match")
+	}
+
+	executor := &CursorExecutor{sessions: map[string]*cursorSession{"cursor-account:active": session}}
+	session.authID = "cursor-account"
+	if key, matched := executor.findSessionByToolResultsLocked("cursor-account", []toolResultInfo{{ToolCallId: "tool-a"}}); key != "" || matched != nil {
+		t.Fatalf("partial batch matched session: key=%q session=%p", key, matched)
+	}
+	key, matched, pending := executor.findPartialSessionByToolResultsLocked("cursor-account", []toolResultInfo{{ToolCallId: "tool-a"}})
+	if key != "cursor-account:active" || matched != 1 || pending != 2 {
+		t.Fatalf("partial batch classification = key=%q matched=%d pending=%d", key, matched, pending)
+	}
+}
+
 func TestHasPendingSessionForStreamLocked(t *testing.T) {
 	t.Parallel()
 
@@ -227,7 +256,7 @@ func TestFlattenConversationIntoUserTextPreservesToolCallOrder(t *testing.T) {
 		"USER: inspect the project",
 		"ASSISTANT: I will read it.",
 		`ASSISTANT_TOOL_CALL (call_id: tool-1, name: read): {"path":"main.go"}`,
-		"TOOL_RESULT (call_id: tool-1): package main",
+		"TOOL_RESULT (call_id: tool-1, status: success): package main",
 		"Current request: summarize it",
 	}
 	position := -1
@@ -246,6 +275,89 @@ func TestFlattenConversationIntoUserTextPreservesToolCallOrder(t *testing.T) {
 	}
 	if parsed.Turns != nil || parsed.ToolResults != nil {
 		t.Fatalf("structured history was not cleared: turns=%d results=%d", len(parsed.Turns), len(parsed.ToolResults))
+	}
+}
+
+func TestFlattenConversationIntoUserTextPreservesToolErrorsAndUnsupportedContent(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"model":"composer-2.5-fast",
+		"messages":[
+			{"role":"assistant","tool_calls":[{"id":"tool-error","type":"function","function":{"name":"read","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"tool-error","content":[
+				{"type":"text","text":"failed"},
+				{"type":"image_url","image_url":{"url":"https://example.com/private.png?token=secret"}},
+				{"type":"resource","uri":"file:///report.json"}
+			]},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+	parsed := parseOpenAIRequest(payload)
+	parsed.ToolResults[0].IsError = true
+	flattenConversationIntoUserText(parsed)
+
+	for _, want := range []string{
+		"TOOL_RESULT (call_id: tool-error, status: error):",
+		"remote image not transferred",
+		"host=example.com",
+		"unsupported content block type=resource",
+	} {
+		if !strings.Contains(parsed.UserText, want) {
+			t.Fatalf("flattened history missing %q: %s", want, parsed.UserText)
+		}
+	}
+	if strings.Contains(parsed.UserText, "token=secret") {
+		t.Fatalf("remote image diagnostic leaked query data: %s", parsed.UserText)
+	}
+}
+
+func TestParseDataURLSupportsParametersAndRejectsNonImages(t *testing.T) {
+	t.Parallel()
+
+	image := parseDataURL("data:image/svg+xml;charset=utf-8;base64,PHN2Zy8+")
+	if image == nil || image.MimeType != "image/svg+xml" || string(image.Data) != "<svg/>" {
+		t.Fatalf("parameterized image data URL = %#v", image)
+	}
+	if got := parseDataURL("data:text/plain;base64,aGVsbG8="); got != nil {
+		t.Fatalf("non-image data URL was accepted: %#v", got)
+	}
+}
+
+func TestBuildRunRequestParamsHonorsToolChoice(t *testing.T) {
+	t.Parallel()
+
+	tool := `{"type":"function","function":{"name":"read","description":"read","parameters":{"type":"object"}}}`
+	tests := []struct {
+		name      string
+		choice    string
+		wantMode  cursorproto.AgentMode
+		wantTools int
+		wantErr   bool
+	}{
+		{name: "none", choice: `"none"`, wantMode: cursorproto.AgentModeAsk},
+		{name: "auto", choice: `"auto"`, wantMode: cursorproto.AgentModeAgent, wantTools: 1},
+		{name: "required", choice: `"required"`, wantErr: true},
+		{name: "specific", choice: `{"type":"function","function":{"name":"read"}}`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed := parseOpenAIRequest([]byte(`{"model":"composer-2.5-fast","messages":[{"role":"user","content":"hi"}],"tools":[` + tool + `],"tool_choice":` + tt.choice + `}`))
+			params, err := buildRunRequestParams(parsed, "conv", "composer-2.5-fast")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("build error = %v, wantErr=%t", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				statusErr, ok := err.(interface{ StatusCode() int })
+				if !ok || statusErr.StatusCode() != http.StatusBadRequest {
+					t.Fatalf("tool choice error status = %v, want 400", err)
+				}
+				return
+			}
+			if params.AgentMode != tt.wantMode || len(params.McpTools) != tt.wantTools {
+				t.Fatalf("mode=%v tools=%d, want mode=%v tools=%d", params.AgentMode, len(params.McpTools), tt.wantMode, tt.wantTools)
+			}
+		})
 	}
 }
 
@@ -275,7 +387,7 @@ func TestPrepareCursorCheckpointContinuationKeepsOnlyPendingDelta(t *testing.T) 
 		}
 	}
 	for _, want := range []string{
-		"TOOL_RESULT (call_id: tool-current, name: read)",
+		"TOOL_RESULT (call_id: tool-current, name: read, status: success)",
 		"CURRENT_USER_MESSAGE: steer after tool",
 		"Continue from the saved conversation state.",
 	} {
@@ -300,6 +412,38 @@ func TestPrepareCursorCheckpointContinuationRejectsUnmatchedLineage(t *testing.T
 	}
 	if len(parsed.ToolResults) != 1 || parsed.UserText != "" {
 		t.Fatal("unmatched continuation mutated the parsed request")
+	}
+}
+
+func TestPrepareCursorCheckpointContinuationRequiresCompleteBatchAndPreservesErrors(t *testing.T) {
+	t.Parallel()
+
+	parsed := &parsedOpenAIRequest{ToolResults: []toolResultInfo{
+		{ToolCallId: "tool-a", Content: "permission denied", Images: []cursorproto.ImageData{{MimeType: "image/png", Data: []byte("image")}}, StructuredContent: json.RawMessage(`{"reason":"denied"}`), IsError: true},
+	}}
+	pending := []pendingMcpExec{
+		{ToolCallId: "tool-a", ToolName: "read"},
+		{ToolCallId: "tool-b", ToolName: "grep"},
+	}
+	if prepareCursorCheckpointContinuation(parsed, pending) {
+		t.Fatal("partial checkpoint tool result batch was accepted")
+	}
+	if parsed.UserText != "" || len(parsed.ToolResults) != 1 || len(parsed.Images) != 0 {
+		t.Fatal("rejected partial batch mutated the request")
+	}
+
+	parsed.ToolResults = append(parsed.ToolResults, toolResultInfo{ToolCallId: "tool-b", Content: "no matches"})
+	if !prepareCursorCheckpointContinuation(parsed, pending) {
+		t.Fatal("complete checkpoint tool result batch was rejected")
+	}
+	if !strings.Contains(parsed.UserText, "TOOL_RESULT (call_id: tool-a, name: read, status: error)") {
+		t.Fatalf("checkpoint continuation lost error status: %s", parsed.UserText)
+	}
+	if !strings.Contains(parsed.UserText, "TOOL_RESULT (call_id: tool-b, name: grep, status: success)") {
+		t.Fatalf("checkpoint continuation lost success status: %s", parsed.UserText)
+	}
+	if !strings.Contains(parsed.UserText, `STRUCTURED_CONTENT: {"reason":"denied"}`) {
+		t.Fatalf("checkpoint continuation lost structured content: %s", parsed.UserText)
 	}
 }
 
@@ -709,10 +853,13 @@ func TestApplyOriginalToolResultErrorsPreservesClaudeErrorFlag(t *testing.T) {
 	t.Parallel()
 
 	parsed := &parsedOpenAIRequest{ToolResults: []toolResultInfo{{ToolCallId: "tool-ok"}, {ToolCallId: "tool-failed"}}}
-	original := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-ok","content":"ok"},{"type":"tool_result","tool_use_id":"tool-failed","content":"failed","is_error":true}]}]}`)
+	original := []byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-ok","content":"ok"},{"type":"tool_result","tool_use_id":"tool-failed","content":[{"type":"json","json":{"reason":"denied"}}],"is_error":true}]}]}`)
 	applyOriginalToolResultErrors(parsed, original)
 	if parsed.ToolResults[0].IsError || !parsed.ToolResults[1].IsError {
 		t.Fatalf("tool result error flags = %#v", parsed.ToolResults)
+	}
+	if got := string(parsed.ToolResults[1].StructuredContent); got != `{"reason":"denied"}` {
+		t.Fatalf("structured tool result = %s", got)
 	}
 }
 
@@ -824,6 +971,29 @@ func TestClaudeToolResultImageReachesCursorReadBinaryOutput(t *testing.T) {
 	readSuccess := mustFindCursorBytesField(t, readResult, 1)
 	if got := mustFindCursorBytesField(t, readSuccess, 5); !bytes.Equal(got, []byte{1, 2, 3, 4}) {
 		t.Fatalf("read binary output = %v", got)
+	}
+}
+
+func TestCursorReadRejectsMultipleBinaryImages(t *testing.T) {
+	t.Parallel()
+
+	messages := encodeCursorExecCompletion(pendingMcpExec{
+		ExecMsgId: 1,
+		ExecId:    "exec-read",
+		Path:      "shot.png",
+		Kind:      cursorExecRead,
+	}, toolResultInfo{
+		Content: "two images",
+		Images: []cursorproto.ImageData{
+			{MimeType: "image/png", Data: []byte{1}},
+			{MimeType: "image/png", Data: []byte{2}},
+		},
+	})
+	exec := mustFindCursorBytesField(t, messages[0], cursorproto.ACM_ExecClientMessage)
+	readResult := mustFindCursorBytesField(t, exec, cursorproto.ECM_ReadResult)
+	readError := mustFindCursorBytesField(t, readResult, 2)
+	if got := string(mustFindCursorBytesField(t, readError, 2)); !strings.Contains(got, "multiple images") {
+		t.Fatalf("read error = %q", got)
 	}
 }
 

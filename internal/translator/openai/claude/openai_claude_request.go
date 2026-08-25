@@ -447,32 +447,30 @@ func convertClaudeToolResultContent(content gjson.Result) (string, bool) {
 		var parts []string
 		contentItems := make([][]byte, 0, 4)
 		hasImagePart := false
+		appendTextContent := func(text string) {
+			parts = append(parts, text)
+			textContent := []byte(`{"type":"text","text":""}`)
+			textContent, _ = sjson.SetBytes(textContent, "text", text)
+			contentItems = append(contentItems, textContent)
+		}
 		content.ForEach(func(_, item gjson.Result) bool {
 			switch {
 			case item.Type == gjson.String:
-				text := item.String()
-				parts = append(parts, text)
-				textContent := []byte(`{"type":"text","text":""}`)
-				textContent, _ = sjson.SetBytes(textContent, "text", text)
-				contentItems = append(contentItems, textContent)
+				appendTextContent(item.String())
 			case item.IsObject() && item.Get("type").String() == "text":
-				text := item.Get("text").String()
-				parts = append(parts, text)
-				textContent := []byte(`{"type":"text","text":""}`)
-				textContent, _ = sjson.SetBytes(textContent, "text", text)
-				contentItems = append(contentItems, textContent)
+				appendTextContent(item.Get("text").String())
 			case item.IsObject() && item.Get("type").String() == "image":
 				contentItem, ok := convertClaudeContentPart(item)
 				if ok {
 					contentItems = append(contentItems, []byte(contentItem))
 					hasImagePart = true
 				} else {
-					parts = append(parts, item.Raw)
+					appendTextContent(item.Raw)
 				}
 			case item.IsObject() && item.Get("text").Exists() && item.Get("text").Type == gjson.String:
-				parts = append(parts, item.Get("text").String())
+				appendTextContent(item.Get("text").String())
 			default:
-				parts = append(parts, item.Raw)
+				appendTextContent(item.Raw)
 			}
 			return true
 		})

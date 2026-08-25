@@ -522,6 +522,12 @@ func EncodeExecMcpResult(execMsgId uint32, execId string, content string, isErro
 // EncodeExecMcpResultWithImages preserves the native MCP text and image content
 // items returned by downstream clients.
 func EncodeExecMcpResultWithImages(execMsgId uint32, execId, content string, images []ImageData, isError bool) []byte {
+	return EncodeExecMcpResultWithContent(execMsgId, execId, content, images, nil, isError)
+}
+
+// EncodeExecMcpResultWithContent preserves text, images, and object-shaped
+// structured content supported by Cursor's native MCP result protocol.
+func EncodeExecMcpResultWithContent(execMsgId uint32, execId, content string, images []ImageData, structuredContent json.RawMessage, isError bool) []byte {
 	success := newMsg("McpSuccess")
 	contentField := field(success, "content")
 	contentList := success.Mutable(contentField).List()
@@ -542,6 +548,20 @@ func EncodeExecMcpResultWithImages(execMsgId uint32, execId, content string, ima
 		contentItem := newMsg("McpToolResultContentItem")
 		setMsg(contentItem, "image", imageContent)
 		contentList.Append(protoreflect.ValueOfMessage(contentItem.ProtoReflect()))
+	}
+	if len(structuredContent) > 0 {
+		var object map[string]any
+		if err := json.Unmarshal(structuredContent, &object); err == nil {
+			if structured, errStruct := structpb.NewStruct(object); errStruct == nil {
+				if encoded, errMarshal := proto.Marshal(structured); errMarshal == nil {
+					// The embedded descriptor predates McpSuccess.structured_content,
+					// so preserve the current field 3 through protobuf unknown fields.
+					unknown := protowire.AppendTag(nil, MCS_StructuredContent, protowire.BytesType)
+					unknown = protowire.AppendBytes(unknown, encoded)
+					success.SetUnknown(append(success.GetUnknown(), unknown...))
+				}
+			}
+		}
 	}
 	setBool(success, "is_error", isError)
 

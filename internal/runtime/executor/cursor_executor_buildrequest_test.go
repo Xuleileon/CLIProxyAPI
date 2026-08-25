@@ -53,7 +53,10 @@ func TestBuildRunRequestParams_ModelOverride(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			parsed := &parsedOpenAIRequest{Model: tc.parsedModel}
-			params := buildRunRequestParams(parsed, "conv-123", tc.override)
+			params, err := buildRunRequestParams(parsed, "conv-123", tc.override)
+			if err != nil {
+				t.Fatalf("build params: %v", err)
+			}
 
 			if params.ModelId != tc.wantModelID {
 				t.Errorf("ModelId = %q, want %q", params.ModelId, tc.wantModelID)
@@ -74,11 +77,17 @@ func TestBuildRunRequestParams_ModelOverride(t *testing.T) {
 func TestBuildRunRequestParams_SelectsModeFromToolCapability(t *testing.T) {
 	t.Parallel()
 
-	withoutTools := buildRunRequestParams(&parsedOpenAIRequest{}, "conv-ask", "composer-2.5")
+	withoutTools, err := buildRunRequestParams(&parsedOpenAIRequest{}, "conv-ask", "composer-2.5")
+	if err != nil {
+		t.Fatalf("build params without tools: %v", err)
+	}
 	if withoutTools.AgentMode != cursorproto.AgentModeAsk {
 		t.Fatalf("mode without tools = %d, want ask", withoutTools.AgentMode)
 	}
-	withTools := buildRunRequestParams(parseOpenAIRequest([]byte(`{"model":"composer-2.5","messages":[],"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)), "conv-agent", "composer-2.5")
+	withTools, err := buildRunRequestParams(parseOpenAIRequest([]byte(`{"model":"composer-2.5","messages":[],"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)), "conv-agent", "composer-2.5")
+	if err != nil {
+		t.Fatalf("build params with tools: %v", err)
+	}
 	if withTools.AgentMode != cursorproto.AgentModeAgent {
 		t.Fatalf("mode with tools = %d, want agent", withTools.AgentMode)
 	}

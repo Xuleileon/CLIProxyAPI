@@ -51,16 +51,19 @@ func TestEncodeExecReadResultWithDataUsesBinaryOutput(t *testing.T) {
 }
 
 func TestEncodeExecMcpResultWithImagesUsesNativeImageContent(t *testing.T) {
-	raw := EncodeExecMcpResultWithImages(8, "exec-mcp", "", []ImageData{{MimeType: "image/png", Data: []byte{5, 6, 7}}}, false)
+	raw := EncodeExecMcpResultWithContent(8, "exec-mcp", "", []ImageData{{MimeType: "image/png", Data: []byte{5, 6, 7}}}, []byte(`{"ok":true}`), false)
 	exec := mustFindBytesField(t, raw, ACM_ExecClientMessage)
 	mcpResult := mustFindBytesField(t, exec, ECM_McpResult)
 	mcpSuccess := mustFindBytesField(t, mcpResult, 1)
 	contentItem := mustFindBytesField(t, mcpSuccess, 1)
-	imageContent := mustFindBytesField(t, contentItem, 2)
+	imageContent := mustFindBytesField(t, contentItem, MTRCI_Image)
 	if got := mustFindBytesField(t, imageContent, 1); string(got) != string([]byte{5, 6, 7}) {
 		t.Fatalf("MCP image data = %v", got)
 	}
 	if got := mustFindBytesField(t, imageContent, 2); string(got) != "image/png" {
 		t.Fatalf("MCP image MIME = %q", got)
+	}
+	if structured := mustFindBytesField(t, mcpSuccess, MCS_StructuredContent); len(structured) == 0 {
+		t.Fatal("MCP structured content was not encoded")
 	}
 }

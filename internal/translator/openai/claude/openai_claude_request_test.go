@@ -3,6 +3,7 @@ package claude
 import (
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -694,6 +695,40 @@ func TestConvertClaudeRequestToOpenAI_ToolResultTextAndImageContent(t *testing.T
 	}
 	if got := toolContent.Get("1.image_url.url").String(); got != "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" {
 		t.Fatalf("Unexpected image_url: %q", got)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ToolResultImagePreservesOtherBlocksAsText(t *testing.T) {
+	inputJSON := `{
+		"model":"claude-3-opus",
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"do_work","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}},
+				{"type":"json","json":{"ok":true}},
+				{"type":"resource","uri":"file:///report.json"}
+			]}]}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
+	content := gjson.GetBytes(result, "messages.1.content")
+	if !content.IsArray() || len(content.Array()) != 3 {
+		t.Fatalf("mixed tool content = %s, want image plus two preserved text blocks", content.Raw)
+	}
+	if got := content.Get("0.type").String(); got != "image_url" {
+		t.Fatalf("first content type = %q", got)
+	}
+	for _, index := range []string{"1", "2"} {
+		if got := content.Get(index + ".type").String(); got != "text" {
+			t.Fatalf("content %s type = %q, want text", index, got)
+		}
+	}
+	if !strings.Contains(content.Get("1.text").String(), `"ok":true`) {
+		t.Fatalf("JSON block was not preserved: %s", content.Raw)
+	}
+	if !strings.Contains(content.Get("2.text").String(), `file:///report.json`) {
+		t.Fatalf("resource block was not preserved: %s", content.Raw)
 	}
 }
 

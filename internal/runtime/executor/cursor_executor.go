@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -265,17 +266,43 @@ func cloneSavedCursorCheckpoint(src *savedCheckpoint) (*savedCheckpoint, bool) {
 }
 
 func sessionMatchesToolResults(session *cursorSession, results []toolResultInfo) bool {
-	if session == nil {
+	if session == nil || len(session.pending) == 0 {
 		return false
 	}
-	for _, pending := range session.pending {
-		for _, result := range results {
-			if pending.ToolCallId != "" && pending.ToolCallId == result.ToolCallId {
-				return true
-			}
+	resultIDs := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		if result.ToolCallId != "" {
+			resultIDs[result.ToolCallId] = struct{}{}
 		}
 	}
-	return false
+	for _, pending := range session.pending {
+		if pending.ToolCallId == "" {
+			return false
+		}
+		if _, ok := resultIDs[pending.ToolCallId]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func sessionToolResultOverlap(session *cursorSession, results []toolResultInfo) (matched, pending int) {
+	if session == nil {
+		return 0, 0
+	}
+	pending = len(session.pending)
+	resultIDs := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		if result.ToolCallId != "" {
+			resultIDs[result.ToolCallId] = struct{}{}
+		}
+	}
+	for _, item := range session.pending {
+		if _, ok := resultIDs[item.ToolCallId]; ok {
+			matched++
+		}
+	}
+	return matched, pending
 }
 
 func (e *CursorExecutor) hasPendingSessionForStreamLocked(stream *cursorproto.H2Stream) bool {
@@ -335,14 +362,29 @@ func (e *CursorExecutor) findSessionByToolResultsLocked(authID string, results [
 			if session == nil || session.authID != authID || session.resuming {
 				continue
 			}
-			for _, pending := range session.pending {
-				if pending.ToolCallId == toolCallID {
-					return sessionKey, session
+			if sessionMatchesToolResults(session, results) {
+				for _, pending := range session.pending {
+					if pending.ToolCallId == toolCallID {
+						return sessionKey, session
+					}
 				}
 			}
 		}
 	}
 	return "", nil
+}
+
+func (e *CursorExecutor) findPartialSessionByToolResultsLocked(authID string, results []toolResultInfo) (string, int, int) {
+	for sessionKey, session := range e.sessions {
+		if session == nil || session.authID != authID || session.resuming {
+			continue
+		}
+		matched, pending := sessionToolResultOverlap(session, results)
+		if matched > 0 && matched < pending {
+			return sessionKey, matched, pending
+		}
+	}
+	return "", 0, 0
 }
 
 // cursorStatusErr implements the StatusError and RetryAfter interfaces so the
@@ -373,6 +415,31 @@ func classifyCursorStreamFailure(streamErr, sessionErr error, dataSent bool) (cu
 		return cursorStreamFailureTerminal, classified
 	}
 	return cursorStreamFailureRetry, classified
+}
+
+func cursorStreamErrorClass(err error) string {
+	if err == nil {
+		return "none"
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "canceled"
+	}
+	var connectErr *cursorproto.ConnectError
+	if errors.As(err, &connectErr) && connectErr.Code != "" {
+		return "connect_" + strings.ToLower(connectErr.Code)
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "server is shutting down"), strings.Contains(message, "goaway"):
+		return "upstream_goaway"
+	case strings.Contains(message, "rate limit"), strings.Contains(message, "quota"), strings.Contains(message, "too many"):
+		return "rate_limited"
+	case strings.Contains(message, "rst_stream"), strings.Contains(message, "connection reset"), strings.Contains(message, "broken pipe"),
+		errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.ErrClosedPipe):
+		return "transport_closed"
+	default:
+		return "unknown"
+	}
 }
 
 // classifyCursorError maps Cursor Connect/H2 errors to HTTP status codes.
@@ -525,19 +592,28 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	payload := req.Payload
+	originalPayload := bytes.Clone(req.Payload)
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = bytes.Clone(opts.OriginalRequest)
+	}
 	if from.String() != "" && from.String() != "openai" {
 		payload = sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(payload), false)
 	}
 
 	parsed := parseOpenAIRequest(payload)
+	applyOriginalToolResultErrors(parsed, originalPayload)
 	// Non-stream OpenAI chat is request-scoped: Cursor ignores structured turns and
 	// reusing a conversation_id without server checkpoint causes "missing blob" errors
 	// on multi-turn payloads. Flatten history into UserText when present.
 	conversationId := deriveConversationId(apiKeyFromContext(ctx), "", parsed.SystemPrompt)
+	logCursorRequestSemantics(parsed, conversationId)
 	if len(parsed.Turns) > 0 || len(parsed.ToolResults) > 0 {
 		flattenConversationIntoUserText(parsed)
 	}
-	params := buildRunRequestParams(parsed, conversationId, req.Model)
+	params, errParams := buildRunRequestParams(parsed, conversationId, req.Model)
+	if errParams != nil {
+		return resp, errParams
+	}
 
 	requestBytes := cursorproto.EncodeRunRequest(params)
 	framedRequest := cursorproto.FrameConnectMessage(requestBytes, 0)
@@ -548,6 +624,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	defer releaseRun()
 
+	requestStartedAt := time.Now()
 	stream, err := e.openCursorH2Stream(ctx, auth, accessToken)
 	if err != nil {
 		return resp, err
@@ -568,8 +645,12 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	var contentText, reasoningText strings.Builder
 	usage := &cursorTokenUsage{}
 	usage.setInputEstimate(len(payload))
+	firstOutputLatencyMS := int64(-1)
 	if streamErr := processH2SessionFrames(sessionCtx, stream, params.BlobStore, nil,
 		func(text string, isThinking bool) {
+			if firstOutputLatencyMS < 0 {
+				firstOutputLatencyMS = time.Since(requestStartedAt).Milliseconds()
+			}
 			if isThinking {
 				reasoningText.WriteString(text)
 			} else {
@@ -581,8 +662,21 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		usage,
 		nil, // onCheckpoint - non-streaming doesn't persist
 	); streamErr != nil {
+		log.WithFields(log.Fields{
+			"conversation":     conversationId,
+			"terminal_outcome": "stream_error",
+			"error_class":      cursorStreamErrorClass(streamErr),
+			"duration_ms":      time.Since(requestStartedAt).Milliseconds(),
+			"first_output_ms":  firstOutputLatencyMS,
+		}).Warn("cursor run terminal")
 		return resp, classifyCursorError(fmt.Errorf("cursor: stream error: %w", streamErr))
 	}
+	log.WithFields(log.Fields{
+		"conversation":     conversationId,
+		"terminal_outcome": "turn_ended",
+		"duration_ms":      time.Since(requestStartedAt).Milliseconds(),
+		"first_output_ms":  firstOutputLatencyMS,
+	}).Info("cursor run terminal")
 
 	id := "chatcmpl-" + uuid.New().String()[:28]
 	created := time.Now().Unix()
@@ -640,6 +734,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	parsed := parseOpenAIRequest(payload)
 	applyOriginalToolResultErrors(parsed, originalPayload)
+	if errChoice := validateCursorToolChoice(parsed); errChoice != nil {
+		return nil, errChoice
+	}
 	adaptCursorTeammateReply(parsed)
 	log.Debugf("cursor: parsed request: model=%s userText=%d chars, turns=%d, tools=%d, toolResults=%d",
 		parsed.Model, len(parsed.UserText), len(parsed.Turns), len(parsed.Tools), len(parsed.ToolResults))
@@ -647,6 +744,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	sourceSessionID := scopeCursorSourceSessionID(rawSourceSessionID, parsed)
 	conversationId := deriveConversationId(apiKeyFromContext(ctx), sourceSessionID, parsed.SystemPrompt)
 	authID := auth.ID // e.g. "cursor.json" or "cursor-account2.json"
+	logCursorRequestSemantics(parsed, conversationId)
 	log.Debugf("cursor: conversationId=%s authID=%s stableSource=%t", conversationId, authID, sourceSessionID != "")
 
 	// Session key includes authID (H2 stream is auth-specific, not transferable).
@@ -657,6 +755,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	var continuationPending []pendingMcpExec
 	continuationMatched := false
+	partialSessionKey := ""
+	partialMatched := 0
+	partialPending := 0
 
 	// Match tool results to the exact pending Cursor tool call. Reusing the active
 	// H2 Run preserves Cursor's native tool loop and avoids one billed Run per tool.
@@ -680,6 +781,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				log.Debugf("cursor: matched tool result lineage to session %s", matchedKey)
 			}
 		}
+		if !hasSession {
+			partialSessionKey, partialMatched, partialPending = e.findPartialSessionByToolResultsLocked(authID, parsed.ToolResults)
+		}
 		if hasSession && session.conversationID != "" {
 			conversationId = session.conversationID
 			sessionKey = authID + ":" + conversationId
@@ -700,6 +804,13 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 		e.mu.Unlock()
+		if partialSessionKey != "" {
+			log.Warnf("cursor: incomplete tool result batch session=%s matched=%d pending=%d", partialSessionKey, partialMatched, partialPending)
+			return nil, cliproxyauth.NewRequestScopedError(
+				fmt.Sprintf("cursor: incomplete tool result batch: received %d of %d pending results", partialMatched, partialPending),
+				http.StatusConflict,
+			)
+		}
 
 		if hasSession && session.stream != nil && session.authID == authID {
 			continuationPending = append([]pendingMcpExec(nil), session.pending...)
@@ -741,7 +852,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	e.mu.Unlock()
 
-	hadConversationHistory := len(parsed.ToolResults) > 0 || len(parsed.Turns) > 0
+	requestToolResults := len(parsed.ToolResults)
+	requestTurns := len(parsed.Turns)
+	hadConversationHistory := requestToolResults > 0 || requestTurns > 0
 
 	// Look up saved checkpoint for this conversation (keyed by conversationId only).
 	// Checkpoint is auth-specific: if auth changed (e.g. quota exhaustion failover),
@@ -760,10 +873,19 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 
-	params := buildRunRequestParams(parsed, conversationId, req.Model)
+	params, errParams := buildRunRequestParams(parsed, conversationId, req.Model)
+	if errParams != nil {
+		return nil, errParams
+	}
 
 	if useCheckpoint {
 		log.Debugf("cursor: using saved checkpoint (%d bytes) for conv=%s auth=%s delta=%t", len(saved.data), checkpointKey, authID, continuationMatched)
+		log.WithFields(log.Fields{
+			"conversation":         conversationId,
+			"continuation_mode":    "checkpoint",
+			"semantic_degradation": false,
+			"tool_results":         requestToolResults,
+		}).Info("cursor continuation selected")
 		params.RawCheckpoint = saved.data
 		for k, v := range saved.blobStore {
 			params.BlobStore[k] = append([]byte(nil), v...)
@@ -776,16 +898,36 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		delete(e.checkpoints, checkpointKey)
 		e.mu.Unlock()
 		if hadConversationHistory {
+			log.WithFields(log.Fields{
+				"conversation":         conversationId,
+				"continuation_mode":    "cold_auth_migration",
+				"semantic_degradation": true,
+				"turns":                len(parsed.Turns),
+				"tool_results":         len(parsed.ToolResults),
+			}).Warn("cursor continuation flattened into user text")
 			flattenConversationIntoUserText(parsed)
-			params = buildRunRequestParams(parsed, conversationId, req.Model)
+			params, errParams = buildRunRequestParams(parsed, conversationId, req.Model)
+			if errParams != nil {
+				return nil, errParams
+			}
 		}
 	} else if hadConversationHistory {
 		// Fallback: no checkpoint available (cold resume / proxy restart).
 		// Flatten the full conversation history (including tool interactions) into userText.
 		// Cursor's turns encoding is not reliably read by the model, but userText always works.
 		log.Debugf("cursor: no checkpoint, flattening %d turns + %d tool results into userText", len(parsed.Turns), len(parsed.ToolResults))
+		log.WithFields(log.Fields{
+			"conversation":         conversationId,
+			"continuation_mode":    "cold",
+			"semantic_degradation": true,
+			"turns":                len(parsed.Turns),
+			"tool_results":         len(parsed.ToolResults),
+		}).Warn("cursor continuation flattened into user text")
 		flattenConversationIntoUserText(parsed)
-		params = buildRunRequestParams(parsed, conversationId, req.Model)
+		params, errParams = buildRunRequestParams(parsed, conversationId, req.Model)
+		if errParams != nil {
+			return nil, errParams
+		}
 	}
 	requestBytes := cursorproto.EncodeRunRequest(params)
 	framedRequest := cursorproto.FrameConnectMessage(requestBytes, 0)
@@ -877,11 +1019,15 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	streamErrCh := make(chan error, 1)
 	firstChunkReady := make(chan struct{})
 	var dataSent atomic.Bool
+	var firstChunkLatencyMS atomic.Int64
+	firstChunkLatencyMS.Store(-1)
 
 	origEmitToOut := emitToOut
 	emitToOut = func(chunk cliproxyexecutor.StreamChunk) {
 		if dataSent.CompareAndSwap(false, true) {
-			log.Debugf("cursor: first downstream chunk after %s conv=%s checkpoint=%t", time.Since(requestStartedAt).Round(time.Millisecond), conversationId, len(params.RawCheckpoint) > 0)
+			firstLatency := time.Since(requestStartedAt)
+			firstChunkLatencyMS.Store(firstLatency.Milliseconds())
+			log.Debugf("cursor: first downstream chunk after %s conv=%s checkpoint=%t", firstLatency.Round(time.Millisecond), conversationId, len(params.RawCheckpoint) > 0)
 			close(firstChunkReady)
 		}
 		origEmitToOut(chunk)
@@ -998,6 +1144,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				// turn a local cancellation into either a successful terminal event
 				// or an upstream retry.
 				log.Debugf("cursor: stream canceled locally (auth=%s conv=%s): %v", authID, conversationId, streamErr)
+				log.WithFields(log.Fields{
+					"conversation":     conversationId,
+					"terminal_outcome": "canceled",
+					"error_class":      cursorStreamErrorClass(streamErr),
+					"data_sent":        dataSent.Load(),
+					"duration_ms":      time.Since(requestStartedAt).Milliseconds(),
+					"first_output_ms":  firstChunkLatencyMS.Load(),
+				}).Info("cursor run terminal")
 				outMu.Lock()
 				if currentOut != nil {
 					close(currentOut)
@@ -1011,6 +1165,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				// Surface a terminal stream error and never append stop/[DONE], which
 				// would incorrectly turn a truncated response into success.
 				log.Warnf("cursor: stream error after data sent (auth=%s conv=%s): %v", authID, conversationId, streamErr)
+				log.WithFields(log.Fields{
+					"conversation":     conversationId,
+					"terminal_outcome": "stream_error_after_data",
+					"error_class":      cursorStreamErrorClass(streamErr),
+					"data_sent":        true,
+					"duration_ms":      time.Since(requestStartedAt).Milliseconds(),
+					"first_output_ms":  firstChunkLatencyMS.Load(),
+				}).Warn("cursor run terminal")
 				emitToOut(cliproxyexecutor.StreamChunk{Err: failureErr})
 				outMu.Lock()
 				if currentOut != nil {
@@ -1024,6 +1186,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			case cursorStreamFailureRetry:
 				// No data sent yet — propagate error for transparent conductor retry.
 				log.Warnf("cursor: stream error before data sent (auth=%s conv=%s): %v — signaling retry", authID, conversationId, streamErr)
+				log.WithFields(log.Fields{
+					"conversation":     conversationId,
+					"terminal_outcome": "retryable_error_before_data",
+					"error_class":      cursorStreamErrorClass(streamErr),
+					"data_sent":        false,
+					"duration_ms":      time.Since(requestStartedAt).Milliseconds(),
+					"first_output_ms":  firstChunkLatencyMS.Load(),
+				}).Warn("cursor run terminal")
 				streamErrCh <- failureErr
 				outMu.Lock()
 				if currentOut != nil {
@@ -1036,6 +1206,13 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				return
 			}
 		}
+		log.WithFields(log.Fields{
+			"conversation":     conversationId,
+			"terminal_outcome": "turn_ended",
+			"data_sent":        dataSent.Load(),
+			"duration_ms":      time.Since(requestStartedAt).Milliseconds(),
+			"first_output_ms":  firstChunkLatencyMS.Load(),
+		}).Info("cursor run terminal")
 
 		// Include token usage in the final stop chunk
 		inputTok, outputTok := usage.get()
@@ -1453,11 +1630,7 @@ func processH2SessionFrames(
 				for _, pending := range pendingBatch {
 					result, ok := findCursorToolResult(toolResults, pending.ToolCallId)
 					if !ok {
-						result = toolResultInfo{
-							ToolCallId: pending.ToolCallId,
-							Content:    "The downstream client did not return a result for this tool call.",
-							IsError:    true,
-						}
+						return fmt.Errorf("cursor: incomplete downstream tool result batch for call %s", pending.ToolCallId)
 					}
 					if err := writeCursorExecMessages(stream, encodeCursorExecCompletion(pending, result)); err != nil {
 						return fmt.Errorf("cursor: write tool result for %s: %w", pending.ToolName, err)
@@ -1659,12 +1832,22 @@ func encodeCursorExecCompletion(pending pendingMcpExec, result toolResultInfo) [
 	var messages [][]byte
 	switch pending.Kind {
 	case cursorExecMCP:
-		messages = append(messages, cursorproto.EncodeExecMcpResultWithImages(pending.ExecMsgId, pending.ExecId, result.Content, result.Images, result.IsError))
+		messages = append(messages, cursorproto.EncodeExecMcpResultWithContent(pending.ExecMsgId, pending.ExecId, result.Content, result.Images, result.StructuredContent, result.IsError))
 	case cursorExecShell:
 		messages = append(messages, cursorproto.EncodeExecShellResult(pending.ExecMsgId, pending.ExecId, pending.Command, pending.WorkDir, result.Content, result.IsError))
 	case cursorExecShellStream:
 		messages = append(messages, cursorproto.EncodeExecShellStreamResult(pending.ExecMsgId, pending.ExecId, pending.WorkDir, result.Content, result.IsError)...)
 	case cursorExecRead:
+		if len(result.Images) > 1 {
+			messages = append(messages, cursorproto.EncodeExecReadResult(
+				pending.ExecMsgId,
+				pending.ExecId,
+				pending.Path,
+				"The downstream read result contained multiple images, but Cursor's native Read protocol accepts exactly one binary file.",
+				true,
+			))
+			break
+		}
 		var data []byte
 		if len(result.Images) > 0 {
 			data = result.Images[0].Data
@@ -1895,6 +2078,7 @@ type parsedOpenAIRequest struct {
 	Model        string
 	Messages     []gjson.Result
 	Tools        []gjson.Result
+	ToolChoice   cursorToolChoice
 	Stream       bool
 	SystemPrompt string
 	UserText     string
@@ -1903,17 +2087,24 @@ type parsedOpenAIRequest struct {
 	ToolResults  []toolResultInfo
 }
 
+type cursorToolChoice struct {
+	Mode string
+	Name string
+}
+
 type toolResultInfo struct {
-	ToolCallId string
-	Content    string
-	Images     []cursorproto.ImageData
-	IsError    bool
+	ToolCallId        string
+	Content           string
+	Images            []cursorproto.ImageData
+	StructuredContent json.RawMessage
+	IsError           bool
 }
 
 func parseOpenAIRequest(payload []byte) *parsedOpenAIRequest {
 	p := &parsedOpenAIRequest{
-		Model:  gjson.GetBytes(payload, "model").String(),
-		Stream: gjson.GetBytes(payload, "stream").Bool(),
+		Model:      gjson.GetBytes(payload, "model").String(),
+		Stream:     gjson.GetBytes(payload, "stream").Bool(),
+		ToolChoice: parseCursorToolChoice(gjson.GetBytes(payload, "tool_choice")),
 	}
 
 	messages := gjson.GetBytes(payload, "messages").Array()
@@ -1941,9 +2132,11 @@ func parseOpenAIRequest(payload []byte) *parsedOpenAIRequest {
 			continue
 		case "tool":
 			p.ToolResults = append(p.ToolResults, toolResultInfo{
-				ToolCallId: msg.Get("tool_call_id").String(),
-				Content:    extractTextContent(msg.Get("content")),
-				Images:     extractImages(msg.Get("content")),
+				ToolCallId:        msg.Get("tool_call_id").String(),
+				Content:           extractTextContent(msg.Get("content")),
+				Images:            extractImages(msg.Get("content")),
+				StructuredContent: extractCursorStructuredContent(msg.Get("structured_content"), msg.Get("content")),
+				IsError:           msg.Get("is_error").Bool(),
 			})
 		case "user":
 			if pendingUser != "" {
@@ -1986,30 +2179,133 @@ func parseOpenAIRequest(payload []byte) *parsedOpenAIRequest {
 	return p
 }
 
+func logCursorRequestSemantics(parsed *parsedOpenAIRequest, conversationID string) {
+	if parsed == nil {
+		return
+	}
+	imageBytes := 0
+	for _, image := range parsed.Images {
+		imageBytes += len(image.Data)
+	}
+	toolErrors := 0
+	toolImages := 0
+	structuredResults := 0
+	for _, result := range parsed.ToolResults {
+		if result.IsError {
+			toolErrors++
+		}
+		for _, image := range result.Images {
+			toolImages++
+			imageBytes += len(image.Data)
+		}
+		if len(result.StructuredContent) > 0 {
+			structuredResults++
+		}
+	}
+	remoteImages, invalidImages, unsupportedBlocks := 0, 0, 0
+	for _, message := range parsed.Messages {
+		content := message.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		for _, part := range content.Array() {
+			partType := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+			switch partType {
+			case "text", "input_text", "output_text":
+			case "image", "image_url", "input_image":
+				imageURL := cursorContentImageURL(part)
+				switch {
+				case strings.HasPrefix(strings.ToLower(imageURL), "data:") && parseDataURL(imageURL) == nil:
+					invalidImages++
+				case imageURL == "":
+					invalidImages++
+				case !strings.HasPrefix(strings.ToLower(imageURL), "data:"):
+					remoteImages++
+				}
+			default:
+				unsupportedBlocks++
+			}
+		}
+	}
+	fields := log.Fields{
+		"conversation":               conversationID,
+		"model":                      parsed.Model,
+		"tools":                      len(parsed.Tools),
+		"tool_choice":                parsed.ToolChoice.Mode,
+		"tool_results":               len(parsed.ToolResults),
+		"tool_result_errors":         toolErrors,
+		"structured_tool_results":    structuredResults,
+		"image_count":                len(parsed.Images) + toolImages,
+		"image_bytes":                imageBytes,
+		"remote_images_not_fetched":  remoteImages,
+		"invalid_images":             invalidImages,
+		"unsupported_content_blocks": unsupportedBlocks,
+	}
+	entry := log.WithFields(fields)
+	if remoteImages > 0 || invalidImages > 0 || unsupportedBlocks > 0 {
+		entry.Warn("cursor request contains explicitly degraded content")
+		return
+	}
+	entry.Debug("cursor request semantics")
+}
+
+func parseCursorToolChoice(choice gjson.Result) cursorToolChoice {
+	if !choice.Exists() {
+		return cursorToolChoice{Mode: "auto"}
+	}
+	if choice.Type == gjson.String {
+		mode := strings.ToLower(strings.TrimSpace(choice.String()))
+		switch mode {
+		case "auto", "none", "required":
+			return cursorToolChoice{Mode: mode}
+		default:
+			return cursorToolChoice{Mode: "unsupported", Name: mode}
+		}
+	}
+	if choice.IsObject() && strings.EqualFold(choice.Get("type").String(), "function") {
+		name := strings.TrimSpace(choice.Get("function.name").String())
+		if name != "" {
+			return cursorToolChoice{Mode: "specific", Name: name}
+		}
+	}
+	return cursorToolChoice{Mode: "unsupported"}
+}
+
 func applyOriginalToolResultErrors(parsed *parsedOpenAIRequest, originalPayload []byte) {
 	if parsed == nil || len(parsed.ToolResults) == 0 || len(originalPayload) == 0 {
 		return
 	}
 	errorByID := make(map[string]bool)
+	structuredByID := make(map[string]json.RawMessage)
 	for _, message := range gjson.GetBytes(originalPayload, "messages").Array() {
 		if message.Get("role").String() == "tool" {
 			toolCallID := message.Get("tool_call_id").String()
 			if toolCallID != "" && message.Get("is_error").Bool() {
 				errorByID[toolCallID] = true
 			}
+			if structured := extractCursorStructuredContent(message.Get("structured_content"), message.Get("content")); toolCallID != "" && len(structured) > 0 {
+				structuredByID[toolCallID] = structured
+			}
 		}
 		for _, block := range message.Get("content").Array() {
-			if block.Get("type").String() != "tool_result" || !block.Get("is_error").Bool() {
+			if block.Get("type").String() != "tool_result" {
 				continue
 			}
 			toolCallID := block.Get("tool_use_id").String()
-			if toolCallID != "" {
+			if toolCallID != "" && block.Get("is_error").Bool() {
 				errorByID[toolCallID] = true
+			}
+			if structured := extractCursorStructuredContent(block.Get("content")); toolCallID != "" && len(structured) > 0 {
+				structuredByID[toolCallID] = structured
 			}
 		}
 	}
 	for index := range parsed.ToolResults {
-		parsed.ToolResults[index].IsError = errorByID[parsed.ToolResults[index].ToolCallId]
+		toolCallID := parsed.ToolResults[index].ToolCallId
+		parsed.ToolResults[index].IsError = errorByID[toolCallID]
+		if structured := structuredByID[toolCallID]; len(structured) > 0 {
+			parsed.ToolResults[index].StructuredContent = append(json.RawMessage(nil), structured...)
+		}
 	}
 }
 
@@ -2074,6 +2370,12 @@ func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 	parsed.Images = appendUniqueCursorImages(allImages, parsed.Images)
 
 	var buf strings.Builder
+	toolResults := make(map[string]toolResultInfo, len(parsed.ToolResults))
+	for _, result := range parsed.ToolResults {
+		if result.ToolCallId != "" {
+			toolResults[result.ToolCallId] = result
+		}
+	}
 	currentUserIndex := -1
 	if parsed.UserText != "" {
 		for index := len(parsed.Messages) - 1; index >= 0; index-- {
@@ -2104,8 +2406,17 @@ func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 			}
 		case "tool":
 			callID := message.Get("tool_call_id").String()
-			content := truncateCursorHistoryText(extractTextContent(message.Get("content")))
-			fmt.Fprintf(&buf, "TOOL_RESULT (call_id: %s): %s\n\n", callID, content)
+			result, hasResult := toolResults[callID]
+			content := extractTextContent(message.Get("content"))
+			if hasResult {
+				content = cursorFallbackToolResultContent(result, content)
+			}
+			content = truncateCursorHistoryText(content)
+			status := "success"
+			if hasResult && result.IsError {
+				status = "error"
+			}
+			fmt.Fprintf(&buf, "TOOL_RESULT (call_id: %s, status: %s): %s\n\n", callID, status, content)
 		}
 	}
 
@@ -2137,16 +2448,22 @@ func prepareCursorCheckpointContinuation(parsed *parsedOpenAIRequest, pending []
 			latest[result.ToolCallId] = result
 		}
 	}
+	for _, exec := range pending {
+		if _, ok := latest[exec.ToolCallId]; !ok {
+			return false
+		}
+	}
 
 	var buf strings.Builder
 	matched := 0
 	for _, exec := range pending {
-		result, ok := latest[exec.ToolCallId]
-		if !ok {
-			continue
+		result := latest[exec.ToolCallId]
+		content := truncateCursorHistoryText(cursorFallbackToolResultContent(result, result.Content))
+		status := "success"
+		if result.IsError {
+			status = "error"
 		}
-		content := truncateCursorHistoryText(result.Content)
-		fmt.Fprintf(&buf, "TOOL_RESULT (call_id: %s, name: %s): %s\n\n", exec.ToolCallId, exec.ToolName, content)
+		fmt.Fprintf(&buf, "TOOL_RESULT (call_id: %s, name: %s, status: %s): %s\n\n", exec.ToolCallId, exec.ToolName, status, content)
 		parsed.Images = appendUniqueCursorImages(parsed.Images, result.Images)
 		matched++
 	}
@@ -2164,6 +2481,20 @@ func prepareCursorCheckpointContinuation(parsed *parsedOpenAIRequest, pending []
 	parsed.Turns = nil
 	parsed.ToolResults = nil
 	return true
+}
+
+func cursorFallbackToolResultContent(result toolResultInfo, fallback string) string {
+	content := fallback
+	if strings.TrimSpace(content) == "" {
+		content = result.Content
+	}
+	if len(result.StructuredContent) == 0 {
+		return content
+	}
+	if content != "" {
+		content += "\n"
+	}
+	return content + "STRUCTURED_CONTENT: " + string(result.StructuredContent)
 }
 
 func appendCursorHistorySection(buf *strings.Builder, label, content string) {
@@ -2197,13 +2528,65 @@ func extractTextContent(content gjson.Result) string {
 	if content.IsArray() {
 		var parts []string
 		for _, part := range content.Array() {
-			if part.Get("type").String() == "text" {
+			partType := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+			switch partType {
+			case "text", "input_text", "output_text":
 				parts = append(parts, part.Get("text").String())
+			case "image", "image_url", "input_image":
+				if diagnostic := cursorImagePartDiagnostic(part); diagnostic != "" {
+					parts = append(parts, diagnostic)
+				}
+			default:
+				if text := part.Get("text"); text.Type == gjson.String {
+					parts = append(parts, text.String())
+					continue
+				}
+				if part.Raw != "" {
+					if partType == "" {
+						partType = "unknown"
+					}
+					parts = append(parts, fmt.Sprintf("[unsupported content block type=%s] %s", partType, part.Raw))
+				}
 			}
 		}
-		return strings.Join(parts, "")
+		return strings.Join(parts, "\n")
 	}
 	return content.String()
+}
+
+func extractCursorStructuredContent(candidates ...gjson.Result) json.RawMessage {
+	for _, content := range candidates {
+		if !content.Exists() {
+			continue
+		}
+		if content.IsObject() {
+			if strings.EqualFold(content.Get("type").String(), "json") {
+				value := content.Get("json")
+				if value.IsObject() {
+					return json.RawMessage(value.Raw)
+				}
+				continue
+			}
+			if content.Get("type").String() == "" {
+				return json.RawMessage(content.Raw)
+			}
+		}
+		if content.IsArray() {
+			var structured json.RawMessage
+			count := 0
+			for _, part := range content.Array() {
+				if !strings.EqualFold(part.Get("type").String(), "json") || !part.Get("json").IsObject() {
+					continue
+				}
+				structured = json.RawMessage(part.Get("json").Raw)
+				count++
+			}
+			if count == 1 {
+				return structured
+			}
+		}
+	}
+	return nil
 }
 
 func extractImages(content gjson.Result) []cursorproto.ImageData {
@@ -2212,17 +2595,66 @@ func extractImages(content gjson.Result) []cursorproto.ImageData {
 	}
 	var images []cursorproto.ImageData
 	for _, part := range content.Array() {
-		if part.Get("type").String() == "image_url" {
-			url := part.Get("image_url.url").String()
-			if strings.HasPrefix(url, "data:") {
-				img := parseDataURL(url)
-				if img != nil {
-					images = append(images, *img)
-				}
+		partType := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+		if partType != "image" && partType != "image_url" && partType != "input_image" {
+			continue
+		}
+		imageURL := cursorContentImageURL(part)
+		if strings.HasPrefix(strings.ToLower(imageURL), "data:") {
+			img := parseDataURL(imageURL)
+			if img != nil {
+				images = append(images, *img)
 			}
 		}
 	}
 	return images
+}
+
+func cursorContentImageURL(part gjson.Result) string {
+	for _, candidate := range []gjson.Result{
+		part.Get("image_url.url"),
+		part.Get("image_url"),
+		part.Get("url"),
+		part.Get("source.url"),
+	} {
+		if candidate.Type == gjson.String && strings.TrimSpace(candidate.String()) != "" {
+			return strings.TrimSpace(candidate.String())
+		}
+	}
+	if strings.EqualFold(part.Get("source.type").String(), "base64") {
+		mimeType := strings.TrimSpace(part.Get("source.media_type").String())
+		data := strings.TrimSpace(part.Get("source.data").String())
+		if mimeType != "" && data != "" {
+			return "data:" + mimeType + ";base64," + data
+		}
+	}
+	return ""
+}
+
+func cursorImagePartDiagnostic(part gjson.Result) string {
+	imageURL := cursorContentImageURL(part)
+	if imageURL == "" {
+		return "[image omitted: missing image data]"
+	}
+	if strings.HasPrefix(strings.ToLower(imageURL), "data:") {
+		if parseDataURL(imageURL) != nil {
+			return ""
+		}
+		return "[image omitted: invalid or unsupported image data URL]"
+	}
+	parsedURL, err := neturl.Parse(imageURL)
+	if err != nil {
+		return "[image omitted: invalid remote image URL]"
+	}
+	scheme := strings.ToLower(parsedURL.Scheme)
+	host := strings.ToLower(parsedURL.Hostname())
+	if scheme == "" {
+		scheme = "unknown"
+	}
+	if host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("[remote image not transferred: scheme=%s host=%s; server-side fetching is disabled]", scheme, host)
 }
 
 func appendUniqueCursorImages(dst, src []cursorproto.ImageData) []cursorproto.ImageData {
@@ -2248,26 +2680,50 @@ func appendUniqueCursorImages(dst, src []cursorproto.ImageData) []cursorproto.Im
 }
 
 func parseDataURL(url string) *cursorproto.ImageData {
-	// data:image/png;base64,...
-	if !strings.HasPrefix(url, "data:") {
+	const maxCursorImageBytes = 25 << 20
+	if len(url) < 5 || !strings.EqualFold(url[:5], "data:") {
 		return nil
 	}
-	parts := strings.SplitN(url[5:], ";", 2)
-	if len(parts) != 2 {
+	comma := strings.IndexByte(url[5:], ',')
+	if comma < 0 {
 		return nil
 	}
-	mimeType := parts[0]
-	if !strings.HasPrefix(parts[1], "base64,") {
+	comma += 5
+	metadata := strings.Split(url[5:comma], ";")
+	mimeType := strings.ToLower(strings.TrimSpace(metadata[0]))
+	if !strings.HasPrefix(mimeType, "image/") {
 		return nil
 	}
-	encoded := parts[1][7:]
-	data, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		// Try RawStdEncoding for unpadded base64
-		data, err = base64.RawStdEncoding.DecodeString(encoded)
+	isBase64 := false
+	for _, parameter := range metadata[1:] {
+		if strings.EqualFold(strings.TrimSpace(parameter), "base64") {
+			isBase64 = true
+			break
+		}
+	}
+	payload := url[comma+1:]
+	var data []byte
+	if isBase64 {
+		if len(payload) > (maxCursorImageBytes*4/3)+4 {
+			return nil
+		}
+		decoded, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			decoded, err = base64.RawStdEncoding.DecodeString(payload)
+			if err != nil {
+				return nil
+			}
+		}
+		data = decoded
+	} else {
+		decoded, err := neturl.PathUnescape(payload)
 		if err != nil {
 			return nil
 		}
+		data = []byte(decoded)
+	}
+	if len(data) == 0 || len(data) > maxCursorImageBytes {
+		return nil
 	}
 	return &cursorproto.ImageData{
 		MimeType: mimeType,
@@ -2275,7 +2731,10 @@ func parseDataURL(url string) *cursorproto.ImageData {
 	}
 }
 
-func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstreamModel string) *cursorproto.RunRequestParams {
+func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstreamModel string) (*cursorproto.RunRequestParams, error) {
+	if err := validateCursorToolChoice(parsed); err != nil {
+		return nil, err
+	}
 	// upstreamModel is the provider-resolved model name. Keep parsed.Model
 	// unchanged so OpenAI-compatible responses continue to echo the client model.
 	modelID := strings.TrimSpace(upstreamModel)
@@ -2297,20 +2756,46 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 		BlobStore:      make(map[string][]byte),
 	}
 
-	// Convert OpenAI tools to McpToolDefs
-	for _, tool := range parsed.Tools {
-		fn := tool.Get("function")
-		params.McpTools = append(params.McpTools, cursorproto.McpToolDef{
-			Name:        fn.Get("name").String(),
-			Description: fn.Get("description").String(),
-			InputSchema: json.RawMessage(fn.Get("parameters").Raw),
-		})
-	}
-	if len(params.McpTools) > 0 {
-		params.AgentMode = cursorproto.AgentModeAgent
+	switch parsed.ToolChoice.Mode {
+	case "", "auto":
+		for _, tool := range parsed.Tools {
+			fn := tool.Get("function")
+			params.McpTools = append(params.McpTools, cursorproto.McpToolDef{
+				Name:        fn.Get("name").String(),
+				Description: fn.Get("description").String(),
+				InputSchema: json.RawMessage(fn.Get("parameters").Raw),
+			})
+		}
+		if len(params.McpTools) > 0 {
+			params.AgentMode = cursorproto.AgentModeAgent
+		}
+	case "none":
+		// Ask mode without MCP definitions is Cursor's native no-tools mode.
+	case "required":
+		return nil, cliproxyauth.NewRequestScopedError("cursor: tool_choice=required is not supported by the Cursor Run protocol", http.StatusBadRequest)
+	case "specific":
+		return nil, cliproxyauth.NewRequestScopedError(fmt.Sprintf("cursor: forcing tool %q is not supported by the Cursor Run protocol", parsed.ToolChoice.Name), http.StatusBadRequest)
+	default:
+		return nil, cliproxyauth.NewRequestScopedError("cursor: unsupported tool_choice value", http.StatusBadRequest)
 	}
 
-	return params
+	return params, nil
+}
+
+func validateCursorToolChoice(parsed *parsedOpenAIRequest) error {
+	if parsed == nil {
+		return cliproxyauth.NewRequestScopedError("cursor: request is missing", http.StatusBadRequest)
+	}
+	switch parsed.ToolChoice.Mode {
+	case "", "auto", "none":
+		return nil
+	case "required":
+		return cliproxyauth.NewRequestScopedError("cursor: tool_choice=required is not supported by the Cursor Run protocol", http.StatusBadRequest)
+	case "specific":
+		return cliproxyauth.NewRequestScopedError(fmt.Sprintf("cursor: forcing tool %q is not supported by the Cursor Run protocol", parsed.ToolChoice.Name), http.StatusBadRequest)
+	default:
+		return cliproxyauth.NewRequestScopedError("cursor: unsupported tool_choice value", http.StatusBadRequest)
+	}
 }
 
 // normalizeCursorModel returns the upstream model id and whether Max Mode is required.

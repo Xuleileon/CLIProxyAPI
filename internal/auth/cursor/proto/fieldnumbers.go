@@ -255,13 +255,15 @@ const (
 
 // McpSuccess (msg 290)
 const (
-	MCS_Content = 1 // repeated McpToolResultContentItem
-	MCS_IsError = 2 // bool
+	MCS_Content           = 1 // repeated McpToolResultContentItem
+	MCS_IsError           = 2 // bool
+	MCS_StructuredContent = 3 // google.protobuf.Struct
 )
 
 // McpToolResultContentItem oneof "content"
 const (
-	MTRCI_Text = 1 // McpTextContent
+	MTRCI_Text  = 1 // McpTextContent
+	MTRCI_Image = 2 // McpImageContent
 )
 
 // McpTextContent (msg 287)
