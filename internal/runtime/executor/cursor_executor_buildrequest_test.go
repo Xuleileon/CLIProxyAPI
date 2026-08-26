@@ -115,9 +115,12 @@ func TestBuildRunRequestParams_PrefixesClaudeCodeToolNames(t *testing.T) {
 		if got := helps.UnprefixCursorACPName(tool.Name); got != client {
 			t.Fatalf("client name for %q = %q, want %q", tool.Name, got, client)
 		}
+		if !strings.HasPrefix(tool.Description, "["+client+"]") {
+			t.Fatalf("description for %q missing [%s] tag: %s", tool.Name, client, tool.Description)
+		}
 	}
-	if !strings.Contains(params.SystemPrompt, "acp_") {
-		t.Fatalf("system prompt missing compact acp_ rule: %s", params.SystemPrompt)
+	if !strings.Contains(params.SystemPrompt, "acp_Grep") {
+		t.Fatalf("system prompt missing Grep alias example: %s", params.SystemPrompt)
 	}
 	if strings.Contains(params.SystemPrompt, "Workflow →") {
 		t.Fatalf("system prompt listed per-tool mappings: %s", params.SystemPrompt)

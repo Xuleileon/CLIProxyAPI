@@ -3035,7 +3035,7 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 			originalNames = append(originalNames, originalName)
 			params.McpTools = append(params.McpTools, cursorproto.McpToolDef{
 				Name:        helps.PrefixCursorACPName(originalName),
-				Description: fn.Get("description").String(),
+				Description: helps.AnnotateCursorACPDescription(originalName, fn.Get("description").String()),
 				InputSchema: json.RawMessage(fn.Get("parameters").Raw),
 			})
 		}

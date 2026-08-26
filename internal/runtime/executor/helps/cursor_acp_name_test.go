@@ -49,12 +49,24 @@ func TestPrefixCursorACPNamePreservesClaudeMCPNames(t *testing.T) {
 	}
 }
 
+func TestAnnotateCursorACPDescription(t *testing.T) {
+	t.Parallel()
+
+	got := AnnotateCursorACPDescription("Grep", "search file contents")
+	if got != "[Grep] search file contents" {
+		t.Fatalf("description = %q, want short original-name tag", got)
+	}
+	if again := AnnotateCursorACPDescription("Grep", got); again != got {
+		t.Fatalf("tagged twice: %q", again)
+	}
+}
+
 func TestCursorACPAliasInstruction(t *testing.T) {
 	t.Parallel()
 
 	got := CursorACPAliasInstruction([]string{"Task", "Bash"})
-	if !strings.Contains(got, "acp_") || !strings.Contains(got, "Task") {
-		t.Fatalf("instruction = %q, want a compact acp_ rule", got)
+	if !strings.Contains(got, "acp_Grep") || !strings.Contains(got, "acp_Task") {
+		t.Fatalf("instruction = %q, want Grep/Task examples", got)
 	}
 	if strings.Contains(got, "Bash →") {
 		t.Fatalf("instruction listed per-tool mappings: %s", got)
