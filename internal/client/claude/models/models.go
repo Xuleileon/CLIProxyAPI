@@ -9,13 +9,12 @@ import (
 const claudeDDModelPrefix = "claude-fable-5-dd-"
 
 // BuildResponse builds an Anthropic model response from available models.
-func BuildResponse(availableModels []map[string]any, disableCloaking bool) map[string]any {
-	models := make([]map[string]any, len(availableModels))
-	for i, model := range availableModels {
-		models[i] = cloneModel(model)
-		if id, ok := models[i]["id"].(string); ok && !disableCloaking {
-			models[i]["id"] = EnsureClaudeModelIDPrefix(id)
-		}
+// Each registry model is listed once with its original ID so the catalog size
+// matches the backend. Cloaked IDs remain accepted by FindModel and request routing.
+func BuildResponse(availableModels []map[string]any, _ bool) map[string]any {
+	models := make([]map[string]any, 0, len(availableModels))
+	for _, model := range availableModels {
+		models = append(models, cloneModel(model))
 	}
 
 	sort.SliceStable(models, func(i, j int) bool {
@@ -54,11 +53,18 @@ func FindModel(availableModels []map[string]any, id string, disableCloaking bool
 
 	listed, _ := BuildResponse(availableModels, disableCloaking)["data"].([]map[string]any)
 	want := ResolveClaudeModelIDPrefix(id)
+	var fuzzy map[string]any
 	for _, model := range listed {
 		listedID, _ := model["id"].(string)
-		if listedID == id || listedID == want || ResolveClaudeModelIDPrefix(listedID) == want {
+		if listedID == id {
 			return model, true
 		}
+		if fuzzy == nil && (listedID == want || ResolveClaudeModelIDPrefix(listedID) == want) {
+			fuzzy = model
+		}
+	}
+	if fuzzy != nil {
+		return fuzzy, true
 	}
 	return nil, false
 }

@@ -1798,7 +1798,13 @@ func TestAnthropicCompatibleAliasRoutes(t *testing.T) {
 			MaxCompletionTokens: 64000,
 		},
 		{
-			ID:      "gpt-4o",
+			ID:      "gpt-5.6-sol",
+			Object:  "model",
+			OwnedBy: "openai",
+			Type:    "openai",
+		},
+		{
+			ID:      "gpt-5.6-sol-low-fast",
 			Object:  "model",
 			OwnedBy: "openai",
 			Type:    "openai",
@@ -1838,6 +1844,26 @@ func TestAnthropicCompatibleAliasRoutes(t *testing.T) {
 		}
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		var resp struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
+		}
+		found := map[string]bool{}
+		for _, model := range resp.Data {
+			found[model.ID] = true
+		}
+		for _, id := range []string{"gpt-5.6-sol", "gpt-5.6-sol-low-fast"} {
+			if !found[id] {
+				t.Fatalf("expected original %q in /anthropic/v1/models, got %s", id, rr.Body.String())
+			}
+			if found[claudemodels.EnsureClaudeModelIDPrefix(id)] {
+				t.Fatalf("did not expect cloaked duplicate of %q in /anthropic/v1/models, got %s", id, rr.Body.String())
+			}
 		}
 	})
 
@@ -1924,6 +1950,20 @@ func TestAnthropicCompatibleAliasRoutes(t *testing.T) {
 		}
 	})
 
+	t.Run("retrieve gpt model via anthropic alias keeps original id", func(t *testing.T) {
+		rr := anthropicGET("/anthropic/v1/models/gpt-5.6-sol")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		var model map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &model); err != nil {
+			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
+		}
+		if got, _ := model["id"].(string); got != "gpt-5.6-sol" {
+			t.Fatalf("id = %q, want gpt-5.6-sol body=%s", got, rr.Body.String())
+		}
+	})
+
 	t.Run("retrieve model anthropic format", func(t *testing.T) {
 		rr := anthropicGET("/v1/models/claude-sonnet-4-6")
 		if rr.Code == http.StatusNotFound && strings.Contains(rr.Body.String(), "404 page not found") {
@@ -1965,7 +2005,7 @@ func TestAnthropicCompatibleAliasRoutes(t *testing.T) {
 	})
 
 	t.Run("openai retrieve stays openai format", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/v1/models/gpt-4o", nil)
+		req := httptest.NewRequest(http.MethodGet, "/v1/models/gpt-5.6-sol", nil)
 		req.Header.Set("Authorization", "Bearer test-key")
 		req.Header.Set("User-Agent", "Mozilla/5.0")
 		rr := httptest.NewRecorder()
@@ -1977,8 +2017,8 @@ func TestAnthropicCompatibleAliasRoutes(t *testing.T) {
 		if err := json.Unmarshal(rr.Body.Bytes(), &model); err != nil {
 			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
 		}
-		if got, _ := model["id"].(string); got != "gpt-4o" {
-			t.Fatalf("id = %q, want gpt-4o body=%s", got, rr.Body.String())
+		if got, _ := model["id"].(string); got != "gpt-5.6-sol" {
+			t.Fatalf("id = %q, want gpt-5.6-sol body=%s", got, rr.Body.String())
 		}
 		if _, ok := model["display_name"]; ok {
 			t.Fatalf("did not expect Anthropic display_name in OpenAI retrieve: %s", rr.Body.String())
@@ -2003,7 +2043,7 @@ func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
 			MaxCompletionTokens: 64000,
 		},
 		{
-			ID:      "gpt-4o",
+			ID:      "gpt-5.6-sol",
 			Object:  "model",
 			OwnedBy: "openai",
 			Type:    "openai",
@@ -2044,23 +2084,24 @@ func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
 		}
 
 		var claudeModel map[string]any
-		var rewrittenModel map[string]any
+		var rawGPT map[string]any
+		cloakedGPT := claudemodels.EnsureClaudeModelIDPrefix("gpt-5.6-sol")
 		for _, m := range resp.Data {
 			id, _ := m["id"].(string)
 			switch id {
 			case "claude-sonnet-4-6":
 				claudeModel = m
-			case "claude-fable-5-dd-o4-tpg":
-				rewrittenModel = m
-			case "gpt-4o", "claude-gpt-4o":
-				t.Fatalf("expected non-claude model id to be rewritten as claude-fable-5-dd-<reversed>, got %q", id)
+			case "gpt-5.6-sol":
+				rawGPT = m
+			case cloakedGPT, "claude-gpt-5.6-sol":
+				t.Fatalf("expected original gpt-5.6-sol without cloaked duplicate, got %q", id)
 			}
 		}
 		if claudeModel == nil {
 			t.Fatalf("expected claude-sonnet-4-6 in response, got %s", rr.Body.String())
 		}
-		if rewrittenModel == nil {
-			t.Fatalf("expected claude-fable-5-dd-o4-tpg in response, got %s", rr.Body.String())
+		if rawGPT == nil {
+			t.Fatalf("expected original gpt-5.6-sol in Anthropic model list, got %s", rr.Body.String())
 		}
 		for _, field := range []string{"max_input_tokens", "max_tokens", "display_name"} {
 			if _, ok := claudeModel[field]; !ok {
@@ -2092,19 +2133,20 @@ func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
 			t.Fatalf("expected OpenAI format (object=list), got %s", rr.Body.String())
 		}
 		foundRawGPT := false
+		cloakedGPT := claudemodels.EnsureClaudeModelIDPrefix("gpt-5.6-sol")
 		for _, m := range resp.Data {
 			if _, ok := m["max_input_tokens"]; ok {
 				t.Fatalf("did not expect max_input_tokens in OpenAI format, got %v", m)
 			}
-			if id, _ := m["id"].(string); id == "gpt-4o" {
+			if id, _ := m["id"].(string); id == "gpt-5.6-sol" {
 				foundRawGPT = true
 			}
-			if id, _ := m["id"].(string); id == "claude-gpt-4o" || id == "claude-fable-5-dd-o4-tpg" {
+			if id, _ := m["id"].(string); id == "claude-gpt-5.6-sol" || id == cloakedGPT {
 				t.Fatalf("did not expect Anthropic id rewrite on OpenAI format models, got %v", m)
 			}
 		}
 		if !foundRawGPT {
-			t.Fatalf("expected raw gpt-4o in OpenAI format response, got %s", rr.Body.String())
+			t.Fatalf("expected raw gpt-5.6-sol in OpenAI format response, got %s", rr.Body.String())
 		}
 	})
 }
@@ -2149,7 +2191,7 @@ func TestClaudeModelListCloakingConfigHotReload(t *testing.T) {
 		t.Fatalf("model %q not found in response: %s", want, recorder.Body.String())
 	}
 
-	assertModelID(claudemodels.EnsureClaudeModelIDPrefix(modelID))
+	assertModelID(modelID)
 
 	updatedCfg := *server.cfg
 	updatedCfg.SDKConfig = server.cfg.SDKConfig

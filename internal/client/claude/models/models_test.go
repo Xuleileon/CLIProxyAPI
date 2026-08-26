@@ -18,7 +18,7 @@ func TestBuildResponse(t *testing.T) {
 
 	wantIDs := []string{
 		"claude-c",
-		"claude-fable-5-dd-o4-tpg",
+		"gpt-4o",
 		"claude-b",
 		"claude-z",
 	}
@@ -100,6 +100,8 @@ func TestEnsureClaudeModelIDPrefix(t *testing.T) {
 		{"contains claude mid-string is reversed", "my-claude-custom", "claude-fable-5-dd-motsuc-edualc-ym"},
 		{"uppercase Claude prefix is reversed", "Claude-Opus-4", "claude-fable-5-dd-4-supO-edualC"},
 		{"gpt model is reversed", "gpt-4o", "claude-fable-5-dd-o4-tpg"},
+		{"codex gpt model is reversed", "gpt-5.6-sol", "claude-fable-5-dd-los-6.5-tpg"},
+		{"codex gpt effort variant is reversed", "gpt-5.6-sol-low-fast", "claude-fable-5-dd-tsaf-wol-los-6.5-tpg"},
 		{"gemini model is reversed", "gemini-2.5-pro", "claude-fable-5-dd-orp-5.2-inimeg"},
 	}
 
@@ -133,8 +135,8 @@ func TestFindModel(t *testing.T) {
 		if !ok {
 			t.Fatal("expected cloaked model")
 		}
-		if got, _ := model["id"].(string); got != "claude-fable-5-dd-o4-tpg" {
-			t.Fatalf("id = %q, want cloaked gpt-4o", got)
+		if got, _ := model["id"].(string); got != "gpt-4o" {
+			t.Fatalf("id = %q, want gpt-4o", got)
 		}
 	})
 
@@ -142,6 +144,16 @@ func TestFindModel(t *testing.T) {
 		model, ok := FindModel(availableModels, "gpt-4o", true)
 		if !ok {
 			t.Fatal("expected uncloaked model")
+		}
+		if got, _ := model["id"].(string); got != "gpt-4o" {
+			t.Fatalf("id = %q, want gpt-4o", got)
+		}
+	})
+
+	t.Run("finds original gpt id when cloaking enabled", func(t *testing.T) {
+		model, ok := FindModel(availableModels, "gpt-4o", false)
+		if !ok {
+			t.Fatal("expected original gpt model")
 		}
 		if got, _ := model["id"].(string); got != "gpt-4o" {
 			t.Fatalf("id = %q, want gpt-4o", got)
