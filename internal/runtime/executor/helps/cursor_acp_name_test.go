@@ -1,6 +1,9 @@
 package helps
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestPrefixCursorACPName(t *testing.T) {
 	t.Parallel()
@@ -13,6 +16,18 @@ func TestPrefixCursorACPName(t *testing.T) {
 		}
 		if restored := UnprefixCursorACPName(got); restored != name {
 			t.Fatalf("UnprefixCursorACPName(%q) = %q, want %q", got, restored, name)
+		}
+	}
+}
+
+func TestPrefixCursorACPNamePrefixesClaudeCodeTools(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"Task", "ToolSearch", "TaskOutput", "SendMessage", "mcp__context7__query-docs"} {
+		got := PrefixCursorACPName(name)
+		want := CursorACPNamePrefix + name
+		if got != want {
+			t.Fatalf("PrefixCursorACPName(%q) = %q, want %q", name, got, want)
 		}
 	}
 }
@@ -31,6 +46,28 @@ func TestPrefixCursorACPNamePreservesClaudeMCPNames(t *testing.T) {
 	}
 	if restored := UnprefixCursorACPName(name); restored != name {
 		t.Fatalf("UnprefixCursorACPName(%q) = %q, want unchanged", name, restored)
+	}
+}
+
+func TestCursorACPAliasInstruction(t *testing.T) {
+	t.Parallel()
+
+	got := CursorACPAliasInstruction([]string{"Task", "Bash"})
+	if !strings.Contains(got, "acp_") || !strings.Contains(got, "Task") {
+		t.Fatalf("instruction = %q, want a compact acp_ rule", got)
+	}
+	if strings.Contains(got, "Bash →") {
+		t.Fatalf("instruction listed per-tool mappings: %s", got)
+	}
+	many := make([]string, 80)
+	for i := range many {
+		many[i] = "Tool" + strings.Repeat("X", i%3)
+	}
+	if gotMany := CursorACPAliasInstruction(many); gotMany != got {
+		t.Fatalf("instruction grew with tool count: %d vs %d bytes", len(gotMany), len(got))
+	}
+	if CursorACPAliasInstruction(nil) != "" {
+		t.Fatal("empty tool list should not inject an instruction")
 	}
 }
 

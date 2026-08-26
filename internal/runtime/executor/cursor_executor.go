@@ -3028,13 +3028,23 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 
 	switch parsed.ToolChoice.Mode {
 	case "", "auto":
+		originalNames := make([]string, 0, len(parsed.Tools))
 		for _, tool := range parsed.Tools {
 			fn := tool.Get("function")
+			originalName := fn.Get("name").String()
+			originalNames = append(originalNames, originalName)
 			params.McpTools = append(params.McpTools, cursorproto.McpToolDef{
-				Name:        helps.PrefixCursorACPName(fn.Get("name").String()),
+				Name:        helps.PrefixCursorACPName(originalName),
 				Description: fn.Get("description").String(),
 				InputSchema: json.RawMessage(fn.Get("parameters").Raw),
 			})
+		}
+		if instr := helps.CursorACPAliasInstruction(originalNames); instr != "" {
+			if params.SystemPrompt != "" {
+				params.SystemPrompt = instr + "\n\n" + params.SystemPrompt
+			} else {
+				params.SystemPrompt = instr
+			}
 		}
 		if len(params.McpTools) > 0 {
 			params.AgentMode = cursorproto.AgentModeAgent
