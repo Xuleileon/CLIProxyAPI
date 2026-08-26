@@ -75,6 +75,13 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 			wantErr:       false,
 		},
 		{
+			name:          "hyphen thinking level routes to registered Claude model",
+			inputModel:    "claude-sonnet-4-5-thinking-high",
+			wantProviders: []string{"claude"},
+			wantModel:     "claude-sonnet-4-5-thinking-high",
+			wantErr:       false,
+		},
+		{
 			name:          "unknown model with suffix",
 			inputModel:    "unknown-model(8192)",
 			wantProviders: nil,
@@ -120,6 +127,34 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 				t.Fatalf("getRequestDetails() model = %v, want %v", model, tt.wantModel)
 			}
 		})
+	}
+}
+
+func TestGetRequestDetails_HyphenThinkingDoesNotFallBackToCursor(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	now := time.Now().Unix()
+
+	modelRegistry.RegisterClient("test-hyphen-thinking-claude", "claude", []*registry.ModelInfo{
+		{ID: "claude-sonnet-5", Created: now + 5},
+	})
+	modelRegistry.RegisterClient("test-hyphen-thinking-cursor", "cursor", []*registry.ModelInfo{
+		{ID: "composer-2", Created: now + 4},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient("test-hyphen-thinking-claude")
+		modelRegistry.UnregisterClient("test-hyphen-thinking-cursor")
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+	providers, model, errMsg := handler.getRequestDetails("claude-sonnet-5-thinking-high")
+	if errMsg != nil {
+		t.Fatalf("getRequestDetails() error = %v", errMsg)
+	}
+	if !reflect.DeepEqual(providers, []string{"claude"}) {
+		t.Fatalf("getRequestDetails() providers = %v, want [claude]", providers)
+	}
+	if model != "claude-sonnet-5-thinking-high" {
+		t.Fatalf("getRequestDetails() model = %q, want claude-sonnet-5-thinking-high", model)
 	}
 }
 

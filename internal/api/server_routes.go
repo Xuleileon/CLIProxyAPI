@@ -86,6 +86,7 @@ func (s *Server) setupRoutes() {
 	v1.Use(AuthMiddleware(s.accessManager))
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
+		v1.GET("/models/:model", s.unifiedRetrieveModelHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
 		v1.POST("/images/generations", openaiHandlers.ImagesGenerations)
@@ -121,6 +122,17 @@ func (s *Server) setupRoutes() {
 	s.engine.POST("/v1/realtime/calls/:call_id/accept", standardAuth, s.codexLiveHandler.HandleSIPControl)
 	s.engine.POST("/v1/realtime/calls/:call_id/reject", standardAuth, s.codexLiveHandler.HandleSIPControl)
 	s.engine.POST("/v1/realtime/calls/:call_id/refer", standardAuth, s.codexLiveHandler.HandleSIPControl)
+
+	// Anthropic-prefixed alias for clients that set ANTHROPIC_BASE_URL to .../anthropic
+	// (so /v1/messages does not become /v1/v1/messages). Always Anthropic format.
+	anthropicV1 := s.engine.Group("/anthropic/v1")
+	anthropicV1.Use(AuthMiddleware(s.accessManager))
+	{
+		anthropicV1.GET("/models", claudeCodeHandlers.ClaudeModels)
+		anthropicV1.GET("/models/:model", claudeCodeHandlers.ClaudeRetrieveModel)
+		anthropicV1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
+		anthropicV1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
+	}
 
 	openaiV1 := s.engine.Group("/openai/v1")
 	openaiV1.Use(AuthMiddleware(s.accessManager))
@@ -158,6 +170,8 @@ func (s *Server) setupRoutes() {
 				"POST /v1/chat/completions",
 				"POST /v1/completions",
 				"GET /v1/models",
+				"POST /v1/messages",
+				"POST /anthropic/v1/messages",
 			},
 		})
 	})
@@ -605,6 +619,16 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	}
 
 	s.engine.GET(trimmed, conditionalAuth, finalHandler)
+}
+
+func (s *Server) unifiedRetrieveModelHandler(openaiHandler *openai.OpenAIAPIHandler, claudeHandler *claude.ClaudeCodeAPIHandler) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isAnthropicModelsRequest(c) {
+			claudeHandler.ClaudeRetrieveModel(c)
+			return
+		}
+		openaiHandler.OpenAIRetrieveModel(c)
+	}
 }
 
 // isAnthropicModelsRequest reports whether a /v1/models request should be served in

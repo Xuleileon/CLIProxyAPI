@@ -61,6 +61,9 @@ func adjustExecutionProvidersForEntryProtocol(entryProtocol string, providers []
 	if entryProtocol == Interactions {
 		return preferExecutionProvider(providers, GeminiInteractions)
 	}
+	if entryProtocol == Claude {
+		return preferExecutionProvider(providers, Claude)
+	}
 	if supportsNativeInteractionsEntryProtocol(entryProtocol) {
 		return providers
 	}

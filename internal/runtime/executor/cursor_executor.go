@@ -1805,7 +1805,7 @@ func processH2SessionFrames(
 								ExecMsgId:  msg.ExecMsgId,
 								ExecId:     msg.ExecId,
 								ToolCallId: toolCallId,
-								ToolName:   msg.McpToolName,
+								ToolName:   helps.UnprefixCursorACPName(msg.McpToolName),
 								Args:       decodedArgs,
 								Kind:       cursorExecMCP,
 							}
@@ -2010,7 +2010,7 @@ func waitForCursorToolResults(
 						ExecMsgId:  msg.ExecMsgId,
 						ExecId:     msg.ExecId,
 						ToolCallId: toolCallID,
-						ToolName:   msg.McpToolName,
+						ToolName:   helps.UnprefixCursorACPName(msg.McpToolName),
 						Args:       decodedArgs,
 						Kind:       cursorExecMCP,
 					})
@@ -2302,7 +2302,7 @@ func bridgeCursorNativeExec(msg *cursorproto.DecodedServerMessage, tools []curso
 	if err != nil {
 		return pendingMcpExec{}, false
 	}
-	pending.ToolName = tool.Name
+	pending.ToolName = helps.UnprefixCursorACPName(tool.Name)
 	pending.Args = string(encodedArgs)
 	return pending, true
 }
@@ -2310,7 +2310,7 @@ func bridgeCursorNativeExec(msg *cursorproto.DecodedServerMessage, tools []curso
 func findCursorBridgeTool(tools []cursorproto.McpToolDef, aliases ...string) (cursorproto.McpToolDef, bool) {
 	for _, alias := range aliases {
 		for _, tool := range tools {
-			if strings.EqualFold(strings.TrimSpace(tool.Name), alias) {
+			if helps.CursorACPNameEquals(tool.Name, alias) {
 				return tool, true
 			}
 		}
@@ -2614,7 +2614,7 @@ func cursorRequestHasTool(parsed *parsedOpenAIRequest, name string) bool {
 }
 
 func rejectCursorTeammateTaskOutput(toolName, args string) string {
-	if toolName != "TaskOutput" {
+	if !helps.CursorACPNameEquals(toolName, "TaskOutput") {
 		return ""
 	}
 	taskID := strings.TrimSpace(gjson.Get(args, "task_id").String())
@@ -2981,7 +2981,7 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 		for _, tool := range parsed.Tools {
 			fn := tool.Get("function")
 			params.McpTools = append(params.McpTools, cursorproto.McpToolDef{
-				Name:        fn.Get("name").String(),
+				Name:        helps.PrefixCursorACPName(fn.Get("name").String()),
 				Description: fn.Get("description").String(),
 				InputSchema: json.RawMessage(fn.Get("parameters").Raw),
 			})

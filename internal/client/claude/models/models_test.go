@@ -112,6 +112,49 @@ func TestEnsureClaudeModelIDPrefix(t *testing.T) {
 	}
 }
 
+func TestFindModel(t *testing.T) {
+	availableModels := []map[string]any{
+		{"id": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6", "max_tokens": 64000},
+		{"id": "gpt-4o", "display_name": "GPT-4o"},
+	}
+
+	t.Run("finds listed claude id", func(t *testing.T) {
+		model, ok := FindModel(availableModels, "claude-sonnet-4-6", false)
+		if !ok {
+			t.Fatal("expected model")
+		}
+		if got, _ := model["id"].(string); got != "claude-sonnet-4-6" {
+			t.Fatalf("id = %q, want claude-sonnet-4-6", got)
+		}
+	})
+
+	t.Run("finds cloaked listing id", func(t *testing.T) {
+		model, ok := FindModel(availableModels, "claude-fable-5-dd-o4-tpg", false)
+		if !ok {
+			t.Fatal("expected cloaked model")
+		}
+		if got, _ := model["id"].(string); got != "claude-fable-5-dd-o4-tpg" {
+			t.Fatalf("id = %q, want cloaked gpt-4o", got)
+		}
+	})
+
+	t.Run("finds original id when cloaking disabled", func(t *testing.T) {
+		model, ok := FindModel(availableModels, "gpt-4o", true)
+		if !ok {
+			t.Fatal("expected uncloaked model")
+		}
+		if got, _ := model["id"].(string); got != "gpt-4o" {
+			t.Fatalf("id = %q, want gpt-4o", got)
+		}
+	})
+
+	t.Run("missing model", func(t *testing.T) {
+		if _, ok := FindModel(availableModels, "missing-model", false); ok {
+			t.Fatal("expected miss")
+		}
+	})
+}
+
 func TestResolveClaudeModelIDPrefix(t *testing.T) {
 	tests := []struct {
 		name string

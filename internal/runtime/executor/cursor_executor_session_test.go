@@ -655,6 +655,17 @@ func TestBridgeCursorNativeExecMapsClaudeCodeTools(t *testing.T) {
 	if !ok || read.Kind != cursorExecRead || !strings.Contains(read.Args, `"file_path":"README.md"`) {
 		t.Fatalf("read bridge = %#v, ok=%t", read, ok)
 	}
+
+	prefixed := []cursorproto.McpToolDef{{
+		Name:        "acp_Read",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}`),
+	}}
+	prefixedRead, ok := bridgeCursorNativeExec(&cursorproto.DecodedServerMessage{
+		Type: cursorproto.ServerMsgExecReadArgs, ExecMsgId: 5, Path: "AGENTS.md",
+	}, prefixed)
+	if !ok || prefixedRead.ToolName != "Read" {
+		t.Fatalf("prefixed read bridge = %#v, ok=%t", prefixedRead, ok)
+	}
 }
 
 func TestBridgeCursorNativeExecRejectsUnrepresentableTools(t *testing.T) {

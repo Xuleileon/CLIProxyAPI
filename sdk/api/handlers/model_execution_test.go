@@ -574,6 +574,19 @@ func TestPreferExecutionProviderMovesPreferredFirst(t *testing.T) {
 	}
 }
 
+func TestAdjustExecutionProvidersPrefersClaudeForAnthropicEntry(t *testing.T) {
+	providers := adjustExecutionProvidersForEntryProtocol(constant.Claude, []string{"cursor", "claude"})
+	want := []string{"claude", "cursor"}
+	if len(providers) != len(want) {
+		t.Fatalf("providers = %#v, want %#v", providers, want)
+	}
+	for i := range want {
+		if providers[i] != want[i] {
+			t.Fatalf("providers = %#v, want %#v", providers, want)
+		}
+	}
+}
+
 func TestAdjustExecutionProvidersExcludesInteractionsProviderForUnsupportedEntry(t *testing.T) {
 	providers := adjustExecutionProvidersForEntryProtocol("codex", []string{"gemini-interactions", "codex"})
 	want := []string{"codex"}

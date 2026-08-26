@@ -12,6 +12,52 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestClaudeRetrieveModel(t *testing.T) {
+	const clientID = "claude-retrieve-model-test"
+	const modelID = "claude-retrieve-model-test"
+	registryRef := registry.GetGlobalRegistry()
+	registryRef.RegisterClient(clientID, "claude", []*registry.ModelInfo{{
+		ID: modelID, Object: "model", OwnedBy: "test", DisplayName: "Retrieve Claude",
+	}})
+	t.Cleanup(func() {
+		registryRef.UnregisterClient(clientID)
+	})
+
+	handler := NewClaudeCodeAPIHandler(&handlers.BaseAPIHandler{})
+
+	t.Run("found", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Params = gin.Params{{Key: "model", Value: modelID}}
+		handler.ClaudeRetrieveModel(ctx)
+		if recorder.Code != 200 {
+			t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+		}
+		if got := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); got != modelID {
+			t.Fatalf("id = %q, want %q", got, modelID)
+		}
+		if got := gjson.GetBytes(recorder.Body.Bytes(), "display_name").String(); got != "Retrieve Claude" {
+			t.Fatalf("display_name = %q, want Retrieve Claude", got)
+		}
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Params = gin.Params{{Key: "model", Value: "missing-model"}}
+		handler.ClaudeRetrieveModel(ctx)
+		if recorder.Code != 404 {
+			t.Fatalf("status = %d, want 404 body=%s", recorder.Code, recorder.Body.String())
+		}
+		if got := gjson.GetBytes(recorder.Body.Bytes(), "type").String(); got != "error" {
+			t.Fatalf("type = %q, want error", got)
+		}
+		if got := gjson.GetBytes(recorder.Body.Bytes(), "error.type").String(); got != "not_found_error" {
+			t.Fatalf("error.type = %q, want not_found_error", got)
+		}
+	})
+}
+
 func TestClaudeModelsResponseUsesConfiguredDisplayName(t *testing.T) {
 	const clientID = "claude-display-name-catalog-test"
 	const modelID = "claude-display-name-catalog-test"
