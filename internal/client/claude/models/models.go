@@ -44,6 +44,25 @@ func BuildResponse(availableModels []map[string]any, disableCloaking bool) map[s
 	}
 }
 
+// FindModel returns the listed Anthropic model matching id.
+// It accepts both the listed id (including cloaked ids) and the original registry id.
+func FindModel(availableModels []map[string]any, id string, disableCloaking bool) (map[string]any, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, false
+	}
+
+	listed, _ := BuildResponse(availableModels, disableCloaking)["data"].([]map[string]any)
+	want := ResolveClaudeModelIDPrefix(id)
+	for _, model := range listed {
+		listedID, _ := model["id"].(string)
+		if listedID == id || listedID == want || ResolveClaudeModelIDPrefix(listedID) == want {
+			return model, true
+		}
+	}
+	return nil, false
+}
+
 // EnsureClaudeModelIDPrefix rewrites model IDs for Anthropic model listings.
 // IDs that already start with "claude-" are returned unchanged; all other IDs
 // become "claude-fable-5-dd-" plus the original ID with its characters reversed.

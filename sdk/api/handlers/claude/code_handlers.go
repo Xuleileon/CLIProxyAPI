@@ -158,6 +158,21 @@ func (h *ClaudeCodeAPIHandler) ClaudeModels(c *gin.Context) {
 	c.JSON(http.StatusOK, claudemodels.BuildResponse(h.Models(), disableCloaking))
 }
 
+// ClaudeRetrieveModel handles GET /v1/models/{model_id} in Anthropic format.
+func (h *ClaudeCodeAPIHandler) ClaudeRetrieveModel(c *gin.Context) {
+	modelID := strings.TrimSpace(c.Param("model"))
+	disableCloaking := h.Cfg != nil && h.Cfg.ClaudeCode.DisableCloakingModelList
+	model, ok := claudemodels.FindModel(h.Models(), modelID, disableCloaking)
+	if !ok {
+		h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+			StatusCode: http.StatusNotFound,
+			Error:      fmt.Errorf("model: %s", modelID),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, model)
+}
+
 // handleNonStreamingResponse handles non-streaming content generation requests for Claude models.
 // This function processes the request synchronously and returns the complete generated
 // response in a single API call. It supports various generation parameters and

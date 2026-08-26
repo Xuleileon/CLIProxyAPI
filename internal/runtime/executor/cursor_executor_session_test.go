@@ -366,6 +366,101 @@ func TestHasPendingSessionForStreamLocked(t *testing.T) {
 	}
 }
 
+func TestParseOpenAIRequestMergesClaudeCodeFirstTurnUserMessages(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"model":"claude-sonnet-5-thinking-high",
+		"messages":[
+			{"role":"system","content":"You are Claude Code."},
+			{"role":"user","content":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is 2026-08-26.\n</system-reminder>"},
+			{"role":"user","content":"审计一下未提交代码"},
+			{"role":"user","content":"<system-reminder>\n技能列表、可用代理类型、token 余量\n</system-reminder>"}
+		]
+	}`)
+	parsed := parseOpenAIRequest(payload)
+	if len(parsed.Turns) != 0 {
+		t.Fatalf("first-turn reminder users became completed turns: %#v", parsed.Turns)
+	}
+	if !strings.Contains(parsed.UserText, "审计一下未提交代码") {
+		t.Fatalf("current user text lost the actual task:\n%s", parsed.UserText)
+	}
+	if !strings.Contains(parsed.UserText, "<system-reminder>") {
+		t.Fatalf("current user text dropped system reminders:\n%s", parsed.UserText)
+	}
+	taskAt := strings.LastIndex(parsed.UserText, "审计一下未提交代码")
+	reminderAt := strings.LastIndex(parsed.UserText, "<system-reminder>")
+	if taskAt < 0 || reminderAt > taskAt {
+		t.Fatalf("actual task must follow system reminders so Cursor treats it as the current request:\n%s", parsed.UserText)
+	}
+
+	if len(parsed.Turns) > 0 || len(parsed.ToolResults) > 0 {
+		flattenConversationIntoUserText(parsed)
+	}
+	if strings.Contains(parsed.UserText, "USER: 审计一下未提交代码") {
+		t.Fatalf("actual first-turn task was buried as previous conversation:\n%s", parsed.UserText)
+	}
+}
+
+func TestParseOpenAIRequestMergesTranslatedClaudeSystemReminderAfterUser(t *testing.T) {
+	t.Parallel()
+
+	claudePayload := []byte(`{
+		"model":"claude-sonnet-5-thinking-high",
+		"system":[{"type":"text","text":"You are Claude Code."}],
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"审计一下未提交代码"}]},
+			{"role":"system","content":"技能列表、可用代理类型、token 余量"}
+		]
+	}`)
+	translated := claudetoopenai.ConvertClaudeRequestToOpenAI("claude-sonnet-5-thinking-high", claudePayload, true)
+	parsed := parseOpenAIRequest(translated)
+	if len(parsed.Turns) != 0 {
+		t.Fatalf("translated trailing system reminder became a completed turn: %#v", parsed.Turns)
+	}
+	if !strings.Contains(parsed.UserText, "审计一下未提交代码") {
+		t.Fatalf("translated current user text lost the actual task:\n%s", parsed.UserText)
+	}
+	if !strings.Contains(parsed.UserText, "<system-reminder>") {
+		t.Fatalf("translated current user text dropped the system reminder:\n%s", parsed.UserText)
+	}
+	taskAt := strings.LastIndex(parsed.UserText, "审计一下未提交代码")
+	reminderAt := strings.LastIndex(parsed.UserText, "<system-reminder>")
+	if taskAt < 0 || reminderAt > taskAt {
+		t.Fatalf("translated actual task must follow system reminders:\n%s", parsed.UserText)
+	}
+}
+
+func TestFlattenConversationIntoUserTextKeepsClaudeCodeTaskAsCurrentRequest(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{
+		"model":"claude-sonnet-5-thinking-high",
+		"messages":[
+			{"role":"user","content":"inspect the project"},
+			{"role":"assistant","content":"I will read it."},
+			{"role":"user","content":"<system-reminder>\n技能列表、可用代理类型、token 余量\n</system-reminder>"},
+			{"role":"user","content":"审计一下未提交代码"}
+		]
+	}`)
+	parsed := parseOpenAIRequest(payload)
+	if len(parsed.Turns) != 1 {
+		t.Fatalf("history turns = %d, want 1: %#v", len(parsed.Turns), parsed.Turns)
+	}
+	flattenConversationIntoUserText(parsed)
+	if !strings.Contains(parsed.UserText, "USER: inspect the project") {
+		t.Fatalf("previous turn missing from flattened history:\n%s", parsed.UserText)
+	}
+	if strings.Contains(parsed.UserText, "USER: 审计一下未提交代码") {
+		t.Fatalf("current task was buried as previous conversation:\n%s", parsed.UserText)
+	}
+	currentAt := strings.Index(parsed.UserText, "Current request:")
+	taskAt := strings.LastIndex(parsed.UserText, "审计一下未提交代码")
+	if currentAt < 0 || taskAt < currentAt {
+		t.Fatalf("current task was not in Current request:\n%s", parsed.UserText)
+	}
+}
+
 func TestFlattenConversationIntoUserTextPreservesToolCallOrder(t *testing.T) {
 	t.Parallel()
 
@@ -654,6 +749,17 @@ func TestBridgeCursorNativeExecMapsClaudeCodeTools(t *testing.T) {
 	}, tools)
 	if !ok || read.Kind != cursorExecRead || !strings.Contains(read.Args, `"file_path":"README.md"`) {
 		t.Fatalf("read bridge = %#v, ok=%t", read, ok)
+	}
+
+	prefixed := []cursorproto.McpToolDef{{
+		Name:        "acp_Read",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}`),
+	}}
+	prefixedRead, ok := bridgeCursorNativeExec(&cursorproto.DecodedServerMessage{
+		Type: cursorproto.ServerMsgExecReadArgs, ExecMsgId: 5, Path: "AGENTS.md",
+	}, prefixed)
+	if !ok || prefixedRead.ToolName != "Read" {
+		t.Fatalf("prefixed read bridge = %#v, ok=%t", prefixedRead, ok)
 	}
 }
 
