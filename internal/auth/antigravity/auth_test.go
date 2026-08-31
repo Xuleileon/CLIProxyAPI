@@ -2,6 +2,7 @@ package antigravity
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -12,6 +13,25 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func TestFetchProjectIDMarksUnprovisionedAccount(t *testing.T) {
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist":
+			return jsonResponse(`{"allowedTiers":[{"id":"standard-tier","isDefault":true}]}`), nil
+		case "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser":
+			return jsonResponse(`{"done":true,"response":{}}`), nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+			return nil, nil
+		}
+	})})
+
+	_, err := auth.FetchProjectID(context.Background(), "access-token")
+	if !errors.Is(err, ErrProjectUnavailable) {
+		t.Fatalf("error = %v, want ErrProjectUnavailable", err)
+	}
 }
 
 func TestFetchProjectIDFromLoadCodeAssist(t *testing.T) {

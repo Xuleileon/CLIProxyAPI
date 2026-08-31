@@ -24,6 +24,10 @@ const (
 	projectDiscoveryRetryDelay  = 250 * time.Millisecond
 )
 
+// ErrProjectUnavailable indicates that Google authenticated the account but did
+// not provision or return an Antigravity project.
+var ErrProjectUnavailable = errors.New("antigravity project unavailable")
+
 type projectDiscoveryHTTPError struct {
 	message    string
 	statusCode int
@@ -322,7 +326,7 @@ func (o *AntigravityAuth) fetchProjectIDOnce(ctx context.Context, accessToken st
 			return "", err
 		}
 		if projectID == "" {
-			return "", fmt.Errorf("project id not found in loadCodeAssist or onboardUser response")
+			return "", fmt.Errorf("%w: project id not found in loadCodeAssist or onboardUser response", ErrProjectUnavailable)
 		}
 		return projectID, nil
 	}
@@ -415,7 +419,7 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 					return projectID, nil
 				}
 
-				return "", fmt.Errorf("no project_id in response")
+				return "", fmt.Errorf("%w: no project_id in response", ErrProjectUnavailable)
 			}
 
 			time.Sleep(2 * time.Second)

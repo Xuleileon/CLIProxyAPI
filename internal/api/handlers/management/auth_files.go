@@ -3110,13 +3110,20 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			return
 		}
 
+		fileName := antigravity.CredentialFileName(email)
 		fetchedProjectID, errProject := authSvc.FetchProjectID(ctx, accessToken)
-		if errProject != nil {
-			log.Errorf("antigravity: failed to fetch project ID: %v", errProject)
-			SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to discover Antigravity project; credentials were not saved", errProject))
-			return
-		}
 		projectID := strings.TrimSpace(fetchedProjectID)
+		if errProject != nil {
+			if errors.Is(errProject, antigravity.ErrProjectUnavailable) {
+				projectID = h.reusableAntigravityProjectID(email, fileName)
+			}
+			if projectID == "" {
+				log.Errorf("antigravity: failed to fetch project ID: %v", errProject)
+				SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to discover Antigravity project; credentials were not saved", errProject))
+				return
+			}
+			log.Warnf("antigravity: project discovery unavailable; reusing project from existing credential %s", fileName)
+		}
 		if projectID == "" {
 			log.Error("antigravity: project discovery returned an empty project ID")
 			SetOAuthSessionError(state, "Failed to discover Antigravity project; credentials were not saved")
@@ -3138,7 +3145,6 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		}
 		metadata["project_id"] = projectID
 
-		fileName := antigravity.CredentialFileName(email)
 		label := strings.TrimSpace(email)
 		if label == "" {
 			label = "antigravity"
@@ -3170,6 +3176,27 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) reusableAntigravityProjectID(email, fileName string) string {
+	if h == nil || h.authManager == nil {
+		return ""
+	}
+	email = strings.TrimSpace(email)
+	fileName = strings.TrimSpace(fileName)
+	for _, existing := range h.authManager.List() {
+		if existing == nil || !strings.EqualFold(strings.TrimSpace(existing.Provider), "antigravity") {
+			continue
+		}
+		existingEmail := strings.TrimSpace(stringValue(existing.Metadata, "email"))
+		if !strings.EqualFold(strings.TrimSpace(existing.FileName), fileName) && !strings.EqualFold(existingEmail, email) {
+			continue
+		}
+		if projectID := strings.TrimSpace(stringValue(existing.Metadata, "project_id")); projectID != "" {
+			return projectID
+		}
+	}
+	return ""
 }
 
 func (h *Handler) RequestXAIToken(c *gin.Context) {
