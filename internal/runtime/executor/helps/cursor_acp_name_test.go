@@ -83,12 +83,17 @@ func TestCursorACPAliasInstruction(t *testing.T) {
 	}
 }
 
-func TestPrefixCursorACPNameDoesNotDoublePrefix(t *testing.T) {
+func TestPrefixCursorACPNameEscapesExistingPrefix(t *testing.T) {
 	t.Parallel()
 
-	prefixed := PrefixCursorACPName("Read")
-	if got := PrefixCursorACPName(prefixed); got != prefixed {
-		t.Fatalf("PrefixCursorACPName(%q) = %q", prefixed, got)
+	original := CursorACPNamePrefix + "Read"
+	prefixed := PrefixCursorACPName(original)
+	want := CursorACPNamePrefix + original
+	if prefixed != want {
+		t.Fatalf("PrefixCursorACPName(%q) = %q, want %q", original, prefixed, want)
+	}
+	if restored := UnprefixCursorACPName(prefixed); restored != original {
+		t.Fatalf("UnprefixCursorACPName(%q) = %q, want %q", prefixed, restored, original)
 	}
 }
 

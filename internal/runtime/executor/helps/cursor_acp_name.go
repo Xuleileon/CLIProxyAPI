@@ -11,9 +11,11 @@ import (
 const CursorACPNamePrefix = "acp_"
 
 // PrefixCursorACPName is the name Cursor sees for a client-declared tool.
+// Existing prefixes receive another layer so removing one layer restores the
+// exact name declared by the client.
 func PrefixCursorACPName(name string) string {
 	name = strings.TrimSpace(name)
-	if name == "" || strings.HasPrefix(name, CursorACPNamePrefix) {
+	if name == "" {
 		return name
 	}
 	return CursorACPNamePrefix + name
