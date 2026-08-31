@@ -3110,16 +3110,19 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			return
 		}
 
-		projectID := ""
-		if accessToken != "" {
-			fetchedProjectID, errProject := authSvc.FetchProjectID(ctx, accessToken)
-			if errProject != nil {
-				log.Warnf("antigravity: failed to fetch project ID: %v", errProject)
-			} else {
-				projectID = fetchedProjectID
-				log.Infof("antigravity: obtained project ID %s", util.HideAPIKey(projectID))
-			}
+		fetchedProjectID, errProject := authSvc.FetchProjectID(ctx, accessToken)
+		if errProject != nil {
+			log.Errorf("antigravity: failed to fetch project ID: %v", errProject)
+			SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to discover Antigravity project; credentials were not saved", errProject))
+			return
 		}
+		projectID := strings.TrimSpace(fetchedProjectID)
+		if projectID == "" {
+			log.Error("antigravity: project discovery returned an empty project ID")
+			SetOAuthSessionError(state, "Failed to discover Antigravity project; credentials were not saved")
+			return
+		}
+		log.Infof("antigravity: obtained project ID %s", util.HideAPIKey(projectID))
 
 		now := time.Now()
 		metadata := map[string]any{
@@ -3133,9 +3136,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		if email != "" {
 			metadata["email"] = email
 		}
-		if projectID != "" {
-			metadata["project_id"] = projectID
-		}
+		metadata["project_id"] = projectID
 
 		fileName := antigravity.CredentialFileName(email)
 		label := strings.TrimSpace(email)

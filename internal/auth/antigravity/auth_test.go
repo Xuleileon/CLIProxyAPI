@@ -73,6 +73,50 @@ func TestFetchProjectIDFallsBackToDailyOnboardUser(t *testing.T) {
 	}
 }
 
+func TestFetchProjectIDRetriesTransientTransportFailure(t *testing.T) {
+	attempts := 0
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, io.EOF
+		}
+		return jsonResponse(`{"cloudaicompanionProject":"recovered-project"}`), nil
+	})})
+
+	projectID, err := auth.FetchProjectID(context.Background(), "access-token")
+	if err != nil {
+		t.Fatalf("FetchProjectID error: %v", err)
+	}
+	if projectID != "recovered-project" {
+		t.Fatalf("projectID = %q", projectID)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestFetchProjectIDDoesNotRetryPermissionDenied(t *testing.T) {
+	attempts := 0
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		return jsonResponseStatus(http.StatusForbidden, `{"error":{"status":"PERMISSION_DENIED","details":[{"reason":"TOS_VIOLATION"}]}}`), nil
+	})})
+
+	projectID, err := auth.FetchProjectID(context.Background(), "access-token")
+	if err == nil {
+		t.Fatal("FetchProjectID error = nil")
+	}
+	if projectID != "" {
+		t.Fatalf("projectID = %q, want empty", projectID)
+	}
+	if !strings.Contains(err.Error(), "TOS_VIOLATION") {
+		t.Fatalf("error = %q, want TOS_VIOLATION", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
 func assertLoadCodeAssistHeaders(t *testing.T, req *http.Request) {
 	t.Helper()
 	if got := req.Header.Get("Authorization"); got != "Bearer access-token" {
@@ -127,8 +171,12 @@ func assertJSONContains(t *testing.T, req *http.Request, want string) {
 }
 
 func jsonResponse(body string) *http.Response {
+	return jsonResponseStatus(http.StatusOK, body)
+}
+
+func jsonResponseStatus(statusCode int, body string) *http.Response {
 	return &http.Response{
-		StatusCode: http.StatusOK,
+		StatusCode: statusCode,
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}

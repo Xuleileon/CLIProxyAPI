@@ -4,8 +4,10 @@ package antigravity
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,6 +18,20 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 )
+
+const (
+	projectDiscoveryMaxAttempts = 3
+	projectDiscoveryRetryDelay  = 250 * time.Millisecond
+)
+
+type projectDiscoveryHTTPError struct {
+	message    string
+	statusCode int
+}
+
+func (e *projectDiscoveryHTTPError) Error() string {
+	return e.message
+}
 
 // TokenResponse represents OAuth token response from Google
 type TokenResponse struct {
@@ -225,6 +241,34 @@ func (o *AntigravityAuth) FetchUserInfo(ctx context.Context, accessToken string)
 
 // FetchProjectID retrieves the project ID for the authenticated user via loadCodeAssist
 func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string) (string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= projectDiscoveryMaxAttempts; attempt++ {
+		projectID, errFetch := o.fetchProjectIDOnce(ctx, accessToken)
+		if errFetch == nil {
+			return projectID, nil
+		}
+		lastErr = errFetch
+		if attempt == projectDiscoveryMaxAttempts || !retryableProjectDiscoveryError(errFetch) {
+			return "", errFetch
+		}
+
+		timer := time.NewTimer(time.Duration(attempt) * projectDiscoveryRetryDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return "", lastErr
+}
+
+func (o *AntigravityAuth) fetchProjectIDOnce(ctx context.Context, accessToken string) (string, error) {
 	userAgent := o.shortUserAgent()
 	loadReqBody := map[string]any{
 		"metadata": antigravityLoadCodeAssistMetadata(),
@@ -261,7 +305,8 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		message := fmt.Sprintf("request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		return "", &projectDiscoveryHTTPError{message: message, statusCode: resp.StatusCode}
 	}
 
 	var loadResp map[string]any
@@ -283,6 +328,21 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 	}
 
 	return projectID, nil
+}
+
+func retryableProjectDiscoveryError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var statusErr *projectDiscoveryHTTPError
+	if errors.As(err, &statusErr) {
+		return statusErr.statusCode == http.StatusTooManyRequests || statusErr.statusCode >= http.StatusInternalServerError
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // OnboardUser attempts to fetch the project ID via onboardUser by polling for completion
@@ -371,7 +431,8 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 		if len(responseErr) > 200 {
 			responseErr = responseErr[:200]
 		}
-		return "", fmt.Errorf("http %d: %s", resp.StatusCode, responseErr)
+		message := fmt.Sprintf("http %d: %s", resp.StatusCode, responseErr)
+		return "", &projectDiscoveryHTTPError{message: message, statusCode: resp.StatusCode}
 	}
 
 	return "", fmt.Errorf("onboard user did not complete after %d attempts", maxAttempts)
