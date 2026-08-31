@@ -20,20 +20,21 @@ import (
 )
 
 const (
-	projectDiscoveryMaxAttempts = 3
-	projectDiscoveryRetryDelay  = 250 * time.Millisecond
+	transientRequestMaxAttempts = 3
+	transientRequestRetryDelay  = 250 * time.Millisecond
+	userInfoFallbackEndpoint    = "https://openidconnect.googleapis.com/v1/userinfo"
 )
 
 // ErrProjectUnavailable indicates that Google authenticated the account but did
 // not provision or return an Antigravity project.
 var ErrProjectUnavailable = errors.New("antigravity project unavailable")
 
-type projectDiscoveryHTTPError struct {
+type antigravityHTTPError struct {
 	message    string
 	statusCode int
 }
 
-func (e *projectDiscoveryHTTPError) Error() string {
+func (e *antigravityHTTPError) Error() string {
 	return e.message
 }
 
@@ -204,7 +205,30 @@ func (o *AntigravityAuth) FetchUserInfo(ctx context.Context, accessToken string)
 	if accessToken == "" {
 		return "", fmt.Errorf("antigravity userinfo: missing access token")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, UserInfoEndpoint, nil)
+
+	var lastErr error
+	for attempt := 1; attempt <= transientRequestMaxAttempts; attempt++ {
+		endpoint := UserInfoEndpoint
+		if attempt > 1 {
+			endpoint = userInfoFallbackEndpoint
+		}
+		email, errFetch := o.fetchUserInfoOnce(ctx, accessToken, endpoint)
+		if errFetch == nil {
+			return email, nil
+		}
+		lastErr = errFetch
+		if attempt == transientRequestMaxAttempts || !retryableAntigravityRequestError(errFetch) {
+			return "", errFetch
+		}
+		if errWait := waitForAntigravityRetry(ctx, attempt); errWait != nil {
+			return "", errWait
+		}
+	}
+	return "", lastErr
+}
+
+func (o *AntigravityAuth) fetchUserInfoOnce(ctx context.Context, accessToken, endpoint string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return "", fmt.Errorf("antigravity userinfo: create request: %w", err)
 	}
@@ -228,9 +252,11 @@ func (o *AntigravityAuth) FetchUserInfo(ctx context.Context, accessToken string)
 		}
 		body := strings.TrimSpace(string(bodyBytes))
 		if body == "" {
-			return "", fmt.Errorf("antigravity userinfo: request failed: status %d", resp.StatusCode)
+			message := fmt.Sprintf("antigravity userinfo: request failed: status %d", resp.StatusCode)
+			return "", &antigravityHTTPError{message: message, statusCode: resp.StatusCode}
 		}
-		return "", fmt.Errorf("antigravity userinfo: request failed: status %d: %s", resp.StatusCode, body)
+		message := fmt.Sprintf("antigravity userinfo: request failed: status %d: %s", resp.StatusCode, body)
+		return "", &antigravityHTTPError{message: message, statusCode: resp.StatusCode}
 	}
 	var info userInfo
 	if errDecode := json.NewDecoder(resp.Body).Decode(&info); errDecode != nil {
@@ -246,27 +272,17 @@ func (o *AntigravityAuth) FetchUserInfo(ctx context.Context, accessToken string)
 // FetchProjectID retrieves the project ID for the authenticated user via loadCodeAssist
 func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string) (string, error) {
 	var lastErr error
-	for attempt := 1; attempt <= projectDiscoveryMaxAttempts; attempt++ {
+	for attempt := 1; attempt <= transientRequestMaxAttempts; attempt++ {
 		projectID, errFetch := o.fetchProjectIDOnce(ctx, accessToken)
 		if errFetch == nil {
 			return projectID, nil
 		}
 		lastErr = errFetch
-		if attempt == projectDiscoveryMaxAttempts || !retryableProjectDiscoveryError(errFetch) {
+		if attempt == transientRequestMaxAttempts || !retryableAntigravityRequestError(errFetch) {
 			return "", errFetch
 		}
-
-		timer := time.NewTimer(time.Duration(attempt) * projectDiscoveryRetryDelay)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			return "", ctx.Err()
-		case <-timer.C:
+		if errWait := waitForAntigravityRetry(ctx, attempt); errWait != nil {
+			return "", errWait
 		}
 	}
 	return "", lastErr
@@ -310,7 +326,7 @@ func (o *AntigravityAuth) fetchProjectIDOnce(ctx context.Context, accessToken st
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		message := fmt.Sprintf("request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
-		return "", &projectDiscoveryHTTPError{message: message, statusCode: resp.StatusCode}
+		return "", &antigravityHTTPError{message: message, statusCode: resp.StatusCode}
 	}
 
 	var loadResp map[string]any
@@ -334,11 +350,11 @@ func (o *AntigravityAuth) fetchProjectIDOnce(ctx context.Context, accessToken st
 	return projectID, nil
 }
 
-func retryableProjectDiscoveryError(err error) bool {
+func retryableAntigravityRequestError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	var statusErr *projectDiscoveryHTTPError
+	var statusErr *antigravityHTTPError
 	if errors.As(err, &statusErr) {
 		return statusErr.statusCode == http.StatusTooManyRequests || statusErr.statusCode >= http.StatusInternalServerError
 	}
@@ -347,6 +363,22 @@ func retryableProjectDiscoveryError(err error) bool {
 		return true
 	}
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+func waitForAntigravityRetry(ctx context.Context, attempt int) error {
+	timer := time.NewTimer(time.Duration(attempt) * transientRequestRetryDelay)
+	select {
+	case <-ctx.Done():
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // OnboardUser attempts to fetch the project ID via onboardUser by polling for completion
@@ -436,7 +468,7 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 			responseErr = responseErr[:200]
 		}
 		message := fmt.Sprintf("http %d: %s", resp.StatusCode, responseErr)
-		return "", &projectDiscoveryHTTPError{message: message, statusCode: resp.StatusCode}
+		return "", &antigravityHTTPError{message: message, statusCode: resp.StatusCode}
 	}
 
 	return "", fmt.Errorf("onboard user did not complete after %d attempts", maxAttempts)

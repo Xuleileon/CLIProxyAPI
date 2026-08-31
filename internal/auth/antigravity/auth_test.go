@@ -15,6 +15,53 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func TestFetchUserInfoRetriesWithOIDCFallback(t *testing.T) {
+	attempts := 0
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			if req.URL.String() != UserInfoEndpoint {
+				t.Fatalf("first endpoint = %s", req.URL)
+			}
+			return nil, io.EOF
+		}
+		if req.URL.String() != userInfoFallbackEndpoint {
+			t.Fatalf("fallback endpoint = %s", req.URL)
+		}
+		if got := req.Header.Get("Authorization"); got != "Bearer access-token" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		return jsonResponse(`{"email":"user@example.com"}`), nil
+	})})
+
+	email, err := auth.FetchUserInfo(context.Background(), "access-token")
+	if err != nil {
+		t.Fatalf("FetchUserInfo error: %v", err)
+	}
+	if email != "user@example.com" {
+		t.Fatalf("email = %q", email)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestFetchUserInfoDoesNotRetryUnauthorized(t *testing.T) {
+	attempts := 0
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		return jsonResponseStatus(http.StatusUnauthorized, `{"error":"invalid_token"}`), nil
+	})})
+
+	_, err := auth.FetchUserInfo(context.Background(), "access-token")
+	if err == nil {
+		t.Fatal("FetchUserInfo error = nil")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
 func TestFetchProjectIDMarksUnprovisionedAccount(t *testing.T) {
 	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.String() {
