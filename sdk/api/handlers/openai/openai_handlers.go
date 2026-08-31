@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -65,34 +66,50 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 		return
 	}
 
-	// Get all available models
 	allModels := h.Models()
-
-	// Filter to only include the 4 required fields: id, object, created, owned_by
 	filteredModels := make([]map[string]any, len(allModels))
 	for i, model := range allModels {
-		filteredModel := map[string]any{
-			"id":     model["id"],
-			"object": model["object"],
-		}
-
-		// Add created field if it exists
-		if created, exists := model["created"]; exists {
-			filteredModel["created"] = created
-		}
-
-		// Add owned_by field if it exists
-		if ownedBy, exists := model["owned_by"]; exists {
-			filteredModel["owned_by"] = ownedBy
-		}
-
-		filteredModels[i] = filteredModel
+		filteredModels[i] = openaiModelListItem(model)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
 		"data":   filteredModels,
 	})
+}
+
+// OpenAIRetrieveModel handles GET /v1/models/{model} in OpenAI format.
+func (h *OpenAIAPIHandler) OpenAIRetrieveModel(c *gin.Context) {
+	modelID := strings.TrimSpace(c.Param("model"))
+	for _, model := range h.Models() {
+		id, _ := model["id"].(string)
+		if id != modelID {
+			continue
+		}
+		c.JSON(http.StatusOK, openaiModelListItem(model))
+		return
+	}
+	c.JSON(http.StatusNotFound, handlers.ErrorResponse{
+		Error: handlers.ErrorDetail{
+			Message: fmt.Sprintf("The model '%s' does not exist", modelID),
+			Type:    "invalid_request_error",
+			Code:    "model_not_found",
+		},
+	})
+}
+
+func openaiModelListItem(model map[string]any) map[string]any {
+	filteredModel := map[string]any{
+		"id":     model["id"],
+		"object": model["object"],
+	}
+	if created, exists := model["created"]; exists {
+		filteredModel["created"] = created
+	}
+	if ownedBy, exists := model["owned_by"]; exists {
+		filteredModel["owned_by"] = ownedBy
+	}
+	return filteredModel
 }
 
 // ChatCompletions handles the /v1/chat/completions endpoint.

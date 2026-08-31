@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1783,6 +1784,251 @@ func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 	})
 }
 
+func TestAnthropicCompatibleAliasRoutes(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	clientID := "test-anthropic-compat-aliases"
+	modelRegistry.RegisterClient(clientID, "claude", []*registry.ModelInfo{
+		{
+			ID:                  "claude-sonnet-4-6",
+			Object:              "model",
+			OwnedBy:             "anthropic",
+			Type:                "claude",
+			DisplayName:         "Claude 4.6 Sonnet",
+			ContextLength:       200000,
+			MaxCompletionTokens: 64000,
+		},
+		{
+			ID:      "gpt-5.6-sol",
+			Object:  "model",
+			OwnedBy: "openai",
+			Type:    "openai",
+		},
+		{
+			ID:      "gpt-5.6-sol-low-fast",
+			Object:  "model",
+			OwnedBy: "openai",
+			Type:    "openai",
+		},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(clientID)
+	})
+
+	server := newTestServer(t)
+	anthropicGET := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+		req.Header.Set("User-Agent", "claude-cli/2.1.220 (external, cli)")
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		return rr
+	}
+	anthropicPOST := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"claude-sonnet-4-6","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer test-key")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+		req.Header.Set("User-Agent", "claude-cli/2.1.220 (external, cli)")
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		return rr
+	}
+
+	t.Run("anthropic prefix models lists anthropic format", func(t *testing.T) {
+		rr := anthropicGET("/anthropic/v1/models")
+		if rr.Code == http.StatusNotFound {
+			t.Fatalf("GET /anthropic/v1/models not registered: %s", rr.Body.String())
+		}
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		var resp struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
+		}
+		found := map[string]bool{}
+		for _, model := range resp.Data {
+			found[model.ID] = true
+		}
+		for _, id := range []string{"gpt-5.6-sol", "gpt-5.6-sol-low-fast"} {
+			if !found[id] {
+				t.Fatalf("expected original %q in /anthropic/v1/models, got %s", id, rr.Body.String())
+			}
+			if found[claudemodels.EnsureClaudeModelIDPrefix(id)] {
+				t.Fatalf("did not expect cloaked duplicate of %q in /anthropic/v1/models, got %s", id, rr.Body.String())
+			}
+		}
+	})
+
+	t.Run("anthropic prefix models stays anthropic without anthropic headers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		var resp struct {
+			Object  string `json:"object"`
+			HasMore *bool  `json:"has_more"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
+		}
+		if resp.Object == "list" || resp.HasMore == nil {
+			t.Fatalf("expected Anthropic envelope on /anthropic/v1/models, got %s", rr.Body.String())
+		}
+	})
+
+	t.Run("nested v1 v1 aliases are not registered", func(t *testing.T) {
+		for _, path := range []string{"/v1/v1/models", "/anthropic/v1/v1/models", "/anthropic/v1/v1/messages"} {
+			var rr *httptest.ResponseRecorder
+			if strings.HasSuffix(path, "/messages") {
+				rr = anthropicPOST(path)
+			} else {
+				rr = anthropicGET(path)
+			}
+			if rr.Code != http.StatusNotFound {
+				t.Fatalf("%s status = %d, want 404 body=%s", path, rr.Code, rr.Body.String())
+			}
+		}
+	})
+
+	t.Run("root endpoints omit nested v1 v1", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		var resp struct {
+			Endpoints []string `json:"endpoints"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
+		}
+		want := []string{
+			"POST /v1/chat/completions",
+			"POST /v1/completions",
+			"GET /v1/models",
+			"POST /v1/messages",
+			"POST /anthropic/v1/messages",
+		}
+		if !reflect.DeepEqual(resp.Endpoints, want) {
+			t.Fatalf("endpoints = %#v, want %#v", resp.Endpoints, want)
+		}
+	})
+
+	for _, path := range []string{"/anthropic/v1/messages", "/anthropic/v1/messages/count_tokens"} {
+		t.Run("route exists "+path, func(t *testing.T) {
+			rr := anthropicPOST(path)
+			if rr.Code == http.StatusNotFound {
+				t.Fatalf("%s not registered: %s", path, rr.Body.String())
+			}
+		})
+	}
+
+	t.Run("retrieve model via anthropic alias", func(t *testing.T) {
+		rr := anthropicGET("/anthropic/v1/models/claude-sonnet-4-6")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		var model map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &model); err != nil {
+			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
+		}
+		if got, _ := model["id"].(string); got != "claude-sonnet-4-6" {
+			t.Fatalf("id = %q, want claude-sonnet-4-6 body=%s", got, rr.Body.String())
+		}
+	})
+
+	t.Run("retrieve gpt model via anthropic alias keeps original id", func(t *testing.T) {
+		rr := anthropicGET("/anthropic/v1/models/gpt-5.6-sol")
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		var model map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &model); err != nil {
+			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
+		}
+		if got, _ := model["id"].(string); got != "gpt-5.6-sol" {
+			t.Fatalf("id = %q, want gpt-5.6-sol body=%s", got, rr.Body.String())
+		}
+	})
+
+	t.Run("retrieve model anthropic format", func(t *testing.T) {
+		rr := anthropicGET("/v1/models/claude-sonnet-4-6")
+		if rr.Code == http.StatusNotFound && strings.Contains(rr.Body.String(), "404 page not found") {
+			t.Fatalf("GET /v1/models/:id not registered: %s", rr.Body.String())
+		}
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		var model map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &model); err != nil {
+			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
+		}
+		if got, _ := model["id"].(string); got != "claude-sonnet-4-6" {
+			t.Fatalf("id = %q, want claude-sonnet-4-6 body=%s", got, rr.Body.String())
+		}
+		if _, ok := model["display_name"]; !ok {
+			t.Fatalf("expected display_name, got %s", rr.Body.String())
+		}
+	})
+
+	t.Run("retrieve missing model", func(t *testing.T) {
+		rr := anthropicGET("/v1/models/does-not-exist")
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+		var resp struct {
+			Type  string `json:"type"`
+			Error struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
+		}
+		if resp.Type != "error" || resp.Error.Type != "not_found_error" {
+			t.Fatalf("error envelope = %+v, body=%s", resp, rr.Body.String())
+		}
+	})
+
+	t.Run("openai retrieve stays openai format", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models/gpt-5.6-sol", nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		var model map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &model); err != nil {
+			t.Fatalf("parse: %v body=%s", err, rr.Body.String())
+		}
+		if got, _ := model["id"].(string); got != "gpt-5.6-sol" {
+			t.Fatalf("id = %q, want gpt-5.6-sol body=%s", got, rr.Body.String())
+		}
+		if _, ok := model["display_name"]; ok {
+			t.Fatalf("did not expect Anthropic display_name in OpenAI retrieve: %s", rr.Body.String())
+		}
+		if _, ok := model["owned_by"]; !ok {
+			t.Fatalf("expected owned_by, got %s", rr.Body.String())
+		}
+	})
+}
+
 func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
 	modelRegistry := registry.GetGlobalRegistry()
 	clientID := "test-anthropic-version-dispatch"
@@ -1797,7 +2043,7 @@ func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
 			MaxCompletionTokens: 64000,
 		},
 		{
-			ID:      "gpt-4o",
+			ID:      "gpt-5.6-sol",
 			Object:  "model",
 			OwnedBy: "openai",
 			Type:    "openai",
@@ -1838,23 +2084,24 @@ func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
 		}
 
 		var claudeModel map[string]any
-		var rewrittenModel map[string]any
+		var rawGPT map[string]any
+		cloakedGPT := claudemodels.EnsureClaudeModelIDPrefix("gpt-5.6-sol")
 		for _, m := range resp.Data {
 			id, _ := m["id"].(string)
 			switch id {
 			case "claude-sonnet-4-6":
 				claudeModel = m
-			case "claude-fable-5-dd-o4-tpg":
-				rewrittenModel = m
-			case "gpt-4o", "claude-gpt-4o":
-				t.Fatalf("expected non-claude model id to be rewritten as claude-fable-5-dd-<reversed>, got %q", id)
+			case "gpt-5.6-sol":
+				rawGPT = m
+			case cloakedGPT, "claude-gpt-5.6-sol":
+				t.Fatalf("expected original gpt-5.6-sol without cloaked duplicate, got %q", id)
 			}
 		}
 		if claudeModel == nil {
 			t.Fatalf("expected claude-sonnet-4-6 in response, got %s", rr.Body.String())
 		}
-		if rewrittenModel == nil {
-			t.Fatalf("expected claude-fable-5-dd-o4-tpg in response, got %s", rr.Body.String())
+		if rawGPT == nil {
+			t.Fatalf("expected original gpt-5.6-sol in Anthropic model list, got %s", rr.Body.String())
 		}
 		for _, field := range []string{"max_input_tokens", "max_tokens", "display_name"} {
 			if _, ok := claudeModel[field]; !ok {
@@ -1886,19 +2133,20 @@ func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
 			t.Fatalf("expected OpenAI format (object=list), got %s", rr.Body.String())
 		}
 		foundRawGPT := false
+		cloakedGPT := claudemodels.EnsureClaudeModelIDPrefix("gpt-5.6-sol")
 		for _, m := range resp.Data {
 			if _, ok := m["max_input_tokens"]; ok {
 				t.Fatalf("did not expect max_input_tokens in OpenAI format, got %v", m)
 			}
-			if id, _ := m["id"].(string); id == "gpt-4o" {
+			if id, _ := m["id"].(string); id == "gpt-5.6-sol" {
 				foundRawGPT = true
 			}
-			if id, _ := m["id"].(string); id == "claude-gpt-4o" || id == "claude-fable-5-dd-o4-tpg" {
+			if id, _ := m["id"].(string); id == "claude-gpt-5.6-sol" || id == cloakedGPT {
 				t.Fatalf("did not expect Anthropic id rewrite on OpenAI format models, got %v", m)
 			}
 		}
 		if !foundRawGPT {
-			t.Fatalf("expected raw gpt-4o in OpenAI format response, got %s", rr.Body.String())
+			t.Fatalf("expected raw gpt-5.6-sol in OpenAI format response, got %s", rr.Body.String())
 		}
 	})
 }
@@ -1943,7 +2191,7 @@ func TestClaudeModelListCloakingConfigHotReload(t *testing.T) {
 		t.Fatalf("model %q not found in response: %s", want, recorder.Body.String())
 	}
 
-	assertModelID(claudemodels.EnsureClaudeModelIDPrefix(modelID))
+	assertModelID(modelID)
 
 	updatedCfg := *server.cfg
 	updatedCfg.SDKConfig = server.cfg.SDKConfig

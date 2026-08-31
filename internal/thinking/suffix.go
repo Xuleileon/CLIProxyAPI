@@ -1,7 +1,7 @@
 // Package thinking provides unified thinking configuration processing.
 //
 // This file implements suffix parsing functionality for extracting
-// thinking configuration from model names in the format model(value).
+// thinking configuration from model names.
 package thinking
 
 import (
@@ -9,38 +9,69 @@ import (
 	"strings"
 )
 
+const hyphenThinkingMarker = "-thinking-"
+
 // ParseSuffix extracts thinking suffix from a model name.
 //
-// The suffix format is: model-name(value)
+// Supported formats:
+//   - model-name(value)
+//   - model-name-thinking-value, when value is a known thinking token
+//
 // Examples:
 //   - "claude-sonnet-4-5(16384)" -> ModelName="claude-sonnet-4-5", RawSuffix="16384"
 //   - "gpt-5.2(high)" -> ModelName="gpt-5.2", RawSuffix="high"
+//   - "claude-sonnet-5-thinking-high" -> ModelName="claude-sonnet-5", RawSuffix="high"
 //   - "gemini-2.5-pro" -> ModelName="gemini-2.5-pro", HasSuffix=false
+//   - "kimi-k2-thinking" -> ModelName="kimi-k2-thinking", HasSuffix=false
 //
-// This function only extracts the suffix; it does not validate or interpret
-// the suffix content. Use ParseNumericSuffix, ParseLevelSuffix, etc. for
-// content interpretation.
+// Parenthesis suffixes take priority. Hyphen suffixes are accepted only for
+// known thinking tokens so real model IDs are left unchanged. Use
+// ParseNumericSuffix, ParseLevelSuffix, etc. for content interpretation.
 func ParseSuffix(model string) SuffixResult {
 	// Find the last opening parenthesis
 	lastOpen := strings.LastIndex(model, "(")
-	if lastOpen == -1 {
-		return SuffixResult{ModelName: model, HasSuffix: false}
+	if lastOpen != -1 && strings.HasSuffix(model, ")") {
+		modelName := model[:lastOpen]
+		rawSuffix := model[lastOpen+1 : len(model)-1]
+		return SuffixResult{
+			ModelName: modelName,
+			HasSuffix: true,
+			RawSuffix: rawSuffix,
+		}
 	}
 
-	// Check if the string ends with a closing parenthesis
-	if !strings.HasSuffix(model, ")") {
-		return SuffixResult{ModelName: model, HasSuffix: false}
+	if base, rawSuffix, ok := parseHyphenThinkingSuffix(model); ok {
+		return SuffixResult{
+			ModelName: base,
+			HasSuffix: true,
+			RawSuffix: rawSuffix,
+		}
 	}
 
-	// Extract components
-	modelName := model[:lastOpen]
-	rawSuffix := model[lastOpen+1 : len(model)-1]
+	return SuffixResult{ModelName: model, HasSuffix: false}
+}
 
-	return SuffixResult{
-		ModelName: modelName,
-		HasSuffix: true,
-		RawSuffix: rawSuffix,
+func parseHyphenThinkingSuffix(model string) (base, rawSuffix string, ok bool) {
+	idx := strings.LastIndex(strings.ToLower(model), hyphenThinkingMarker)
+	if idx <= 0 {
+		return "", "", false
 	}
+	rawSuffix = model[idx+len(hyphenThinkingMarker):]
+	if rawSuffix == "" || !isKnownThinkingSuffix(rawSuffix) {
+		return "", "", false
+	}
+	return model[:idx], rawSuffix, true
+}
+
+func isKnownThinkingSuffix(rawSuffix string) bool {
+	if _, ok := ParseSpecialSuffix(rawSuffix); ok {
+		return true
+	}
+	if _, ok := ParseLevelSuffix(rawSuffix); ok {
+		return true
+	}
+	_, ok := ParseNumericSuffix(rawSuffix)
+	return ok
 }
 
 // ParseNumericSuffix attempts to parse a raw suffix as a numeric budget value.

@@ -1805,7 +1805,7 @@ func processH2SessionFrames(
 								ExecMsgId:  msg.ExecMsgId,
 								ExecId:     msg.ExecId,
 								ToolCallId: toolCallId,
-								ToolName:   msg.McpToolName,
+								ToolName:   helps.UnprefixCursorACPName(msg.McpToolName),
 								Args:       decodedArgs,
 								Kind:       cursorExecMCP,
 							}
@@ -2010,7 +2010,7 @@ func waitForCursorToolResults(
 						ExecMsgId:  msg.ExecMsgId,
 						ExecId:     msg.ExecId,
 						ToolCallId: toolCallID,
-						ToolName:   msg.McpToolName,
+						ToolName:   helps.UnprefixCursorACPName(msg.McpToolName),
 						Args:       decodedArgs,
 						Kind:       cursorExecMCP,
 					})
@@ -2302,7 +2302,7 @@ func bridgeCursorNativeExec(msg *cursorproto.DecodedServerMessage, tools []curso
 	if err != nil {
 		return pendingMcpExec{}, false
 	}
-	pending.ToolName = tool.Name
+	pending.ToolName = helps.UnprefixCursorACPName(tool.Name)
 	pending.Args = string(encodedArgs)
 	return pending, true
 }
@@ -2310,7 +2310,7 @@ func bridgeCursorNativeExec(msg *cursorproto.DecodedServerMessage, tools []curso
 func findCursorBridgeTool(tools []cursorproto.McpToolDef, aliases ...string) (cursorproto.McpToolDef, bool) {
 	for _, alias := range aliases {
 		for _, tool := range tools {
-			if strings.EqualFold(strings.TrimSpace(tool.Name), alias) {
+			if helps.CursorACPNameEquals(tool.Name, alias) {
 				return tool, true
 			}
 		}
@@ -2390,7 +2390,12 @@ func parseOpenAIRequest(payload []byte) *parsedOpenAIRequest {
 	}
 
 	// Extract turns, tool results, and last user message
-	var pendingUser string
+	var pendingUserParts []string
+	composePendingUser := func() string {
+		text := composeCursorCurrentUserText(pendingUserParts)
+		pendingUserParts = nil
+		return text
+	}
 	for _, msg := range messages {
 		role := msg.Get("role").String()
 		switch role {
@@ -2405,19 +2410,24 @@ func parseOpenAIRequest(payload []byte) *parsedOpenAIRequest {
 				IsError:           msg.Get("is_error").Bool(),
 			})
 		case "user":
-			if pendingUser != "" {
-				p.Turns = append(p.Turns, cursorproto.TurnData{UserText: pendingUser})
+			// Consecutive user messages without an assistant in between are one
+			// current request. Claude Code prepends/appends <system-reminder>
+			// user turns around the real prompt; treating those as completed
+			// turns leaves only the last reminder as UserText.
+			userImages := extractImages(msg.Get("content"))
+			if len(pendingUserParts) == 0 {
+				p.Images = userImages
+			} else {
+				p.Images = appendUniqueCursorImages(p.Images, userImages)
 			}
-			pendingUser = extractTextContent(msg.Get("content"))
-			p.Images = extractImages(msg.Get("content"))
+			pendingUserParts = append(pendingUserParts, extractTextContent(msg.Get("content")))
 		case "assistant":
 			assistantText := extractTextContent(msg.Get("content"))
-			if pendingUser != "" {
+			if pendingUser := composePendingUser(); pendingUser != "" {
 				p.Turns = append(p.Turns, cursorproto.TurnData{
 					UserText:      pendingUser,
 					AssistantText: assistantText,
 				})
-				pendingUser = ""
 			} else if len(p.Turns) > 0 && assistantText != "" {
 				// Assistant message after tool results (no pending user) —
 				// append to the last turn's assistant text to preserve context.
@@ -2431,7 +2441,7 @@ func parseOpenAIRequest(payload []byte) *parsedOpenAIRequest {
 		}
 	}
 
-	if pendingUser != "" {
+	if pendingUser := composePendingUser(); pendingUser != "" {
 		p.UserText = pendingUser
 	} else if len(p.Turns) > 0 && len(p.ToolResults) == 0 {
 		last := p.Turns[len(p.Turns)-1]
@@ -2614,7 +2624,7 @@ func cursorRequestHasTool(parsed *parsedOpenAIRequest, name string) bool {
 }
 
 func rejectCursorTeammateTaskOutput(toolName, args string) string {
-	if toolName != "TaskOutput" {
+	if !helps.CursorACPNameEquals(toolName, "TaskOutput") {
 		return ""
 	}
 	taskID := strings.TrimSpace(gjson.Get(args, "task_id").String())
@@ -2642,11 +2652,13 @@ func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 			toolResults[result.ToolCallId] = result
 		}
 	}
-	currentUserIndex := -1
+	currentRequestStart := len(parsed.Messages)
 	if parsed.UserText != "" {
+		currentRequestStart = 0
 		for index := len(parsed.Messages) - 1; index >= 0; index-- {
-			if parsed.Messages[index].Get("role").String() == "user" {
-				currentUserIndex = index
+			role := parsed.Messages[index].Get("role").String()
+			if role == "assistant" || role == "tool" {
+				currentRequestStart = index + 1
 				break
 			}
 		}
@@ -2658,7 +2670,7 @@ func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 		case "system":
 			continue
 		case "user":
-			if index == currentUserIndex {
+			if index >= currentRequestStart {
 				continue
 			}
 			appendCursorHistorySection(&buf, "USER", extractTextContent(message.Get("content")))
@@ -2739,6 +2751,44 @@ func truncateCursorHistoryText(content string) string {
 		cut--
 	}
 	return content[:cut] + "\n... [truncated]"
+}
+
+func composeCursorCurrentUserText(parts []string) string {
+	contextParts := make([]string, 0, len(parts))
+	taskParts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if isCursorContextOnlyUserText(part) {
+			contextParts = append(contextParts, part)
+			continue
+		}
+		taskParts = append(taskParts, part)
+	}
+	return strings.Join(append(contextParts, taskParts...), "\n\n")
+}
+
+func isCursorContextOnlyUserText(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	for trimmed != "" {
+		var endTag string
+		switch {
+		case strings.HasPrefix(trimmed, "<system-reminder>"):
+			endTag = "</system-reminder>"
+		case strings.HasPrefix(trimmed, "<project-instructions>"):
+			endTag = "</project-instructions>"
+		default:
+			return false
+		}
+		end := strings.Index(trimmed, endTag)
+		if end < 0 {
+			return false
+		}
+		trimmed = strings.TrimSpace(trimmed[end+len(endTag):])
+	}
+	return true
 }
 
 func extractTextContent(content gjson.Result) string {
@@ -2978,13 +3028,23 @@ func buildRunRequestParams(parsed *parsedOpenAIRequest, conversationId, upstream
 
 	switch parsed.ToolChoice.Mode {
 	case "", "auto":
+		originalNames := make([]string, 0, len(parsed.Tools))
 		for _, tool := range parsed.Tools {
 			fn := tool.Get("function")
+			originalName := fn.Get("name").String()
+			originalNames = append(originalNames, originalName)
 			params.McpTools = append(params.McpTools, cursorproto.McpToolDef{
-				Name:        fn.Get("name").String(),
-				Description: fn.Get("description").String(),
+				Name:        helps.PrefixCursorACPName(originalName),
+				Description: helps.AnnotateCursorACPDescription(originalName, fn.Get("description").String()),
 				InputSchema: json.RawMessage(fn.Get("parameters").Raw),
 			})
+		}
+		if instr := helps.CursorACPAliasInstruction(originalNames); instr != "" {
+			if params.SystemPrompt != "" {
+				params.SystemPrompt = instr + "\n\n" + params.SystemPrompt
+			} else {
+				params.SystemPrompt = instr
+			}
 		}
 		if len(params.McpTools) > 0 {
 			params.AgentMode = cursorproto.AgentModeAgent

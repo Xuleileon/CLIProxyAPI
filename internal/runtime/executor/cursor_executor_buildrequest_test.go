@@ -1,9 +1,11 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 
 	cursorproto "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor/proto"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 )
 
 func TestBuildRunRequestParams_ModelOverride(t *testing.T) {
@@ -71,6 +73,57 @@ func TestBuildRunRequestParams_ModelOverride(t *testing.T) {
 				t.Errorf("parsed.Model = %q, want %q", parsed.Model, tc.parsedModel)
 			}
 		})
+	}
+}
+
+func TestBuildRunRequestParams_PrefixesClaudeCodeToolNames(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{"model":"claude-sonnet-5-thinking-high","messages":[],"tools":[` +
+		`{"type":"function","function":{"name":"Agent","description":"spawn","parameters":{"type":"object"}}},` +
+		`{"type":"function","function":{"name":"Bash","description":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}},` +
+		`{"type":"function","function":{"name":"Read","description":"read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}},` +
+		`{"type":"function","function":{"name":"Write","description":"write","parameters":{"type":"object"}}},` +
+		`{"type":"function","function":{"name":"WebSearch","description":"search","parameters":{"type":"object"}}},` +
+		`{"type":"function","function":{"name":"Workflow","description":"workflow","parameters":{"type":"object"}}},` +
+		`{"type":"function","function":{"name":"Task","description":"spawn a subagent","parameters":{"type":"object"}}}` +
+		`]}`)
+	params, err := buildRunRequestParams(parseOpenAIRequest(payload), "conv-claude-code", "claude-sonnet-5-thinking-high")
+	if err != nil {
+		t.Fatalf("build params: %v", err)
+	}
+	if params.AgentMode != cursorproto.AgentModeAgent {
+		t.Fatalf("mode = %d, want agent", params.AgentMode)
+	}
+	if len(params.McpTools) != 7 {
+		t.Fatalf("tools = %d, want 7", len(params.McpTools))
+	}
+	want := map[string]string{
+		"acp_Agent":     "Agent",
+		"acp_Bash":      "Bash",
+		"acp_Read":      "Read",
+		"acp_Write":     "Write",
+		"acp_WebSearch": "WebSearch",
+		"acp_Workflow":  "Workflow",
+		"acp_Task":      "Task",
+	}
+	for _, tool := range params.McpTools {
+		client, ok := want[tool.Name]
+		if !ok {
+			t.Fatalf("unexpected upstream MCP name %q", tool.Name)
+		}
+		if got := helps.UnprefixCursorACPName(tool.Name); got != client {
+			t.Fatalf("client name for %q = %q, want %q", tool.Name, got, client)
+		}
+		if !strings.HasPrefix(tool.Description, "["+client+"]") {
+			t.Fatalf("description for %q missing [%s] tag: %s", tool.Name, client, tool.Description)
+		}
+	}
+	if !strings.Contains(params.SystemPrompt, "acp_Grep") {
+		t.Fatalf("system prompt missing Grep alias example: %s", params.SystemPrompt)
+	}
+	if strings.Contains(params.SystemPrompt, "Workflow →") {
+		t.Fatalf("system prompt listed per-tool mappings: %s", params.SystemPrompt)
 	}
 }
 

@@ -55,12 +55,12 @@ type KiroRateLimitConfig struct {
 	Enabled           *bool   `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	MinTokenInterval  string  `yaml:"min-token-interval,omitempty" json:"min-token-interval,omitempty"`
 	MaxTokenInterval  string  `yaml:"max-token-interval,omitempty" json:"max-token-interval,omitempty"`
-	DailyMaxRequests   int     `yaml:"daily-max-requests,omitempty" json:"daily-max-requests,omitempty"`
-	JitterPercent      float64 `yaml:"jitter-percent,omitempty" json:"jitter-percent,omitempty"`
-	BackoffBase        string  `yaml:"backoff-base,omitempty" json:"backoff-base,omitempty"`
-	BackoffMax         string  `yaml:"backoff-max,omitempty" json:"backoff-max,omitempty"`
-	BackoffMultiplier  float64 `yaml:"backoff-multiplier,omitempty" json:"backoff-multiplier,omitempty"`
-	SuspendCooldown    string  `yaml:"suspend-cooldown,omitempty" json:"suspend-cooldown,omitempty"`
+	DailyMaxRequests  int     `yaml:"daily-max-requests,omitempty" json:"daily-max-requests,omitempty"`
+	JitterPercent     float64 `yaml:"jitter-percent,omitempty" json:"jitter-percent,omitempty"`
+	BackoffBase       string  `yaml:"backoff-base,omitempty" json:"backoff-base,omitempty"`
+	BackoffMax        string  `yaml:"backoff-max,omitempty" json:"backoff-max,omitempty"`
+	BackoffMultiplier float64 `yaml:"backoff-multiplier,omitempty" json:"backoff-multiplier,omitempty"`
+	SuspendCooldown   string  `yaml:"suspend-cooldown,omitempty" json:"suspend-cooldown,omitempty"`
 }
 
 // SanitizeKiroKeys trims Kiro credential fields loaded from configuration.
