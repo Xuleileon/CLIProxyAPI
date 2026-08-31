@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,7 +27,11 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
-const defaultAPICallTimeout = 60 * time.Second
+const (
+	defaultAPICallTimeout      = 60 * time.Second
+	antigravityAPICallAttempts = 3
+	antigravityAPICallRetryGap = 250 * time.Millisecond
+)
 
 const (
 	geminiOAuthClientIDEnv = "CLIPROXY_GEMINI_OAUTH_CLIENT_ID"
@@ -243,7 +249,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 	httpClient.Transport = h.apiCallTransport(auth, requestProxyURL)
 
-	resp, errDo := httpClient.Do(req)
+	resp, errDo := doManagementAPICall(c.Request.Context(), httpClient, req, shouldRetryAntigravityAPICall(method, parsedURL))
 	if errDo != nil {
 		log.WithError(errDo).Debug("management APICall request failed")
 		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
@@ -293,6 +299,73 @@ func (h *Handler) APICall(c *gin.Context) {
 	} else {
 		c.JSON(http.StatusOK, response)
 	}
+}
+
+func shouldRetryAntigravityAPICall(method string, parsedURL *url.URL) bool {
+	if !strings.EqualFold(strings.TrimSpace(method), http.MethodPost) || parsedURL == nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsedURL.Hostname()))
+	if host != "cloudcode-pa.googleapis.com" && host != "daily-cloudcode-pa.googleapis.com" {
+		return false
+	}
+	path := strings.TrimSpace(parsedURL.EscapedPath())
+	return strings.HasSuffix(path, ":loadCodeAssist") || strings.HasSuffix(path, ":retrieveUserQuotaSummary")
+}
+
+func doManagementAPICall(ctx context.Context, client *http.Client, req *http.Request, allowRetry bool) (*http.Response, error) {
+	if !allowRetry {
+		return client.Do(req)
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= antigravityAPICallAttempts; attempt++ {
+		attemptReq := req
+		if attempt > 1 {
+			attemptReq = req.Clone(ctx)
+			if req.Body != nil && req.Body != http.NoBody {
+				if req.GetBody == nil {
+					return nil, lastErr
+				}
+				body, errBody := req.GetBody()
+				if errBody != nil {
+					return nil, errBody
+				}
+				attemptReq.Body = body
+			}
+		}
+
+		resp, errDo := client.Do(attemptReq)
+		if errDo == nil {
+			return resp, nil
+		}
+		lastErr = errDo
+		if attempt == antigravityAPICallAttempts || !retryableManagementAPICallError(errDo) {
+			return nil, errDo
+		}
+
+		timer := time.NewTimer(time.Duration(attempt) * antigravityAPICallRetryGap)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
+}
+
+func retryableManagementAPICallError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func firstNonEmptyString(values ...*string) string {
