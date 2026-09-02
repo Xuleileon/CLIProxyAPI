@@ -7,6 +7,7 @@ import (
 )
 
 const (
+	claudeBuiltinFable51ModelID   = "claude-fable-5-1"
 	codexBuiltinImage15ModelID    = "gpt-image-1.5"
 	codexBuiltinImageModelID      = "gpt-image-2"
 	xaiBuiltinImageModelID        = "grok-imagine-image"
@@ -36,7 +37,13 @@ type staticModelsJSON struct {
 
 // GetClaudeModels returns the standard Claude model definitions.
 func GetClaudeModels() []*ModelInfo {
-	return cloneModelInfos(getModels().Claude)
+	return WithClaudeBuiltins(cloneModelInfos(getModels().Claude))
+}
+
+// WithClaudeBuiltins injects Claude models that must remain available even
+// when the remote models.json catalog has not caught up with a new release.
+func WithClaudeBuiltins(models []*ModelInfo) []*ModelInfo {
+	return upsertModelInfos(models, claudeBuiltinFable51ModelInfo())
 }
 
 // GetGeminiModels returns the standard Gemini model definitions.
@@ -138,6 +145,23 @@ func normalizeAntigravityCapabilityModelID(modelID string) string {
 		modelID = strings.TrimSpace(modelID[:open])
 	}
 	return modelID
+}
+
+func claudeBuiltinFable51ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                        claudeBuiltinFable51ModelID,
+		Object:                    "model",
+		Created:                   1788220800, // 2026-09-01
+		OwnedBy:                   "anthropic",
+		Type:                      "claude",
+		DisplayName:               "Claude Fable 5.1",
+		Description:               "Anthropic's latest Fable model for reasoning and agentic work.",
+		ContextLength:             1000000,
+		MaxCompletionTokens:       128000,
+		Thinking:                  &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+		SupportedInputModalities:  []string{"text", "image"},
+		SupportedOutputModalities: []string{"text"},
+	}
 }
 
 func codexBuiltinImage15ModelInfo() *ModelInfo {

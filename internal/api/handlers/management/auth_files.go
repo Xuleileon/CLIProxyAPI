@@ -363,6 +363,7 @@ func (h *Handler) ServePluginAuthURL(c *gin.Context) bool {
 	return true
 }
 func (h *Handler) ListAuthFiles(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	if h == nil {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
@@ -440,8 +441,49 @@ func (h *Handler) lookupAuthFile(name string, authIndex string) (*coreauth.Auth,
 	return nil, false
 }
 
+// RefreshAuthFile synchronously refreshes one OAuth credential so the caller
+// receives the actual refresh result instead of merely scheduling background work.
+func (h *Handler) RefreshAuthFile(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name      string `json:"name"`
+		AuthIndex string `json:"auth_index"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	targetAuth, ok := h.lookupAuthFile(name, strings.TrimSpace(req.AuthIndex))
+	if !ok || targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	refreshed, errRefresh := h.authManager.RefreshAuth(c.Request.Context(), targetAuth.ID)
+	if errRefresh != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to refresh auth: %v", errRefresh)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":       "ok",
+		"name":         refreshed.FileName,
+		"provider":     refreshed.Provider,
+		"last_refresh": refreshed.LastRefreshedAt,
+	})
+}
+
 // GetAuthFileModels returns the models supported by a specific auth file
 func (h *Handler) GetAuthFileModels(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	name := c.Query("name")
 	if name == "" {
 		c.JSON(400, gin.H{"error": "name is required"})

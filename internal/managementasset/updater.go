@@ -262,6 +262,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			// Upstream panel may still lack Plus-only provider UI.
 			ensureCursorOAuthOnDisk(localPath)
 			EnsureOpenCodeGoOnDisk(localPath)
+			EnsureAuthRefreshOnDisk(localPath)
 			return nil, nil
 		}
 
@@ -285,6 +286,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 		data = patchManagementHTMLForCursorOAuth(data)
 		data = patchManagementHTMLForOpenCodeGo(data)
+		data = patchManagementHTMLForAuthRefresh(data)
 		if err = atomicWriteFile(localPath, data); err != nil {
 			log.WithError(err).Warn("failed to update management asset on disk")
 			return nil, nil
@@ -297,6 +299,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 	if _, err := os.Stat(localPath); err == nil {
 		ensureCursorOAuthOnDisk(localPath)
 		EnsureOpenCodeGoOnDisk(localPath)
+		EnsureAuthRefreshOnDisk(localPath)
 		return true
 	}
 	return false
@@ -314,6 +317,7 @@ func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, loca
 
 	data = patchManagementHTMLForCursorOAuth(data)
 	data = patchManagementHTMLForOpenCodeGo(data)
+	data = patchManagementHTMLForAuthRefresh(data)
 	if err = atomicWriteFile(localPath, data); err != nil {
 		log.WithError(err).Warn("failed to persist fallback management control panel page")
 		return false

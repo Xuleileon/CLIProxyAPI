@@ -38,6 +38,35 @@ func TestGeminiVertexModelsUseFlashLiteReleaseID(t *testing.T) {
 	t.Fatalf("Vertex models do not contain %q", releaseID)
 }
 
+func TestWithClaudeBuiltinsIncludesFable51(t *testing.T) {
+	models := WithClaudeBuiltins(nil)
+	for _, model := range models {
+		if model == nil || model.ID != claudeBuiltinFable51ModelID {
+			continue
+		}
+		if model.Created != 1788220800 {
+			t.Fatalf("created = %d, want 1788220800 (2026-09-01)", model.Created)
+		}
+		if model.ContextLength != 1000000 || model.MaxCompletionTokens != 128000 {
+			t.Fatalf("limits = (%d, %d), want (1000000, 128000)", model.ContextLength, model.MaxCompletionTokens)
+		}
+		if model.Thinking == nil || model.Thinking.ZeroAllowed || !containsString(model.Thinking.Levels, "max") {
+			t.Fatalf("thinking = %+v, want always-on effort levels through max", model.Thinking)
+		}
+		return
+	}
+	t.Fatalf("expected Claude builtin model %s", claudeBuiltinFable51ModelID)
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestWithXAIBuiltinsIncludesImage20(t *testing.T) {
 	models := WithXAIBuiltins(nil)
 	for _, model := range models {

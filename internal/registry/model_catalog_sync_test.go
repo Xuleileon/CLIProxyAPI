@@ -12,6 +12,7 @@ func TestSelectedSyncBaseline(t *testing.T) {
 	}
 	selected := []entry{
 		{"claude", "claude-opus-5"},
+		{"claude", "claude-fable-5-1"},
 		{"xai", "grok-4.6"},
 		{"gemini", "gemini-3.5-flash-lite"},
 		{"gemini", "gemini-3.6-flash"},
