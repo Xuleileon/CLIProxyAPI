@@ -15,6 +15,10 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
+// OpenCodeGoUserAgent identifies the subscription adapter without exposing the
+// host application, its build, or machine information.
+const OpenCodeGoUserAgent = "GoSubscriptionClient/1.0"
+
 // ApplyOpenCodeGoSessionHeader preserves configured session headers, then client
 // headers, and otherwise maps the existing conversation identity to an opaque ID.
 // Call after applying custom headers and before logging or sending the request.

@@ -252,7 +252,7 @@ func (e *OpenCodeGoExecutor) preparePayload(payload, original []byte, req clipro
 
 func (e *OpenCodeGoExecutor) applyHeaders(req *http.Request, auth *cliproxyauth.Auth, anthropic bool, clientHeaders ...http.Header) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "cli-proxy-opencode-go")
+	req.Header.Set("User-Agent", helps.OpenCodeGoUserAgent)
 	_, apiKey := openCodeGoCredentials(auth)
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)

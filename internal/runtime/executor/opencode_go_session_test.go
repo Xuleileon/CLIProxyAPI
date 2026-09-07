@@ -93,9 +93,17 @@ func TestOpenCodeGoSessionOnWire(t *testing.T) {
 					t.Fatalf("configured session = %q", got)
 				}
 				for _, h := range headers {
+					if h.Get("User-Agent") != "GoSubscriptionClient/1.0" {
+						t.Errorf("unexpected adapter user agent: %q", h.Get("User-Agent"))
+					}
 					if h.Get("X-Opencode-Client") != "" || h.Get("X-Opencode-Project") != "" {
 						t.Fatal("unexpected client/project attribution")
 					}
+				}
+				auth.Attributes["header:User-Agent"] = "custom-client"
+				call(protocol.first, false)
+				if headers[6].Get("User-Agent") != "custom-client" {
+					t.Fatal("configured user agent was replaced")
 				}
 			})
 		}

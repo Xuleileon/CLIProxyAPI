@@ -57,6 +57,9 @@ func (e *OpenAICompatExecutor) PrepareRequest(req *http.Request, auth *cliproxya
 	if req == nil {
 		return nil
 	}
+	if e.provider == "opencode-go" {
+		req.Header.Set("User-Agent", helps.OpenCodeGoUserAgent)
+	}
 	_, apiKey := e.resolveCredentials(auth)
 	if strings.TrimSpace(apiKey) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -156,6 +159,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	if e.provider == "opencode-go" {
+		httpReq.Header.Set("User-Agent", helps.OpenCodeGoUserAgent)
+	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -253,6 +259,9 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	if e.provider == "opencode-go" {
+		httpReq.Header.Set("User-Agent", helps.OpenCodeGoUserAgent)
+	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -374,6 +383,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	if e.provider == "opencode-go" {
+		httpReq.Header.Set("User-Agent", helps.OpenCodeGoUserAgent)
+	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -616,6 +628,9 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	if e.provider == "opencode-go" {
+		httpReq.Header.Set("User-Agent", helps.OpenCodeGoUserAgent)
+	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
