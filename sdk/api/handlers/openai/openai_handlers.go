@@ -7,6 +7,7 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	codexconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/openai/chat-completions"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
+	responsesrequest "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/responses/openai/chat-completions"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -141,7 +143,7 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		if shouldTreatAsResponsesFormat(rawJSON) {
 			// Already responses-style payload; no conversion needed.
 		} else {
-			rawJSON = codexconverter.ConvertOpenAIRequestToCodex(modelName, rawJSON, stream)
+			rawJSON = responsesrequest.ConvertOpenAIRequestToResponses(modelName, rawJSON, stream)
 		}
 		stream = gjson.GetBytes(rawJSON, "stream").Bool()
 		if stream {
@@ -313,26 +315,41 @@ func wrapResponsesPayloadAsCompleted(payload []byte) []byte {
 	return []byte(wrapped)
 }
 
+type responsesChatStreamState struct {
+	frames      sseFrameAccumulator
+	translation any
+}
+
 func writeConvertedResponsesChunk(c *gin.Context, ctx context.Context, modelName string, originalChatJSON, responsesRequestJSON, chunk []byte, param *any) {
-	outputs := codexconverter.ConvertCodexResponseToOpenAI(ctx, modelName, originalChatJSON, responsesRequestJSON, chunk, param)
-	for _, out := range outputs {
-		if len(out) == 0 {
+	if *param == nil {
+		*param = &responsesChatStreamState{}
+	}
+	state := (*param).(*responsesChatStreamState)
+	for _, frame := range state.frames.AddChunk(chunk) {
+		var data [][]byte
+		for _, line := range bytes.Split(frame, []byte("\n")) {
+			if bytes.HasPrefix(line, []byte("data:")) {
+				data = append(data, bytes.TrimSpace(line[5:]))
+			}
+		}
+		if len(data) == 0 {
 			continue
 		}
-		_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", out)
+		payload := append([]byte("data: "), bytes.Join(data, []byte("\n"))...)
+		outputs := codexconverter.ConvertCodexResponseToOpenAI(ctx, modelName, originalChatJSON, responsesRequestJSON, payload, &state.translation)
+		for _, out := range outputs {
+			if len(out) == 0 {
+				continue
+			}
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", out)
+		}
 	}
 }
 
 func (h *OpenAIAPIHandler) forwardResponsesAsChatStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, ctx context.Context, modelName string, originalChatJSON, responsesRequestJSON []byte, param *any) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
-			outputs := codexconverter.ConvertCodexResponseToOpenAI(ctx, modelName, originalChatJSON, responsesRequestJSON, chunk, param)
-			for _, out := range outputs {
-				if len(out) == 0 {
-					continue
-				}
-				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", out)
-			}
+			writeConvertedResponsesChunk(c, ctx, modelName, originalChatJSON, responsesRequestJSON, chunk, param)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {

@@ -855,7 +855,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							backoffLevel := state.Quota.BackoffLevel
 							if !disableCooling {
 								if result.RetryAfter != nil {
-									next = now.Add(max(*result.RetryAfter, minQuotaCooldownFloor))
+									next = now.Add(quotaRetryDelay(auth, *result.RetryAfter))
 								} else {
 									next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
 								}
@@ -908,6 +908,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								state.NextRetryAfter = time.Time{}
 							} else if transientErrorCooldownConfigured() {
 								state.NextRetryAfter = nextTransientErrorRetryAfter(now)
+							} else if auth.Provider == "opencode-go" && result.RetryAfter != nil {
+								state.NextRetryAfter = now.Add(max(*result.RetryAfter, 2*time.Second))
 							} else {
 								state.NextRetryAfter, state.Quota.BackoffLevel = transientCooldownAfterFailure(
 									state.NextRetryAfter, state.Quota.BackoffLevel, now,
@@ -1925,7 +1927,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		var next time.Time
 		if !disableCooling {
 			if retryAfter != nil {
-				next = now.Add(max(*retryAfter, minQuotaCooldownFloor))
+				next = now.Add(quotaRetryDelay(auth, *retryAfter))
 			} else {
 				next, auth.Quota.BackoffLevel = quotaCooldownAfterFailure(auth.Quota, now)
 			}
@@ -1941,6 +1943,8 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = time.Time{}
 		} else if transientErrorCooldownConfigured() {
 			auth.NextRetryAfter = nextTransientErrorRetryAfter(now)
+		} else if auth.Provider == "opencode-go" && retryAfter != nil {
+			auth.NextRetryAfter = now.Add(max(*retryAfter, 2*time.Second))
 		} else {
 			auth.NextRetryAfter, auth.Quota.BackoffLevel = transientCooldownAfterFailure(
 				auth.NextRetryAfter, auth.Quota.BackoffLevel, now,
@@ -1961,6 +1965,15 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 }
 
 const minQuotaCooldownFloor = 10 * time.Second
+
+// OpenCode Go uses short transient rate limits as well as subscription limits.
+// Its executor preserves Retry-After or supplies the native client's fallback.
+func quotaRetryDelay(auth *Auth, delay time.Duration) time.Duration {
+	if auth != nil && auth.Provider == "opencode-go" {
+		return max(delay, 2*time.Second)
+	}
+	return max(delay, minQuotaCooldownFloor)
+}
 
 // quotaCooldownAfterFailure returns the recovery deadline and backoff level for
 // a quota failure observed at now. Failures that land while a previous quota

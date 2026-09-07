@@ -19,6 +19,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -112,7 +113,7 @@ func (e *OpenCodeGoExecutor) executeNative(ctx context.Context, auth *cliproxyau
 	httpResp, errHTTP := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
 	if errHTTP != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errHTTP)
-		return resp, errHTTP
+		return resp, helps.OpenCodeGoConnectionError(errHTTP)
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -126,7 +127,7 @@ func (e *OpenCodeGoExecutor) executeNative(ctx context.Context, auth *cliproxyau
 		return resp, errRead
 	}
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(body)}
+		return resp, statusErr{code: httpResp.StatusCode, msg: string(body), retryAfter: helps.OpenCodeGoRetryAfter(httpResp.Header, httpResp.StatusCode, body)}
 	}
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, body, &param)
@@ -162,21 +163,21 @@ func (e *OpenCodeGoExecutor) executeNativeStream(ctx context.Context, auth *clip
 	httpResp, errHTTP := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
 	if errHTTP != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errHTTP)
-		return nil, errHTTP
+		return nil, helps.OpenCodeGoConnectionError(errHTTP)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		body, _ := io.ReadAll(httpResp.Body)
 		_ = httpResp.Body.Close()
 		helps.AppendAPIResponseChunk(ctx, e.cfg, body)
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(body)}
+		return nil, statusErr{code: httpResp.StatusCode, msg: string(body), retryAfter: helps.OpenCodeGoRetryAfter(httpResp.Header, httpResp.StatusCode, body)}
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
-	go e.translateStream(ctx, httpResp.Body, out, to, responseFormat, req, opts, translated)
+	go e.translateStream(ctx, httpResp.Body, httpResp.Header.Clone(), out, to, responseFormat, req, opts, translated)
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 
-func (e *OpenCodeGoExecutor) translateStream(ctx context.Context, body io.ReadCloser, out chan<- cliproxyexecutor.StreamChunk, from, to sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated []byte) {
+func (e *OpenCodeGoExecutor) translateStream(ctx context.Context, body io.ReadCloser, headers http.Header, out chan<- cliproxyexecutor.StreamChunk, from, to sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, translated []byte) {
 	defer close(out)
 	defer func() {
 		if errClose := body.Close(); errClose != nil {
@@ -187,6 +188,7 @@ func (e *OpenCodeGoExecutor) translateStream(ctx context.Context, body io.ReadCl
 	scanner.Buffer(nil, 52_428_800)
 	var param any
 	var nativeEvent bytes.Buffer
+	terminal := false
 	flushNative := func() bool {
 		if nativeEvent.Len() == 0 {
 			return true
@@ -203,10 +205,30 @@ func (e *OpenCodeGoExecutor) translateStream(ctx context.Context, body io.ReadCl
 	for scanner.Scan() {
 		line := bytes.Clone(scanner.Bytes())
 		helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+		if bytes.HasPrefix(line, []byte("data:")) {
+			payload := bytes.TrimSpace(line[len("data:"):])
+			switch gjson.GetBytes(payload, "type").String() {
+			case "response.completed", "response.incomplete", "message_stop":
+				terminal = true
+			}
+			if streamErr, ok := openAICompatStreamDataError(payload, ""); ok {
+				streamErr.retryAfter = helps.OpenCodeGoRetryAfter(headers, streamErr.code, payload)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+				case <-ctx.Done():
+				}
+				return
+			}
+		}
 		if from == to {
 			nativeEvent.Write(line)
 			nativeEvent.WriteByte('\n')
 			if len(bytes.TrimSpace(line)) == 0 && !flushNative() {
+				return
+			}
+			if terminal {
+				nativeEvent.WriteByte('\n')
+				flushNative()
 				return
 			}
 			continue
@@ -217,6 +239,9 @@ func (e *OpenCodeGoExecutor) translateStream(ctx context.Context, body io.ReadCl
 			case <-ctx.Done():
 				return
 			}
+		}
+		if terminal {
+			return
 		}
 	}
 	if from == to && !flushNative() {
