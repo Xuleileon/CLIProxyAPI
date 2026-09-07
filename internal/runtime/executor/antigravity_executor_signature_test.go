@@ -326,11 +326,33 @@ func TestAntigravityExecutorCountTokensReconstructsCompactedClaudeToolCall(t *te
 	}
 }
 
-func TestNormalizeAntigravityGeminiFunctionResponseRolesLeavesMixedUserContent(t *testing.T) {
-	payload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"functionResponse":{"name":"run","response":{"result":"ok"}}},{"text":"user follow-up"}]}]}}`)
+func TestNormalizeAntigravityGeminiFunctionResponseRolesOrdersMixedParallelResponses(t *testing.T) {
+	payload := []byte(`{"request":{"contents":[{"role":"model","parts":[{"functionCall":{"id":"call-1","name":"read","args":{"file":"one"}}},{"functionCall":{"id":"call-2","name":"read","args":{"file":"two"}}}]},{"role":"user","parts":[{"text":"results follow"},{"functionResponse":{"id":"call-2","name":"read","response":{"result":"two"}}},{"text":"continue"},{"functionResponse":{"id":"call-1","name":"read","response":{"result":"one"}}}]}]}}`)
+	if errValidate := internalsignature.ValidateGeminiFunctionCallPairing(payload); errValidate == nil {
+		t.Fatal("permuted input unexpectedly passed function call pairing validation")
+	}
 	output := normalizeAntigravityGeminiFunctionResponseRoles(payload)
-	if got := gjson.GetBytes(output, "request.contents.0.role").String(); got != "user" {
+	if got := gjson.GetBytes(output, "request.contents.1.role").String(); got != "user" {
 		t.Fatalf("mixed functionResponse/user content role = %q, want user; output=%s", got, output)
+	}
+	parts := gjson.GetBytes(output, "request.contents.1.parts").Array()
+	if len(parts) != 4 {
+		t.Fatalf("mixed response parts = %d, want 4; output=%s", len(parts), output)
+	}
+	if got := parts[0].Get("functionResponse.id").String(); got != "call-1" {
+		t.Fatalf("first functionResponse.id = %q, want call-1; output=%s", got, output)
+	}
+	if got := parts[1].Get("functionResponse.id").String(); got != "call-2" {
+		t.Fatalf("second functionResponse.id = %q, want call-2; output=%s", got, output)
+	}
+	if got := parts[2].Get("text").String(); got != "results follow" {
+		t.Fatalf("first trailing text = %q; output=%s", got, output)
+	}
+	if got := parts[3].Get("text").String(); got != "continue" {
+		t.Fatalf("second trailing text = %q; output=%s", got, output)
+	}
+	if errValidate := internalsignature.ValidateGeminiFunctionCallPairing(output); errValidate != nil {
+		t.Fatalf("normalized mixed parallel responses are invalid: %v; output=%s", errValidate, output)
 	}
 }
 

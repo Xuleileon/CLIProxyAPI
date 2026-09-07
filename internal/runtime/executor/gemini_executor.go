@@ -315,7 +315,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	})
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
+	httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -347,6 +347,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var param any
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			helps.ObserveGeminiTokenEvent(reporter, line)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			filtered := helps.FilterSSEUsageMetadata(line)
 			payload := helps.JSONPayload(filtered)
@@ -512,7 +513,7 @@ func (e *GeminiExecutor) executeInteractionsStream(ctx context.Context, auth *cl
 		AuthValue: authValue,
 	})
 
-	httpClient := reporter.TrackHTTPClient(helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0))
+	httpClient := reporter.TrackHTTPClientRoundTripOnly(helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0))
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
@@ -590,6 +591,7 @@ func (e *GeminiExecutor) executeInteractionsStream(ctx context.Context, auth *cl
 		}
 		for scanner.Scan() {
 			line := bytes.Clone(scanner.Bytes())
+			helps.ObserveGeminiTokenEvent(reporter, line)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			trimmed := bytes.TrimSpace(line)
 			if len(trimmed) == 0 {

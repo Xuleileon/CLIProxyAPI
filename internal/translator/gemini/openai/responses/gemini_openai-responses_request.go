@@ -58,6 +58,8 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 			normalized = reorderOpenAIResponsesDetachedReasoning(normalized)
 		}
 		consumedFunctionOutputIndexes := make(map[int]bool)
+		hasEncounteredConversation := false
+		var pendingDeveloperParts [][]byte
 		for i := 0; i < len(normalized); i++ {
 			if consumedFunctionOutputIndexes[i] {
 				continue
@@ -72,25 +74,59 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 			switch itemType {
 			case "message":
 				if strings.EqualFold(itemRole, "system") || strings.EqualFold(itemRole, "developer") {
-					pendingFunctionCallIDs = nil
+					if !hasEncounteredConversation {
+						pendingFunctionCallIDs = nil
+						if contentArray := item.Get("content"); contentArray.Exists() {
+							if contentArray.IsArray() {
+								contentArray.ForEach(func(_, contentItem gjson.Result) bool {
+									part := []byte(`{"text":""}`)
+									part, _ = sjson.SetBytes(part, "text", contentItem.Get("text").String())
+									systemParts = append(systemParts, part)
+									return true
+								})
+							} else if contentArray.Type == gjson.String {
+								part := []byte(`{"text":""}`)
+								part, _ = sjson.SetBytes(part, "text", contentArray.String())
+								systemParts = append(systemParts, part)
+							}
+						}
+						continue
+					}
+
+					var devParts [][]byte
 					if contentArray := item.Get("content"); contentArray.Exists() {
 						if contentArray.IsArray() {
 							contentArray.ForEach(func(_, contentItem gjson.Result) bool {
-								part := []byte(`{"text":""}`)
-								part, _ = sjson.SetBytes(part, "text", contentItem.Get("text").String())
-								systemParts = append(systemParts, part)
+								text := contentItem.Get("text").String()
+								if text != "" {
+									part := []byte(`{"text":""}`)
+									part, _ = sjson.SetBytes(part, "text", text)
+									devParts = append(devParts, part)
+								}
 								return true
 							})
-						} else if contentArray.Type == gjson.String {
+						} else if contentArray.Type == gjson.String && contentArray.String() != "" {
 							part := []byte(`{"text":""}`)
 							part, _ = sjson.SetBytes(part, "text", contentArray.String())
-							systemParts = append(systemParts, part)
+							devParts = append(devParts, part)
+						}
+					}
+					if len(devParts) > 0 {
+						if len(pendingFunctionCallIDs) > 0 {
+							pendingDeveloperParts = append(pendingDeveloperParts, devParts...)
+						} else {
+							contentItems = append(contentItems, geminiContent("user", devParts))
 						}
 					}
 					continue
 				}
 
+				hasEncounteredConversation = true
 				if _, isAssistantOutput := openAIResponsesAssistantVisibleText(item); !isAssistantOutput {
+					if len(pendingDeveloperParts) > 0 {
+						contentItems = append(contentItems, geminiContent("user", pendingDeveloperParts))
+						pendingDeveloperParts = nil
+					}
 					pendingFunctionCallIDs = nil
 				}
 
@@ -212,6 +248,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				}
 
 			case "function_call":
+				hasEncounteredConversation = true
 				signature := geminiResponsesThoughtSignature
 				if rawSignature := strings.TrimSpace(item.Get("_cpa_reasoning_signature").String()); rawSignature != "" {
 					signature = openAIResponsesGeminiThoughtSignature(rawSignature)
@@ -228,6 +265,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				}
 
 			case "function_call_output":
+				hasEncounteredConversation = true
 				orderedOutputs, consumedIndexes, remainingPending := collectOpenAIResponsesFunctionCallOutputs(normalized, i, pendingFunctionCallIDs)
 				pendingFunctionCallIDs = remainingPending
 				for consumedIndex := range consumedIndexes {
@@ -240,8 +278,13 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				if len(responseParts) > 0 {
 					contentItems = append(contentItems, geminiContent("user", responseParts))
 				}
+				if len(pendingFunctionCallIDs) == 0 && len(pendingDeveloperParts) > 0 {
+					contentItems = append(contentItems, geminiContent("user", pendingDeveloperParts))
+					pendingDeveloperParts = nil
+				}
 
 			case "reasoning":
+				hasEncounteredConversation = true
 				thoughtText := item.Get("summary.0.text").String()
 				rawSignature := item.Get("encrypted_content").String()
 				carrierDirection := geminiResponsesCarrierDirection(item)
@@ -278,7 +321,12 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				}
 			}
 		}
+		if len(pendingDeveloperParts) > 0 {
+			contentItems = append(contentItems, geminiContent("user", pendingDeveloperParts))
+			pendingDeveloperParts = nil
+		}
 		contentItems = coalesceAdjacentOpenAIResponsesModelContents(contentItems)
+		contentItems = translatorcommon.MergeAdjacentGeminiUserContents(contentItems)
 		out = translatorcommon.SetRawArrayItems(out, "contents", contentItems)
 	} else if input.Exists() && input.Type == gjson.String {
 		// Simple string input conversion to user message.

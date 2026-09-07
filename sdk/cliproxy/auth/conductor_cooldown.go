@@ -296,7 +296,7 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
 
 	if m.scheduler != nil {
 		for _, snapshot := range snapshots {
-			m.scheduler.upsertAuth(snapshot)
+			m.RefreshSchedulerEntry(snapshot.ID)
 		}
 	}
 	return len(snapshots) > 0
@@ -351,7 +351,7 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 
 	if m.scheduler != nil {
 		for _, snapshot := range snapshotsByID {
-			m.scheduler.upsertAuth(snapshot)
+			m.RefreshSchedulerEntry(snapshot.ID)
 		}
 	}
 	m.persistCooldownStates(ctx)
@@ -528,7 +528,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		registry.GetGlobalRegistry().ResumeClientModel(authID, modelKey)
 	}
 	if m.scheduler != nil && snapshot != nil {
-		m.scheduler.upsertAuth(snapshot)
+		m.RefreshSchedulerEntry(snapshot.ID)
 	}
 	if snapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(ctx)
@@ -744,6 +744,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		auth.Generation++
 		now := time.Now()
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil
@@ -854,7 +855,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							backoffLevel := state.Quota.BackoffLevel
 							if !disableCooling {
 								if result.RetryAfter != nil {
-									next = now.Add(*result.RetryAfter)
+									next = now.Add(max(*result.RetryAfter, minQuotaCooldownFloor))
 								} else {
 									next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
 								}
@@ -949,7 +950,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
-		m.scheduler.upsertAuth(authSnapshot)
+		m.RefreshSchedulerEntry(authSnapshot.ID)
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
@@ -1924,7 +1925,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		var next time.Time
 		if !disableCooling {
 			if retryAfter != nil {
-				next = now.Add(*retryAfter)
+				next = now.Add(max(*retryAfter, minQuotaCooldownFloor))
 			} else {
 				next, auth.Quota.BackoffLevel = quotaCooldownAfterFailure(auth.Quota, now)
 			}
@@ -1958,6 +1959,8 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Unavailable = true
 	}
 }
+
+const minQuotaCooldownFloor = 10 * time.Second
 
 // quotaCooldownAfterFailure returns the recovery deadline and backoff level for
 // a quota failure observed at now. Failures that land while a previous quota

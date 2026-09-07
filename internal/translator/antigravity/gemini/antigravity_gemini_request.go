@@ -69,7 +69,9 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			role := value.Get("role").String()
 			content := []byte(value.Raw)
 			if role != "user" && role != "model" {
-				if previousRole == "" || previousRole == "model" {
+				if value.Get("parts.#.functionResponse").Exists() || value.Get("parts.#.function_response").Exists() {
+					role = "user"
+				} else if previousRole == "" || previousRole == "model" {
 					role = "user"
 				} else {
 					role = "model"

@@ -415,7 +415,7 @@ func TestResponsesHandlerRejectsStreamClosedBeforeFirstPayload(t *testing.T) {
 	if recorder.Code == http.StatusOK {
 		t.Fatalf("empty upstream stream returned HTTP 200: %q", recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), "closed before first payload") {
+	if !strings.Contains(recorder.Body.String(), "empty_completion") {
 		t.Fatalf("empty upstream stream error is unclear: status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 }

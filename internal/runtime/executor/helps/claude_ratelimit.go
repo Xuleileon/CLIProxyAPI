@@ -36,7 +36,7 @@ func ClaudeHeadersIndicateUnifiedRateLimitRejection(headers http.Header) bool {
 		return false
 	}
 	status7dOI := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status")))
-	fableOnlyRejection := status5h == "allowed" && status7d == "allowed" && status7dOI == "rejected"
+	fableOnlyRejection := isClaudeWindowAllowed(status5h) && isClaudeWindowAllowed(status7d) && status7dOI == "rejected"
 	return !fableOnlyRejection
 }
 
@@ -113,7 +113,7 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 
 	// 5. Unified reset header:
 	unifiedRejected := unifiedStatus == "rejected" || status5h == "rejected" || status7d == "rejected" || status7dOI == "rejected" ||
-		(unifiedStatus == "" && status5h != "allowed" && status7d != "allowed")
+		(unifiedStatus == "" && !isClaudeWindowAllowed(status5h) && !isClaudeWindowAllowed(status7d))
 
 	if unifiedRejected {
 		if raw := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-Reset"); raw != "" {
@@ -242,4 +242,8 @@ func randomClaudeFuzzDuration(minSec, maxSec int) time.Duration {
 		return time.Duration(minSec) * time.Second
 	}
 	return time.Duration(minSec+int(nBig.Int64())) * time.Second
+}
+
+func isClaudeWindowAllowed(status string) bool {
+	return status == "allowed" || status == "allowed_warning"
 }

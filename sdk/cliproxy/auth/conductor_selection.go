@@ -108,7 +108,13 @@ func (m *Manager) syncScheduler() {
 	if m == nil || m.scheduler == nil {
 		return
 	}
-	m.syncSchedulerFromSnapshot(m.snapshotAuths())
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	auths := make([]*Auth, 0, len(m.auths))
+	for _, auth := range m.auths {
+		auths = append(auths, auth.Clone())
+	}
+	m.syncSchedulerFromSnapshot(auths)
 }
 
 func (m *Manager) snapshotAuths() []*Auth {
@@ -137,8 +143,8 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 		return
 	}
 	snapshot := auth.Clone()
-	m.mu.RUnlock()
 	m.scheduler.upsertAuth(snapshot)
+	m.mu.RUnlock()
 }
 
 // RefreshSchedulerAll rebuilds scheduler entries for every known auth.
@@ -231,7 +237,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	m.mu.Unlock()
 
 	if m.scheduler != nil && snapshot != nil {
-		m.scheduler.upsertAuth(snapshot)
+		m.RefreshSchedulerEntry(snapshot.ID)
 	}
 }
 
@@ -395,6 +401,19 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 		return ""
 	}
 	return routeModel
+}
+
+func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
+	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
+	if !isBuiltInSelector(selector) {
+		if _, affinity := selector.(*SessionAffinitySelector); !affinity {
+			return ctx
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, prevalidatedAuthCandidatesKey{}, true)
 }
 
 func restoreModelCooldownErrorModel(err error, requestedModel string) error {
@@ -1087,7 +1106,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, errPick
 	}
 	if !handled {
-		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
+		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
 			if isBuiltInSelector(selector) {
@@ -1414,7 +1433,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", errPick
 	}
 	if !handled {
-		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
+		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
 			if isBuiltInSelector(selector) {

@@ -45,6 +45,9 @@ func GetRequestInfo(ctx context.Context) *RequestInfo {
 
 // Auth encapsulates the runtime state and metadata associated with a single credential.
 type Auth struct {
+	// RegistrationEpoch and Generation order runtime snapshots; neither is persisted.
+	RegistrationEpoch uint64 `json:"-"`
+	Generation        uint64 `json:"-"`
 	// ID uniquely identifies the auth record across restarts.
 	ID string `json:"id"`
 	// Index is a stable runtime identifier derived from auth metadata (not persisted).

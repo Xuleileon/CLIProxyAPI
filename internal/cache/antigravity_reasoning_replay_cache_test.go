@@ -264,6 +264,11 @@ func TestAntigravityReasoningReplayUnrelatedEvictionDoesNotBlockAbsentSnapshot(t
 		t.Fatalf("initial absent snapshot = found %v, err %v", found, errGet)
 	}
 	antigravityReasoningReplayMu.Lock()
+	// Make eviction order explicit even when the platform clock gives both writes the same timestamp.
+	key := antigravityReasoningReplayCacheKey(model, "older-live-entry")
+	entry := antigravityReasoningReplayEntries[key]
+	entry.Timestamp = time.Now().Add(-time.Minute)
+	antigravityReasoningReplayEntries[key] = entry
 	evictOldestAntigravityReasoningReplayEntries(1)
 	antigravityReasoningReplayMu.Unlock()
 	firstItem := antigravityReplayTestItem("first-write-after-unrelated-eviction-123456")

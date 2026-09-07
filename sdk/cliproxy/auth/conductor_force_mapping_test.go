@@ -35,6 +35,7 @@ func (e *forceMappingExecutor) ExecuteStream(_ context.Context, _ *Auth, req cli
 	e.streamModels = append(e.streamModels, req.Model)
 	e.mu.Unlock()
 	chunks := forceMappingStreamUpstreamChunks(e.id, req.Model)
+	chunks = append(chunks, []byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`+"\n\n"))
 	ch := make(chan cliproxyexecutor.StreamChunk, len(chunks))
 	for _, chunk := range chunks {
 		ch <- cliproxyexecutor.StreamChunk{Payload: chunk}

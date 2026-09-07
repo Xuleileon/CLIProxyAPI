@@ -415,7 +415,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	})
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
+	httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -524,6 +524,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	scanLoop:
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			helps.ObserveChatTokenEvent(reporter, line)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			streamUsage.ObserveOpenAIStream(line)
 			trimmedLine := bytes.TrimSpace(line)
@@ -1041,9 +1042,10 @@ func openAICompatStreamDataError(payload []byte, eventName string) (statusErr, b
 }
 
 type statusErr struct {
-	code       int
-	msg        string
-	retryAfter *time.Duration
+	code             int
+	msg              string
+	retryAfter       *time.Duration
+	credentialScoped bool
 }
 
 func (e statusErr) Error() string {
@@ -1054,3 +1056,4 @@ func (e statusErr) Error() string {
 }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
+func (e statusErr) IsCredentialScoped() bool   { return e.credentialScoped }

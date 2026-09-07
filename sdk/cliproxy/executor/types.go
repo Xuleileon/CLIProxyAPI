@@ -227,3 +227,13 @@ type RequestScopedError interface {
 	error
 	IsRequestScoped() bool
 }
+
+const (
+	LCPFingerprintMetadataKey       = "lcp_fingerprints"
+	LCPMinPrefixLengthMetadataKey   = "lcp_min_prefix_length"
+	LCPAffinitySessionIDMetadataKey = "lcp_affinity_session_id"
+	CanonicalSessionIDMetadataKey   = "canonical_session_id"
+	ParentSessionIDMetadataKey      = "parent_session_id"
+	LCPAccessGenerationMetadataKey  = "lcp_access_generation"
+	IsForkMetadataKey               = "is_fork"
+)

@@ -314,7 +314,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	}
 
 	httpClient := newHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
+	httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)
 
 	var authID, authLabel, authType, authValue string
@@ -413,6 +413,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 				var param any
 				for scanner.Scan() {
 					line := scanner.Bytes()
+					helps.ObserveGeminiTokenEvent(reporter, line)
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 					if detail, ok := helps.ParseGeminiCLIStreamUsage(line); ok {
 						reporter.Publish(ctx, detail)

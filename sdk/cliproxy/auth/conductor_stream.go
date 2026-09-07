@@ -81,11 +81,13 @@ func validateStreamResult(result *cliproxyexecutor.StreamResult, err error) (*cl
 	return result, nil
 }
 
-func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
+func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk, firstPayloadOnly ...bool) ([]cliproxyexecutor.StreamChunk, bool, error) {
 	if ch == nil {
 		return nil, true, nil
 	}
 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
+	var bootstrap streamBootstrapState
+	passthrough := cliproxyexecutor.DownstreamWebsocket(ctx) || (len(firstPayloadOnly) > 0 && firstPayloadOnly[0])
 	for {
 		var (
 			chunk cliproxyexecutor.StreamChunk
@@ -104,11 +106,18 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 			return buffered, true, nil
 		}
 		if chunk.Err != nil {
+			if bootstrap.hasMeaningfulOutput() {
+				buffered = append(buffered, chunk)
+				return buffered, false, nil
+			}
 			return nil, false, chunk.Err
 		}
 		buffered = append(buffered, chunk)
-		if len(chunk.Payload) > 0 {
+		if (passthrough && len(chunk.Payload) > 0) || (!passthrough && bootstrap.observeChunk(chunk.Payload)) {
 			return buffered, false, nil
+		}
+		if !passthrough && bootstrap.isTerminalEmpty() {
+			return buffered, true, nil
 		}
 	}
 }
@@ -129,6 +138,8 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				rerr := resultErrorFromError(chunk.Err)
 				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.runtimeConfigSnapshot())
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Options: opts}
+				result.RetryAfter = retryAfterFromError(chunk.Err)
+				result.CredentialScope = isCredentialScopedError(chunk.Err)
 				applyRequestScopedActionToResult(action, okAction, &result)
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			}
@@ -297,7 +308,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			continue
 		}
 
-		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+		// Codex owns handshake buffering and the distinction between bootstrap and in-stream failures.
+		firstPayloadOnly := provider == "codex"
+		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks, firstPayloadOnly)
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
@@ -333,7 +346,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						streamResult = &cliproxyexecutor.StreamResult{}
 					} else {
 						streamResult = retryStream
-						buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
+						buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks, firstPayloadOnly)
 					}
 				}
 			}
@@ -402,8 +415,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
 
-		if closed && len(buffered) == 0 {
-			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+		if closed && (len(buffered) == 0 || isEmptyCompletion(buffered)) {
+			discardStreamChunks(streamResult.Chunks)
+			emptyErr := errEmptyCompletion
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, Options: execOpts}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
 			if idx < len(execModels)-1 {
@@ -415,6 +429,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		remaining := streamResult.Chunks
 		if closed {
+			discardStreamChunks(remaining)
 			closedCh := make(chan cliproxyexecutor.StreamChunk)
 			close(closedCh)
 			remaining = closedCh

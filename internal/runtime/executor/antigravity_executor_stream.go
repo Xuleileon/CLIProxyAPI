@@ -80,7 +80,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
+	httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
 
 	attempts := antigravityRetryAttempts(auth, e.cfg)
 
@@ -252,6 +252,7 @@ attemptLoop:
 				var param any
 				for scanner.Scan() {
 					line := scanner.Bytes()
+					helps.ObserveGeminiTokenEvent(reporter, line)
 					helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 					if replayAccumulator != nil {
 						replayAccumulator.ObserveSSELine(line)

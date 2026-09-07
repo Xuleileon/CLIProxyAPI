@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -515,7 +516,7 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	defer lock.mu.Unlock()
 
 	m.mu.RLock()
-	auth := m.auths[id]
+	auth := m.auths[id].Clone()
 	var exec ProviderExecutor
 	if auth != nil {
 		// Use the same effective provider key as request execution so OpenAI-compat
@@ -547,6 +548,11 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
+			if current.RegistrationEpoch != auth.RegistrationEpoch || current.Disabled || current.Status == StatusDisabled || authAccessToken(current) != authAccessToken(auth) {
+				m.mu.Unlock()
+				return nil, err
+			}
+			current.Generation++
 			current.LastError = refreshErrorFromError(err)
 			if unauthorized {
 				current.NextRefreshAfter = time.Time{}
@@ -589,15 +595,21 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
-	saved, errUpdate := m.Update(ctx, updated)
-	for _, model := range modelsToResume {
-		registry.GetGlobalRegistry().ResumeClientModel(id, model)
-	}
+	saved, errUpdate := m.UpdateRefreshedAuth(ctx, auth, updated)
 	if errUpdate != nil {
-		log.Debugf("persist refreshed auth %s (%s) failed: %v", auth.Provider, auth.ID, errUpdate)
+		return nil, errUpdate
 	}
-	if saved != nil {
-		return saved, nil
+	if saved == nil {
+		return nil, fmt.Errorf("auth removed during refresh")
 	}
-	return updated.Clone(), nil
+	m.mu.RLock()
+	if current := m.auths[id]; current != nil && current.RegistrationEpoch == saved.RegistrationEpoch {
+		for _, model := range modelsToResume {
+			if blocked, _, _ := isAuthBlockedForModel(current, model, time.Now()); !blocked {
+				registry.GetGlobalRegistry().ResumeClientModel(id, model)
+			}
+		}
+	}
+	m.mu.RUnlock()
+	return saved, nil
 }

@@ -55,24 +55,47 @@ func NormalizeExplicitID(raw string) string {
 	return raw
 }
 
+// ClaudeMetadataIdentities extracts session_id, parent_session_id, and agent_id from Claude user_id metadata.
+func ClaudeMetadataIdentities(payload []byte) (sessionID, parentSessionID, agentID string) {
+	if len(payload) == 0 {
+		return "", "", ""
+	}
+	root := util.ParseGJSONBytesNoCopy(payload)
+	userID := strings.TrimSpace(root.Get("metadata.user_id").String())
+	if userID == "" {
+		req := root.Get("request")
+		if req.Exists() && !root.Get("contents").Exists() {
+			userID = strings.TrimSpace(req.Get("metadata.user_id").String())
+		}
+	}
+	if userID == "" {
+		return "", "", ""
+	}
+	if strings.HasPrefix(userID, "{") {
+		parsed := gjson.Parse(userID)
+		sessionID = NormalizeExplicitID(parsed.Get("session_id").String())
+		parentSessionID = NormalizeExplicitID(parsed.Get("parent_session_id").String())
+		agentID = NormalizeExplicitID(parsed.Get("agent_id").String())
+		return sessionID, parentSessionID, agentID
+	}
+	if matches := legacyClaudeSessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
+		return NormalizeExplicitID(matches[1]), "", ""
+	}
+	return "", "", ""
+}
+
 // ClaudeMetadataSessionID extracts the explicit Claude Code session from
 // current JSON metadata or the legacy user_id suffix before bounding the
 // surrounding metadata container.
 func ClaudeMetadataSessionID(payload []byte) string {
-	if len(payload) == 0 {
-		return ""
-	}
-	userID := strings.TrimSpace(gjson.GetBytes(payload, "metadata.user_id").String())
-	if userID == "" {
-		return ""
-	}
-	if strings.HasPrefix(userID, "{") {
-		return NormalizeExplicitID(gjson.Get(userID, "session_id").String())
-	}
-	if matches := legacyClaudeSessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
-		return NormalizeExplicitID(matches[1])
-	}
-	return ""
+	sessionID, _, _ := ClaudeMetadataIdentities(payload)
+	return sessionID
+}
+
+// ClaudeMetadataParentSessionID extracts parent_session_id from Claude user_id metadata if present.
+func ClaudeMetadataParentSessionID(payload []byte) string {
+	_, parentSessionID, _ := ClaudeMetadataIdentities(payload)
+	return parentSessionID
 }
 
 // CallerScope returns an irreversible namespace for a downstream caller credential.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -166,6 +167,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 		var bootstrapErr *streamBootstrapError
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
+			if isEmptyCompletionError(bootstrapErr) {
+				return nil, bootstrapErr.cause
+			}
 			return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
 		}
 		return nil, lastErr
@@ -401,6 +405,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if result.CredentialScope {
 					break
 				}
+				continue
+			}
+			if isEmptyCompletionPayload(resp.Payload) {
+				authErr = m.markEmptyCompletion(execCtx, &result)
 				continue
 			}
 			m.MarkResult(execCtx, result)
@@ -650,6 +658,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
 		if selection != nil {
+			if _, alreadyTried := tried[auth.ID]; alreadyTried && isEmptyCompletionError(lastErr) {
+				selection.End("repeated_empty_auth")
+				return nil, lastErr
+			}
 			if _, refreshedAlready := unauthorizedRefreshTried[auth.ID]; refreshedAlready {
 				selection.End("repeated_refresh_auth")
 				if lastErr != nil {
@@ -975,7 +987,7 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 		return target, nil
 	}
 
-	updated, errPrepare := preparer.PrepareRequestAuth(ctx, target)
+	updated, errPrepare := preparer.PrepareRequestAuth(ctx, target.Clone())
 	if errPrepare != nil {
 		return auth, errPrepare
 	}
@@ -983,14 +995,14 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 		return target, nil
 	}
 
-	saved, errUpdate := m.Update(ctx, updated)
+	saved, errUpdate := m.UpdatePreparedAuth(ctx, target, updated)
 	if errUpdate != nil {
 		return updated, errUpdate
 	}
 	if saved != nil {
 		return saved, nil
 	}
-	return updated, nil
+	return nil, fmt.Errorf("auth removed during preparation")
 }
 
 func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {

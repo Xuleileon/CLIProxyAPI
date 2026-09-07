@@ -113,6 +113,8 @@ type Manager struct {
 	selector                  Selector
 	hook                      Hook
 	mu                        sync.RWMutex
+	authEpoch                 atomic.Uint64
+	persistLocks              sync.Map
 	selectorMu                sync.Mutex
 	configCooldownMu          sync.Mutex
 	auths                     map[string]*Auth
