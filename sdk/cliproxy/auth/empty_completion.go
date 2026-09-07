@@ -404,7 +404,7 @@ type openAIResponseChunk struct {
 	Usage     *openAIResponseUsage  `json:"usage"`
 	Response  *openAIResponseObject `json:"response"`
 	Delta     string                `json:"delta"`
-	Text      string                `json:"text"`
+	Text      json.RawMessage       `json:"text"`
 	Arguments string                `json:"arguments"`
 }
 
@@ -678,6 +678,8 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 
 	var chunk openAIResponseChunk
 	if err := json.Unmarshal(data, &chunk); err != nil {
+		// Future Responses shapes must be forwarded, not penalize credentials.
+		a.sawUnknownData = true
 		return true
 	}
 
@@ -711,7 +713,10 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 			a.hasContent = true
 		}
 	case "response.output_text.done":
-		if strings.TrimSpace(chunk.Text) != "" {
+		// A completed response uses text for output configuration, while this
+		// event uses the same field for a string containing generated text.
+		var text string
+		if json.Unmarshal(chunk.Text, &text) == nil && strings.TrimSpace(text) != "" {
 			a.hasContent = true
 		}
 	case "response.output_item.done":
