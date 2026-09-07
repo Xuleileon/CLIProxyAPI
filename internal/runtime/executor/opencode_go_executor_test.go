@@ -73,6 +73,14 @@ func TestOpenCodeGoExecutorRoutesNativeProtocols(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:     "muse responses",
+			model:    "muse-spark-1.3-contributor",
+			format:   sdktranslator.FormatOpenAIResponse,
+			payload:  `{"model":"muse-spark-1.3-contributor","input":"hi"}`,
+			wantPath: "/v1/responses",
+			response: `{"id":"resp_2","object":"response","created_at":1,"status":"completed","model":"muse-spark-1.3-contributor","output":[{"id":"msg_2","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+		},
 	}
 
 	for _, tt := range tests {

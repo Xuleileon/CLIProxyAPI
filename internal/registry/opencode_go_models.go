@@ -15,6 +15,7 @@ var openCodeGoAnthropicModels = map[string]struct{}{
 
 var openCodeGoModelIDs = []string{
 	"minimax-m3", "minimax-m2.7", "minimax-m2.5",
+	"muse-spark-1.3-contributor",
 	"kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5",
 	"glm-5.2", "glm-5.1", "glm-5",
 	"deepseek-v4-pro", "deepseek-v4-flash",
@@ -27,7 +28,7 @@ var openCodeGoModelIDs = []string{
 // Unknown models use OpenAI Chat Completions, matching the provider catalog default.
 func OpenCodeGoProtocolForModel(model string) string {
 	model = strings.ToLower(strings.TrimSpace(model))
-	if model == "gpt-5.6-luna" {
+	if model == "gpt-5.6-luna" || model == "muse-spark-1.3-contributor" {
 		return openCodeGoProtocolResponses
 	}
 	if _, ok := openCodeGoAnthropicModels[model]; ok {
