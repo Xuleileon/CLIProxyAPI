@@ -842,6 +842,7 @@ func sessionHeaderValue(headers http.Header, name string) string {
 // ExtractSessionID extracts a session identifier from explicit client signals,
 // then falls back to execution metadata, derived identity, and message history.
 // Priority order:
+// X-Opencode-Session takes precedence when supplied by an OpenCode client.
 //  1. X-Claude-Code-Session-Id
 //  2. Claude Code metadata.user_id session
 //  3. Session-Id / Session_id (Codex and compatible clients)
@@ -863,6 +864,9 @@ func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]a
 // fallbackID preserves an earlier binding when a stronger body identifier appears
 // later, and lets callers bind both identifiers when both are present.
 func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
+	if sid := sessionHeaderValue(headers, "X-Opencode-Session"); sid != "" {
+		return "opencode:" + sid, ""
+	}
 	if sid := sessionHeaderValue(headers, "X-Claude-Code-Session-Id"); sid != "" {
 		return "claude:" + sid, ""
 	}

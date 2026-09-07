@@ -74,8 +74,11 @@ func (e *OpenCodeGoExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth
 	if ctx == nil {
 		ctx = req.Context()
 	}
-	httpReq := req.WithContext(ctx)
+	httpReq := req.Clone(ctx)
 	e.applyHeaders(httpReq, auth, strings.HasSuffix(strings.TrimRight(httpReq.URL.Path, "/"), "/messages"))
+	if err := helps.ApplyOpenCodeGoHTTPRequestSession(httpReq); err != nil {
+		return nil, err
+	}
 	return helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
 }
 
@@ -103,7 +106,8 @@ func (e *OpenCodeGoExecutor) executeNative(ctx context.Context, auth *cliproxyau
 	if errRequest != nil {
 		return resp, errRequest
 	}
-	e.applyHeaders(httpReq, auth, protocol == config.OpenCodeGoProtocolClaude)
+	e.applyHeaders(httpReq, auth, protocol == config.OpenCodeGoProtocolClaude, opts.Headers)
+	helps.ApplyOpenCodeGoSessionHeader(httpReq, req, opts)
 	e.recordRequest(ctx, auth, httpReq, translated)
 	httpResp, errHTTP := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
 	if errHTTP != nil {
@@ -151,7 +155,8 @@ func (e *OpenCodeGoExecutor) executeNativeStream(ctx context.Context, auth *clip
 	if errRequest != nil {
 		return nil, errRequest
 	}
-	e.applyHeaders(httpReq, auth, protocol == config.OpenCodeGoProtocolClaude)
+	e.applyHeaders(httpReq, auth, protocol == config.OpenCodeGoProtocolClaude, opts.Headers)
+	helps.ApplyOpenCodeGoSessionHeader(httpReq, req, opts)
 	httpReq.Header.Set("Accept", "text/event-stream")
 	e.recordRequest(ctx, auth, httpReq, translated)
 	httpResp, errHTTP := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
@@ -245,7 +250,7 @@ func (e *OpenCodeGoExecutor) preparePayload(payload, original []byte, req clipro
 	return payload, nil
 }
 
-func (e *OpenCodeGoExecutor) applyHeaders(req *http.Request, auth *cliproxyauth.Auth, anthropic bool) {
+func (e *OpenCodeGoExecutor) applyHeaders(req *http.Request, auth *cliproxyauth.Auth, anthropic bool, clientHeaders ...http.Header) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "cli-proxy-opencode-go")
 	_, apiKey := openCodeGoCredentials(auth)
@@ -257,7 +262,7 @@ func (e *OpenCodeGoExecutor) applyHeaders(req *http.Request, auth *cliproxyauth.
 		}
 	}
 	if auth != nil {
-		util.ApplyCustomHeadersFromAttrs(req, auth.Attributes)
+		util.ApplyCustomHeadersFromAttrs(req, auth.Attributes, clientHeaders...)
 	}
 }
 

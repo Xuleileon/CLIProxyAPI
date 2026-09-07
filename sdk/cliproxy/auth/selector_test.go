@@ -1163,6 +1163,10 @@ func TestExtractSessionID_DerivedSessionAndExplicitPriority(t *testing.T) {
 	if got := ExtractSessionID(headers, explicitPayload, metadata); got != "header:header-session" {
 		t.Fatalf("ExtractSessionID() = %q, want explicit header session", got)
 	}
+	headers["x-opencode-session"] = []string{"opencode-session"}
+	if got := ExtractSessionID(headers, explicitPayload, metadata); got != "opencode:opencode-session" {
+		t.Fatalf("ExtractSessionID() = %q, want OpenCode session", got)
+	}
 }
 
 func TestExtractSessionID_MessageHashFallback(t *testing.T) {
