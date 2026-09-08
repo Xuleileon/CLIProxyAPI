@@ -2638,6 +2638,7 @@ func rejectCursorTeammateTaskOutput(toolName, args string) string {
 // into the UserText field as plain text while preserving tool call order.
 // This is the fallback for cold resume when no checkpoint is available.
 // Cursor reliably reads UserText but ignores structured turns.
+// Preserve complete history; a per-item byte limit silently drops source and tool data.
 func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 	allImages := make([]cursorproto.ImageData, 0, len(parsed.Images))
 	for _, message := range parsed.Messages {
@@ -2679,7 +2680,7 @@ func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 			for _, toolCall := range message.Get("tool_calls").Array() {
 				callID := toolCall.Get("id").String()
 				name := toolCall.Get("function.name").String()
-				arguments := truncateCursorHistoryText(toolCall.Get("function.arguments").String())
+				arguments := strings.ToValidUTF8(toolCall.Get("function.arguments").String(), "\uFFFD")
 				fmt.Fprintf(&buf, "ASSISTANT_TOOL_CALL (call_id: %s, name: %s): %s\n\n", callID, name, arguments)
 			}
 		case "tool":
@@ -2689,7 +2690,7 @@ func flattenConversationIntoUserText(parsed *parsedOpenAIRequest) {
 			if hasResult {
 				content = cursorFallbackToolResultContent(result, content)
 			}
-			content = truncateCursorHistoryText(content)
+			content = strings.ToValidUTF8(content, "\uFFFD")
 			status := "success"
 			if hasResult && result.IsError {
 				status = "error"
@@ -2730,27 +2731,13 @@ func cursorFallbackToolResultContent(result toolResultInfo, fallback string) str
 }
 
 func appendCursorHistorySection(buf *strings.Builder, label, content string) {
-	content = strings.TrimSpace(content)
-	if content == "" {
+	if strings.TrimSpace(content) == "" {
 		return
 	}
 	buf.WriteString(label)
 	buf.WriteString(": ")
-	buf.WriteString(truncateCursorHistoryText(content))
+	buf.WriteString(strings.ToValidUTF8(content, "\uFFFD"))
 	buf.WriteString("\n\n")
-}
-
-func truncateCursorHistoryText(content string) string {
-	const maxHistoryItemBytes = 8000
-	content = strings.ToValidUTF8(content, "\uFFFD")
-	if len(content) <= maxHistoryItemBytes {
-		return content
-	}
-	cut := maxHistoryItemBytes
-	for cut > 0 && !utf8.RuneStart(content[cut]) {
-		cut--
-	}
-	return content[:cut] + "\n... [truncated]"
 }
 
 func composeCursorCurrentUserText(parts []string) string {

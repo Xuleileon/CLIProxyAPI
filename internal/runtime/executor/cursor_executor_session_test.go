@@ -668,34 +668,75 @@ func TestCloneSavedCursorCheckpointIsDeepCopy(t *testing.T) {
 	}
 }
 
-func TestTruncateCursorHistoryTextPreservesUTF8AtByteLimit(t *testing.T) {
+func TestFlattenConversationIntoUserTextPreservesLongHistory(t *testing.T) {
 	t.Parallel()
-
-	content := strings.Repeat("a", 7999) + "中" + "tail"
-	got := truncateCursorHistoryText(content)
-	if !utf8.ValidString(got) {
-		t.Fatal("truncated history contains invalid UTF-8")
-	}
-	if !strings.HasPrefix(got, strings.Repeat("a", 7999)) {
-		t.Fatal("truncated history lost valid prefix")
-	}
-	if strings.Contains(got, "中") {
-		t.Fatal("partial boundary rune should be omitted")
-	}
-	if !strings.HasSuffix(got, "\n... [truncated]") {
-		t.Fatal("truncation marker missing")
+	user := strings.Repeat("source code\n", 120000) + "USER_TAIL_中"
+	assistant := strings.Repeat("analysis\n", 2000) + "ASSISTANT_TAIL_文"
+	arguments := `{"content":"` + strings.Repeat("x", 16000) + `ARGUMENT_TAIL"}`
+	result := strings.Repeat("tool output\n", 2000) + "RESULT_TAIL_字"
+	for _, toolOnly := range []bool{false, true} {
+		name := "next_user_turn"
+		if toolOnly {
+			name = "tool_continuation"
+		}
+		t.Run(name, func(t *testing.T) {
+			messages := []map[string]any{
+				{"role": "user", "content": user},
+				{"role": "assistant", "content": assistant, "tool_calls": []map[string]any{{"id": "long-call", "type": "function", "function": map[string]any{"name": "read", "arguments": arguments}}}},
+				{"role": "tool", "tool_call_id": "long-call", "content": result},
+			}
+			if !toolOnly {
+				messages = append(messages, map[string]any{"role": "user", "content": "CHECK_CURRENT_REQUEST_ONCE"})
+			}
+			payload, err := json.Marshal(map[string]any{"model": "gemini-3.8-flash-high", "messages": messages})
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed := parseOpenAIRequest(payload)
+			structured := `{"detail":"` + strings.Repeat("z", 16000) + `STRUCTURED_TAIL"}`
+			parsed.ToolResults[0].StructuredContent = json.RawMessage(structured)
+			parsed.ToolResults[0].IsError = true
+			flattenConversationIntoUserText(parsed)
+			position := -1
+			for _, want := range []string{user, assistant, arguments, "TOOL_RESULT (call_id: long-call, status: error):", result, "STRUCTURED_CONTENT: " + structured} {
+				next := strings.Index(parsed.UserText, want)
+				if next < 0 {
+					t.Fatalf("history item missing or truncated (length %d)", len(want))
+				}
+				if next <= position {
+					t.Fatal("history items reordered")
+				}
+				position = next
+			}
+			if !utf8.ValidString(parsed.UserText) {
+				t.Fatal("invalid UTF-8 in history")
+			}
+			if !toolOnly && strings.Count(parsed.UserText, "CHECK_CURRENT_REQUEST_ONCE") != 1 {
+				t.Fatal("current request duplicated or missing")
+			}
+			if parsed.Turns != nil || parsed.ToolResults != nil {
+				t.Fatal("structured replay would duplicate flattened history")
+			}
+			params, err := buildRunRequestParams(parsed, "long-history-test", parsed.Model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire := cursorproto.EncodeRunRequest(params)
+			for _, want := range []string{user, assistant, arguments, result, structured} {
+				if !bytes.Contains(wire, []byte(want)) {
+					t.Fatalf("encoded Run lost history item (length %d)", len(want))
+				}
+			}
+		})
 	}
 }
 
-func TestTruncateCursorHistoryTextRepairsInvalidUTF8(t *testing.T) {
+func TestAppendCursorHistorySectionRepairsInvalidUTF8(t *testing.T) {
 	t.Parallel()
-
-	got := truncateCursorHistoryText("before\xffafter")
-	if !utf8.ValidString(got) {
-		t.Fatal("history contains invalid UTF-8")
-	}
-	if got != "before\uFFFDafter" {
-		t.Fatalf("repaired history = %q, want %q", got, "before\uFFFDafter")
+	var buf strings.Builder
+	appendCursorHistorySection(&buf, "USER", "before\xffafter")
+	if got := buf.String(); got != "USER: before\uFFFDafter\n\n" {
+		t.Fatalf("repaired history = %q", got)
 	}
 }
 
