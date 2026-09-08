@@ -385,7 +385,13 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 // CountTokens counts tokens for the given request using the AI Studio API.
 func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	_, body, err := e.translateRequest(ctx, req, opts, false)
+	countReq := req
+	countReq.Metadata = make(map[string]any, len(req.Metadata)+1)
+	for key, value := range req.Metadata {
+		countReq.Metadata[key] = value
+	}
+	countReq.Metadata["action"] = "countTokens"
+	_, body, err := e.translateRequest(ctx, countReq, opts, false)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
@@ -487,6 +493,9 @@ func (e *AIStudioExecutor) translateRequest(ctx context.Context, req cliproxyexe
 		action = "streamGenerateContent"
 	}
 	payload, _ = sjson.DeleteBytes(payload, "session_id")
+	if action != "countTokens" {
+		payload = helps.EnsureGeminiBoundaryUserContent(payload, "contents")
+	}
 	return payload, translatedPayload{payload: payload, action: action, toFormat: to}, nil
 }
 

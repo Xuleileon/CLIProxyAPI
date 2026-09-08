@@ -84,3 +84,40 @@ func appendVarintField(dst []byte, number protowire.Number, value uint64) []byte
 	dst = protowire.AppendTag(dst, number, protowire.VarintType)
 	return protowire.AppendVarint(dst, value)
 }
+
+func TestDecodeCursorReplySurvivesTrailingInteraction(t *testing.T) {
+	heartbeat := appendBytesField(nil, ASM_InteractionUpdate, appendBytesField(nil, 13, nil))
+	get := appendVarintField(nil, KSM_Id, 41)
+	get = appendBytesField(get, KSM_GetBlobArgs, appendBytesField(nil, GBA_BlobId, []byte("blob")))
+	set := appendVarintField(nil, KSM_Id, 42)
+	setArgs := appendBytesField(nil, SBA_BlobId, []byte("blob"))
+	setArgs = appendBytesField(setArgs, SBA_BlobData, []byte("value"))
+	set = appendBytesField(set, KSM_SetBlobArgs, setArgs)
+	cases := []struct {
+		name string
+		raw  []byte
+		want ServerMessageType
+	}{
+		{"get", appendBytesField(nil, ASM_KvServerMessage, get), ServerMsgKvGetBlob},
+		{"set", appendBytesField(nil, ASM_KvServerMessage, set), ServerMsgKvSetBlob},
+		{"read", wrapExecServerMessage(7, "exec-read", ESM_ReadArgs, appendStringField(nil, RA_Path, "source.go")), ServerMsgExecReadArgs},
+		{"precompact", wrapExecServerMessage(8, "exec-compact", ESM_ExecuteHookArgs, appendBytesField(nil, 1, appendStringField(nil, 1, "automatic"))), ServerMsgExecPreCompact},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, trailing := range []bool{false, true} {
+				payload := append(append([]byte(nil), tc.raw...), heartbeat...)
+				if !trailing {
+					payload = append(append([]byte(nil), heartbeat...), tc.raw...)
+				}
+				got, err := DecodeAgentServerMessage(payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.Type != tc.want {
+					t.Fatalf("trailing=%v: got type %v, want %v", trailing, got.Type, tc.want)
+				}
+			}
+		})
+	}
+}

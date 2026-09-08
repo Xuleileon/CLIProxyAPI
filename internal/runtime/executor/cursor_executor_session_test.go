@@ -835,15 +835,20 @@ func TestEncodeCursorExecCompletionAlwaysClosesExec(t *testing.T) {
 }
 
 type fakeCursorToolResultStream struct {
-	dataCh chan []byte
-	doneCh chan struct{}
-	writes [][]byte
+	writeErr error
+	dataCh   chan []byte
+	doneCh   chan struct{}
+	writes   [][]byte
 }
 
+func (stream *fakeCursorToolResultStream) ID() string            { return "test-stream" }
 func (stream *fakeCursorToolResultStream) Data() <-chan []byte   { return stream.dataCh }
 func (stream *fakeCursorToolResultStream) Done() <-chan struct{} { return stream.doneCh }
 func (stream *fakeCursorToolResultStream) Err() error            { return nil }
 func (stream *fakeCursorToolResultStream) Write(data []byte) error {
+	if stream.writeErr != nil {
+		return stream.writeErr
+	}
 	stream.writes = append(stream.writes, append([]byte(nil), data...))
 	return nil
 }

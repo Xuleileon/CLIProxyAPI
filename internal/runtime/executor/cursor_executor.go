@@ -1670,7 +1670,7 @@ func (u *cursorTokenUsage) takeUnreported() (input, output int64) {
 
 func processH2SessionFrames(
 	ctx context.Context,
-	stream *cursorproto.H2Stream,
+	stream cursorToolResultStream,
 	blobStore map[string][]byte,
 	mcpTools []cursorproto.McpToolDef,
 	onText func(text string, isThinking bool),
@@ -1765,7 +1765,9 @@ func processH2SessionFrames(
 						blobKey := cursorproto.BlobIdHex(msg.BlobId)
 						data := blobStore[blobKey]
 						resp := cursorproto.EncodeKvGetBlobResult(msg.KvId, data)
-						stream.Write(cursorproto.FrameConnectMessage(resp, 0))
+						if err := stream.Write(cursorproto.FrameConnectMessage(resp, 0)); err != nil {
+							return fmt.Errorf("cursor: reply with KV blob: %w", err)
+						}
 
 					case cursorproto.ServerMsgKvSetBlob:
 						blobKey := cursorproto.BlobIdHex(msg.BlobId)
@@ -1918,6 +1920,7 @@ type cursorMessageWriter interface {
 }
 
 type cursorToolResultStream interface {
+	ID() string
 	cursorMessageWriter
 	Data() <-chan []byte
 	Done() <-chan struct{}

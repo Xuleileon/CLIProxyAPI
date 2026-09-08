@@ -111,6 +111,7 @@ attemptLoop:
 				}
 			}
 
+			requestPayload = helps.EnsureAntigravityGeminiBoundaryUserContent(baseModel, requestPayload)
 			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, false, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
 			if errReq != nil {
 				err = errReq
@@ -337,6 +338,7 @@ attemptLoop:
 					return resp, err
 				}
 			}
+			requestPayload = helps.EnsureAntigravityGeminiBoundaryUserContent(baseModel, requestPayload)
 			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
 			if errReq != nil {
 				err = errReq

@@ -92,6 +92,21 @@ type DecodedServerMessage struct {
 	CheckpointData []byte
 }
 
+// isReplyRequiredType reports whether the decoded message type carries a
+// server request that must receive an inline client reply.
+func isReplyRequiredType(t ServerMessageType) bool {
+	switch t {
+	case ServerMsgKvGetBlob, ServerMsgKvSetBlob,
+		ServerMsgExecRequestCtx, ServerMsgExecMcpArgs,
+		ServerMsgExecShellArgs, ServerMsgExecReadArgs, ServerMsgExecWriteArgs,
+		ServerMsgExecDeleteArgs, ServerMsgExecLsArgs, ServerMsgExecGrepArgs,
+		ServerMsgExecFetchArgs, ServerMsgExecDiagnostics, ServerMsgExecShellStream,
+		ServerMsgExecBgShellSpawn, ServerMsgExecWriteShellStdin, ServerMsgExecPreCompact, ServerMsgExecOther:
+		return true
+	}
+	return false
+}
+
 // DecodeAgentServerMessage parses an AgentServerMessage and returns
 // a structured representation of the first meaningful message found.
 func DecodeAgentServerMessage(data []byte) (*DecodedServerMessage, error) {
@@ -114,7 +129,10 @@ func DecodeAgentServerMessage(data []byte) (*DecodedServerMessage, error) {
 
 			switch num {
 			case ASM_InteractionUpdate:
-				decodeInteractionUpdate(val, msg)
+				// Preserve an inline request if a trailing update shares its frame.
+				if !isReplyRequiredType(msg.Type) {
+					decodeInteractionUpdate(val, msg)
+				}
 			case ASM_ExecServerMessage:
 				decodeExecServerMessage(val, msg)
 			case ASM_KvServerMessage:
