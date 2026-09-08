@@ -856,6 +856,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if !disableCooling {
 								if result.RetryAfter != nil {
 									next = now.Add(quotaRetryDelay(auth, *result.RetryAfter))
+								} else if isOpenCodeGoCapacityError(auth, result.Error) {
+									next, backoffLevel = openCodeGoCapacityCooldown(state.Quota, now)
 								} else {
 									next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
 								}
@@ -909,7 +911,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							} else if transientErrorCooldownConfigured() {
 								state.NextRetryAfter = nextTransientErrorRetryAfter(now)
 							} else if auth.Provider == "opencode-go" && result.RetryAfter != nil {
-								state.NextRetryAfter = now.Add(max(*result.RetryAfter, 2*time.Second))
+								state.NextRetryAfter = now.Add(max(*result.RetryAfter, 0))
 							} else {
 								state.NextRetryAfter, state.Quota.BackoffLevel = transientCooldownAfterFailure(
 									state.NextRetryAfter, state.Quota.BackoffLevel, now,
@@ -1928,6 +1930,8 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if !disableCooling {
 			if retryAfter != nil {
 				next = now.Add(quotaRetryDelay(auth, *retryAfter))
+			} else if isOpenCodeGoCapacityError(auth, resultErr) {
+				next, auth.Quota.BackoffLevel = openCodeGoCapacityCooldown(auth.Quota, now)
 			} else {
 				next, auth.Quota.BackoffLevel = quotaCooldownAfterFailure(auth.Quota, now)
 			}
@@ -1944,7 +1948,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		} else if transientErrorCooldownConfigured() {
 			auth.NextRetryAfter = nextTransientErrorRetryAfter(now)
 		} else if auth.Provider == "opencode-go" && retryAfter != nil {
-			auth.NextRetryAfter = now.Add(max(*retryAfter, 2*time.Second))
+			auth.NextRetryAfter = now.Add(max(*retryAfter, 0))
 		} else {
 			auth.NextRetryAfter, auth.Quota.BackoffLevel = transientCooldownAfterFailure(
 				auth.NextRetryAfter, auth.Quota.BackoffLevel, now,
@@ -1970,9 +1974,27 @@ const minQuotaCooldownFloor = 10 * time.Second
 // Its executor preserves Retry-After or supplies the native client's fallback.
 func quotaRetryDelay(auth *Auth, delay time.Duration) time.Duration {
 	if auth != nil && auth.Provider == "opencode-go" {
-		return max(delay, 2*time.Second)
+		return max(delay, 0)
 	}
 	return max(delay, minQuotaCooldownFloor)
+}
+
+// Headerless upstream capacity errors need short, shared backoff, not the
+// subscription quota ladder. Concurrent failures reuse the open window.
+func isOpenCodeGoCapacityError(auth *Auth, err *Error) bool {
+	if auth == nil || auth.Provider != "opencode-go" || err == nil || err.HTTPStatus != 429 {
+		return false
+	}
+	return !strings.Contains(err.Message, "GoUsageLimitError") && !strings.Contains(err.Message, "FreeUsageLimitError")
+}
+
+func openCodeGoCapacityCooldown(quota QuotaState, now time.Time) (time.Time, int) {
+	if quota.NextRecoverAt.After(now) {
+		return quota.NextRecoverAt, quota.BackoffLevel
+	}
+	level := min(max(quota.BackoffLevel, 0), 4)
+	delay := min(2*time.Second*time.Duration(1<<level), 30*time.Second)
+	return now.Add(delay), min(level+1, 4)
 }
 
 // quotaCooldownAfterFailure returns the recovery deadline and backoff level for

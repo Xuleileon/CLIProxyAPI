@@ -64,6 +64,12 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if !shouldRetry {
 			break
 		}
+		for _, provider := range normalized {
+			if provider == "opencode-go" {
+				logEntryWithRequestID(ctx).WithFields(log.Fields{"model": retryModel, "retry": attempt + 1, "wait_ms": wait.Milliseconds()}).Debugf("opencode-go: retry scheduled retry=%d wait_ms=%d", attempt+1, wait.Milliseconds())
+				break
+			}
+		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
@@ -111,6 +117,12 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		if !shouldRetry {
 			break
 		}
+		for _, provider := range normalized {
+			if provider == "opencode-go" {
+				logEntryWithRequestID(ctx).WithFields(log.Fields{"model": retryModel, "retry": attempt + 1, "wait_ms": wait.Milliseconds()}).Debugf("opencode-go: retry scheduled retry=%d wait_ms=%d", attempt+1, wait.Milliseconds())
+				break
+			}
+		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
@@ -151,6 +163,12 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
 		if !shouldRetry {
 			break
+		}
+		for _, provider := range normalized {
+			if provider == "opencode-go" {
+				logEntryWithRequestID(ctx).WithFields(log.Fields{"model": retryModel, "retry": attempt + 1, "wait_ms": wait.Milliseconds()}).Debugf("opencode-go: retry scheduled retry=%d wait_ms=%d", attempt+1, wait.Milliseconds())
+				break
+			}
 		}
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return nil, errWait

@@ -19,7 +19,7 @@ import (
 )
 
 func TestOpenCodeGoRetriesBeforeOutput(t *testing.T) {
-	for _, failure := range []string{"429", "EOF", "stream error", "after output", "long retry", "disabled"} {
+	for _, failure := range []string{"429", "submitted EOF", "stream error", "after output", "long retry", "disabled"} {
 		t.Run(failure, func(t *testing.T) {
 			var calls atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -32,7 +32,7 @@ func TestOpenCodeGoRetriesBeforeOutput(t *testing.T) {
 						w.WriteHeader(429)
 						_, _ = io.WriteString(w, `{"error":{"code":"rate_limit_exceeded","message":"Please retry after a brief wait"}}`)
 						return
-					case "EOF":
+					case "submitted EOF":
 						conn, _, err := w.(http.Hijacker).Hijack()
 						if err != nil {
 							t.Error(err)
@@ -81,7 +81,7 @@ func TestOpenCodeGoRetriesBeforeOutput(t *testing.T) {
 					output.WriteString(gjson.GetBytes(chunk.Payload, "choices.0.delta.content").String())
 				}
 			}
-			if failure == "long retry" || failure == "disabled" || failure == "after output" {
+			if failure == "long retry" || failure == "disabled" || failure == "after output" || failure == "submitted EOF" {
 				if calls.Load() != 1 || err == nil {
 					t.Fatalf("unexpected replay/success: calls=%d err=%v", calls.Load(), err)
 				}

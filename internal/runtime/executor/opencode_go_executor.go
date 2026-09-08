@@ -80,7 +80,7 @@ func (e *OpenCodeGoExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth
 	if err := helps.ApplyOpenCodeGoHTTPRequestSession(httpReq); err != nil {
 		return nil, err
 	}
-	return helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
+	return helps.DoOpenCodeGoRequest(ctx, helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0), httpReq)
 }
 
 func (e *OpenCodeGoExecutor) executeNative(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, protocol string) (resp cliproxyexecutor.Response, err error) {
@@ -110,10 +110,10 @@ func (e *OpenCodeGoExecutor) executeNative(ctx context.Context, auth *cliproxyau
 	e.applyHeaders(httpReq, auth, protocol == config.OpenCodeGoProtocolClaude, opts.Headers)
 	helps.ApplyOpenCodeGoSessionHeader(httpReq, req, opts)
 	e.recordRequest(ctx, auth, httpReq, translated)
-	httpResp, errHTTP := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
+	httpResp, errHTTP := helps.DoOpenCodeGoRequest(ctx, helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0), httpReq)
 	if errHTTP != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errHTTP)
-		return resp, helps.OpenCodeGoConnectionError(errHTTP)
+		return resp, errHTTP
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -160,10 +160,10 @@ func (e *OpenCodeGoExecutor) executeNativeStream(ctx context.Context, auth *clip
 	helps.ApplyOpenCodeGoSessionHeader(httpReq, req, opts)
 	httpReq.Header.Set("Accept", "text/event-stream")
 	e.recordRequest(ctx, auth, httpReq, translated)
-	httpResp, errHTTP := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
+	httpResp, errHTTP := helps.DoOpenCodeGoRequest(ctx, helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0), httpReq)
 	if errHTTP != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errHTTP)
-		return nil, helps.OpenCodeGoConnectionError(errHTTP)
+		return nil, errHTTP
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {

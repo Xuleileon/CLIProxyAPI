@@ -18,13 +18,13 @@ func TestOpenCodeGoRetryAfter(t *testing.T) {
 		body    string
 		want    time.Duration
 	}{
-		{"rate limit", nil, 429, `{"error":"rate_limit_exceeded"}`, 2 * time.Second},
+		{"rate limit", nil, 429, `{"error":"rate_limit_exceeded"}`, -1},
 		{"busy", nil, 503, "", 2 * time.Second},
 		{"milliseconds", http.Header{"Retry-After-Ms": {"250"}}, 429, "", 250 * time.Millisecond},
 		{"seconds", http.Header{"Retry-After": {"120"}}, 429, "", 120 * time.Second},
 		{"quota", nil, 429, "GoUsageLimitError", -1},
 		{"invalid request", nil, 400, "", -1},
-		{"bad header", http.Header{"Retry-After": {"NaN"}}, 429, "", 2 * time.Second},
+		{"bad header", http.Header{"Retry-After": {"NaN"}}, 429, "", -1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := OpenCodeGoRetryAfter(tc.headers, tc.status, []byte(tc.body))
@@ -47,16 +47,16 @@ func TestOpenCodeGoRetryAfter(t *testing.T) {
 
 func TestOpenCodeGoConnectionError(t *testing.T) {
 	err := &url.Error{Op: "Post", URL: "https://example.test", Err: io.EOF}
-	got := OpenCodeGoConnectionError(err)
+	got := openCodeGoTracedConnectionError(err, true)
 	var retry interface {
 		StatusCode() int
 		RetryAfter() *time.Duration
 	}
-	if !errors.As(got, &retry) || retry.StatusCode() != 502 || *retry.RetryAfter() != 2*time.Second || !errors.Is(got, io.EOF) {
+	if !errors.As(got, &retry) || retry.StatusCode() != 502 || *retry.RetryAfter() != 250*time.Millisecond || !errors.Is(got, io.EOF) {
 		t.Fatalf("lost retry or cause: %v", got)
 	}
 	for _, stop := range []error{context.Canceled, context.DeadlineExceeded, errors.New("bad certificate")} {
-		if OpenCodeGoConnectionError(stop) != stop {
+		if openCodeGoTracedConnectionError(stop, true) != stop {
 			t.Fatalf("unexpected retry for %v", stop)
 		}
 	}

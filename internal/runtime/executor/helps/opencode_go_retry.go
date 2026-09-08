@@ -34,31 +34,39 @@ func OpenCodeGoRetryAfter(headers http.Header, status int, body []byte) *time.Du
 	if strings.Contains(string(body), "GoUsageLimitError") || strings.Contains(string(body), "FreeUsageLimitError") {
 		return nil
 	}
-	if status == 429 || status == 500 || status == 502 || status == 503 || status == 504 {
+	// The manager owns shared, increasing backoff for headerless rate limits.
+	if status == 500 || status == 502 || status == 503 || status == 504 {
 		d := 2 * time.Second
 		return &d
 	}
 	return nil
 }
 
-type openCodeGoConnectionError struct{ error }
+type openCodeGoConnectionError struct {
+	error
+	safeToRetry bool
+}
 
-func (e openCodeGoConnectionError) Unwrap() error   { return e.error }
-func (e openCodeGoConnectionError) StatusCode() int { return http.StatusBadGateway }
+func (e openCodeGoConnectionError) Unwrap() error         { return e.error }
+func (e openCodeGoConnectionError) StatusCode() int       { return http.StatusBadGateway }
+func (e openCodeGoConnectionError) IsRequestScoped() bool { return !e.safeToRetry }
 func (e openCodeGoConnectionError) RetryAfter() *time.Duration {
-	d := 2 * time.Second
+	if !e.safeToRetry {
+		return nil
+	}
+	d := 250 * time.Millisecond
 	return &d
 }
 
-// OpenCodeGoConnectionError is only used before an HTTP response is available.
-// Once output is streaming, the manager must not replay delivered content.
-func OpenCodeGoConnectionError(err error) error {
+// Only traced connection acquisition failures are safe to replay.
+// A failure after GotConn can have already submitted inference work.
+func openCodeGoTracedConnectionError(err error, safeToRetry bool) error {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
 	var op *net.OpError
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &op) {
-		return openCodeGoConnectionError{err}
+		return openCodeGoConnectionError{error: err, safeToRetry: safeToRetry}
 	}
 	return err
 }
