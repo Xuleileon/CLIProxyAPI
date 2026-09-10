@@ -81,6 +81,18 @@ func toggleConfigAPIKeyExcludedAll(cfg *config.Config, auth *coreauth.Auth, disa
 			return true, nil
 		}
 	}
+	for i := range cfg.CommandCodeKey {
+		entry := &cfg.CommandCodeKey[i]
+		baseURL := strings.TrimSpace(entry.BaseURL)
+		if baseURL == "" {
+			baseURL = config.DefaultCommandCodeBaseURL
+		}
+		id, _ := idGen.Next("command-code:apikey", entry.APIKey, baseURL)
+		if id == authID {
+			entry.ExcludedModels = setConfigAPIKeyExcludedAll(entry.ExcludedModels, disable)
+			return true, nil
+		}
+	}
 	for i := range cfg.OpenCodeGoKey {
 		entry := &cfg.OpenCodeGoKey[i]
 		baseURL := strings.TrimSpace(entry.BaseURL)

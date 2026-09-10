@@ -152,6 +152,17 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 			}
 		}
 		models = applyExcludedModels(models, excluded)
+	case "command-code":
+		models = registry.GetCommandCodeModels()
+		if entry := s.resolveConfigCommandCodeKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildConfigModels(entry.Models, "command-code", "openai")
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
 	case "opencode-go":
 		models = registry.GetOpenCodeGoModels()
 		if entry := s.resolveConfigOpenCodeGoKey(a); entry != nil {

@@ -164,6 +164,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize OpenCode Go subscription credentials.
 	cfg.SanitizeOpenCodeGoKeys()
+	cfg.SanitizeCommandCodeKeys()
 
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()

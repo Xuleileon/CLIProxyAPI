@@ -71,6 +71,9 @@ type APIKeyClientResult struct {
 	// OpenCodeGoKeyCount is the number of OpenCode Go subscription API keys loaded.
 	OpenCodeGoKeyCount int
 
+	// CommandCodeKeyCount is the number of Command Code subscription keys loaded.
+	CommandCodeKeyCount int
+
 	// OpenAICompatCount is the number of OpenAI compatibility API keys loaded
 	OpenAICompatCount int
 }

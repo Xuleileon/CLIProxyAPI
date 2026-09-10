@@ -24,6 +24,11 @@ type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
 type XAIKey = internalconfig.XAIKey
 type XAIModel = internalconfig.XAIModel
+type CommandCodeKey = internalconfig.CommandCodeKey
+type CommandCodeModel = internalconfig.CommandCodeModel
+
+const DefaultCommandCodeBaseURL = internalconfig.DefaultCommandCodeBaseURL
+
 type OpenCodeGoKey = internalconfig.OpenCodeGoKey
 type OpenCodeGoModel = internalconfig.OpenCodeGoModel
 type ClaudeKey = internalconfig.ClaudeKey

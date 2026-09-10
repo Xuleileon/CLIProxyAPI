@@ -167,6 +167,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/opencode-go-api-key", s.mgmt.PutOpenCodeGoKeys)
 		mgmt.PATCH("/opencode-go-api-key", s.mgmt.PatchOpenCodeGoKey)
 		mgmt.DELETE("/opencode-go-api-key", s.mgmt.DeleteOpenCodeGoKey)
+		mgmt.GET("/command-code-api-key", s.mgmt.GetCommandCodeKeys)
+		mgmt.PUT("/command-code-api-key", s.mgmt.PutCommandCodeKeys)
+		mgmt.PATCH("/command-code-api-key", s.mgmt.PatchCommandCodeKey)
+		mgmt.DELETE("/command-code-api-key", s.mgmt.DeleteCommandCodeKey)
 
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
@@ -353,6 +357,7 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 
 	managementasset.EnsureCursorOAuthOnDisk(filePath)
 	managementasset.EnsureOpenCodeGoOnDisk(filePath)
+	managementasset.EnsureCommandCodeOnDisk(filePath)
 	managementasset.EnsureAuthRefreshOnDisk(filePath)
 	c.Header("Cache-Control", "no-store")
 	c.Header("Pragma", "no-cache")

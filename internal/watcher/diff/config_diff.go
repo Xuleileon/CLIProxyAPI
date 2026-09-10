@@ -351,6 +351,25 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 		}
 	}
 
+	// Command Code keys (do not print key material)
+	if len(oldCfg.CommandCodeKey) != len(newCfg.CommandCodeKey) {
+		changes = append(changes, fmt.Sprintf("command-code-api-key count: %d -> %d", len(oldCfg.CommandCodeKey), len(newCfg.CommandCodeKey)))
+	} else {
+		for i := range oldCfg.CommandCodeKey {
+			o := oldCfg.CommandCodeKey[i]
+			n := newCfg.CommandCodeKey[i]
+			if strings.TrimSpace(o.BaseURL) != strings.TrimSpace(n.BaseURL) {
+				changes = append(changes, fmt.Sprintf("command-code[%d].base-url: %s -> %s", i, strings.TrimSpace(o.BaseURL), strings.TrimSpace(n.BaseURL)))
+			}
+			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
+				changes = append(changes, fmt.Sprintf("command-code[%d].api-key: updated", i))
+			}
+			if ComputeCommandCodeModelsHash(o.Models) != ComputeCommandCodeModelsHash(n.Models) {
+				changes = append(changes, fmt.Sprintf("command-code[%d].models: updated (%d -> %d entries)", i, len(o.Models), len(n.Models)))
+			}
+		}
+	}
+
 	// xAI keys (do not print key material)
 	if len(oldCfg.XAIKey) != len(newCfg.XAIKey) {
 		changes = append(changes, fmt.Sprintf("xai-api-key count: %d -> %d", len(oldCfg.XAIKey), len(newCfg.XAIKey)))

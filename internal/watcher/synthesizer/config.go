@@ -54,6 +54,7 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeCodexKeys(ctx)...)
 	// OpenCode Go subscription API keys
 	out = append(out, s.synthesizeOpenCodeGoKeys(ctx)...)
+	out = append(out, s.synthesizeCommandCodeKeys(ctx)...)
 	// Kiro (AWS CodeWhisperer)
 	out = append(out, s.synthesizeKiroKeys(ctx)...)
 	// xAI API Keys

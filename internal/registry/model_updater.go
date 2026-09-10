@@ -78,6 +78,7 @@ func StartModelsUpdater(ctx context.Context) {
 	updaterOnce.Do(func() {
 		go runModelsUpdater(ctx)
 		go runOpenCodeGoModelsUpdater(ctx)
+		go runCommandCodeModelsUpdater(ctx)
 	})
 }
 

@@ -35,6 +35,12 @@ type openCodeGoKeyWithAuthIndex struct {
 	ModelCount int    `json:"model-count"`
 }
 
+type commandCodeKeyWithAuthIndex struct {
+	config.CommandCodeKey
+	AuthIndex  string `json:"auth-index,omitempty"`
+	ModelCount int    `json:"model-count"`
+}
+
 type vertexCompatKeyWithAuthIndex struct {
 	config.VertexCompatKey
 	AuthIndex string `json:"auth-index,omitempty"`
@@ -262,6 +268,34 @@ func (h *Handler) openCodeGoKeysWithAuthIndex() []openCodeGoKeyWithAuthIndex {
 			modelCount = len(registry.GetOpenCodeGoModels())
 		}
 		out[i] = openCodeGoKeyWithAuthIndex{OpenCodeGoKey: entry, AuthIndex: liveIndexByID[id], ModelCount: modelCount}
+	}
+	return out
+}
+
+func (h *Handler) commandCodeKeysWithAuthIndex() []commandCodeKeyWithAuthIndex {
+	if h == nil {
+		return nil
+	}
+	liveIndexByID := h.liveAuthIndexByID()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return nil
+	}
+	idGen := synthesizer.NewStableIDGenerator()
+	out := make([]commandCodeKeyWithAuthIndex, len(h.cfg.CommandCodeKey))
+	for i := range h.cfg.CommandCodeKey {
+		entry := h.cfg.CommandCodeKey[i]
+		baseURL := strings.TrimSpace(entry.BaseURL)
+		if baseURL == "" {
+			baseURL = config.DefaultCommandCodeBaseURL
+		}
+		id, _ := idGen.Next("command-code:apikey", strings.TrimSpace(entry.APIKey), baseURL)
+		modelCount := len(entry.Models)
+		if modelCount == 0 {
+			modelCount = len(registry.GetCommandCodeModels())
+		}
+		out[i] = commandCodeKeyWithAuthIndex{CommandCodeKey: entry, AuthIndex: liveIndexByID[id], ModelCount: modelCount}
 	}
 	return out
 }

@@ -413,6 +413,10 @@ func configuredModelAliasEntries(cfg *internalconfig.Config, auth *Auth) []model
 		if entry := resolveXAIAPIKeyConfig(cfg, auth); entry != nil {
 			models = asModelAliasEntries(entry.Models)
 		}
+	case "command-code":
+		if entry := resolveCommandCodeAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
 	case "opencode-go":
 		if entry := resolveOpenCodeGoAPIKeyConfig(cfg, auth); entry != nil {
 			models = asModelAliasEntries(entry.Models)
@@ -573,6 +577,10 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 			if entry := resolveXAIAPIKeyConfig(cfg, auth); entry != nil {
 				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
 			}
+		case "command-code":
+			if entry := resolveCommandCodeAPIKeyConfig(cfg, auth); entry != nil {
+				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+			}
 		case "opencode-go":
 			if entry := resolveOpenCodeGoAPIKeyConfig(cfg, auth); entry != nil {
 				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
@@ -699,6 +707,8 @@ func (m *Manager) applyAPIKeyModelAliasWithRouting(routing *apiKeyModelRoutingSn
 		upstreamModel = resolveUpstreamModelForCodexAPIKey(cfg, auth, requestedModel)
 	case "xai":
 		upstreamModel = resolveUpstreamModelForXAIAPIKey(cfg, auth, requestedModel)
+	case "command-code":
+		upstreamModel = resolveUpstreamModelForCommandCodeAPIKey(cfg, auth, requestedModel)
 	case "opencode-go":
 		upstreamModel = resolveUpstreamModelForOpenCodeGoAPIKey(cfg, auth, requestedModel)
 	case "vertex":
@@ -810,6 +820,13 @@ func resolveOpenCodeGoAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *inte
 	return resolveAPIKeyConfig(cfg.OpenCodeGoKey, auth)
 }
 
+func resolveCommandCodeAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.CommandCodeKey {
+	if cfg == nil {
+		return nil
+	}
+	return resolveAPIKeyConfig(cfg.CommandCodeKey, auth)
+}
+
 func resolveVertexAPIKeyConfig(cfg *internalconfig.Config, auth *Auth) *internalconfig.VertexCompatKey {
 	if cfg == nil {
 		return nil
@@ -859,6 +876,14 @@ func resolveUpstreamModelForXAIAPIKey(cfg *internalconfig.Config, auth *Auth, re
 
 func resolveUpstreamModelForOpenCodeGoAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
 	entry := resolveOpenCodeGoAPIKeyConfig(cfg, auth)
+	if entry == nil {
+		return ""
+	}
+	return resolveModelAliasFromConfigModels(requestedModel, asModelAliasEntries(entry.Models))
+}
+
+func resolveUpstreamModelForCommandCodeAPIKey(cfg *internalconfig.Config, auth *Auth, requestedModel string) string {
+	entry := resolveCommandCodeAPIKeyConfig(cfg, auth)
 	if entry == nil {
 		return ""
 	}

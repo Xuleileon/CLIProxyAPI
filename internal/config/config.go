@@ -131,6 +131,9 @@ type Config struct {
 	// XAIKey defines xAI API key configurations using the same structure as Codex API keys.
 	XAIKey []XAIKey `yaml:"xai-api-key" json:"xai-api-key"`
 
+	// CommandCodeKey defines Command Code subscription credentials.
+	CommandCodeKey []CommandCodeKey `yaml:"command-code-api-key" json:"command-code-api-key"`
+
 	// OpenCodeGoKey defines OpenCode Go subscription credentials.
 	OpenCodeGoKey []OpenCodeGoKey `yaml:"opencode-go-api-key" json:"opencode-go-api-key"`
 

@@ -70,6 +70,28 @@ func mergeExcludedModels(lists ...[]string) []string {
 	return out
 }
 
+func (s *Service) resolveConfigCommandCodeKey(auth *coreauth.Auth) *config.CommandCodeKey {
+	if auth == nil || s == nil || s.cfg == nil {
+		return nil
+	}
+	apiKey, baseURL := "", ""
+	if auth.Attributes != nil {
+		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
+		baseURL = strings.TrimRight(strings.TrimSpace(auth.Attributes["base_url"]), "/")
+	}
+	for i := range s.cfg.CommandCodeKey {
+		entry := &s.cfg.CommandCodeKey[i]
+		if apiKey != "" && !strings.EqualFold(apiKey, strings.TrimSpace(entry.APIKey)) {
+			continue
+		}
+		if baseURL != "" && !strings.EqualFold(baseURL, strings.TrimRight(strings.TrimSpace(entry.BaseURL), "/")) {
+			continue
+		}
+		return entry
+	}
+	return nil
+}
+
 func (s *Service) resolveConfigOpenCodeGoKey(auth *coreauth.Auth) *config.OpenCodeGoKey {
 	if auth == nil || s == nil || s.cfg == nil {
 		return nil

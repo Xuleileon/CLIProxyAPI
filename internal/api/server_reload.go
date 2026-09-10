@@ -220,8 +220,8 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		openAICompatCount += len(entry.APIKeyEntries)
 	}
 
-	total := authEntries + geminiAPIKeyCount + interactionsAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + openCodeGoAPIKeyCount + vertexAICompatCount + openAICompatCount
-	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Interactions API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d OpenCode Go keys + %d Vertex-compat + %d OpenAI-compat)\n",
+	total := authEntries + geminiAPIKeyCount + interactionsAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + xaiAPIKeyCount + openCodeGoAPIKeyCount + len(cfg.CommandCodeKey) + vertexAICompatCount + openAICompatCount
+	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Interactions API keys + %d Claude API keys + %d Codex keys + %d xAI keys + %d OpenCode Go keys + %d Command Code keys + %d Vertex-compat + %d OpenAI-compat)\n",
 		total,
 		authEntries,
 		geminiAPIKeyCount,
@@ -230,6 +230,7 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		codexAPIKeyCount,
 		xaiAPIKeyCount,
 		openCodeGoAPIKeyCount,
+		len(cfg.CommandCodeKey),
 		vertexAICompatCount,
 		openAICompatCount,
 	)
