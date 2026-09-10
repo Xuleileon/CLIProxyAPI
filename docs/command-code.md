@@ -7,12 +7,20 @@ API. No separate reverse-proxy process is required.
 ## Configuration
 
 ```yaml
+force-model-prefix: true
 command-code-api-key:
   - name: Command Code
     api-key: YOUR_COMMAND_CODE_KEY
     prefix: command-code
     # proxy-url: http://127.0.0.1:7897
 ```
+
+Use `force-model-prefix: true` to isolate prefixed providers from unprefixed
+requests. A prefix alone registers both forms by default: without this setting,
+an unprefixed model such as `claude-fable-5-1` can select Command Code or fall back
+to it after another provider fails. The setting applies globally to accounts with
+prefixes; accounts without a prefix keep their existing model IDs. Check other
+prefixed accounts before enabling it on an existing installation.
 
 Restart CPA after upgrading the binary. Subsequent account changes hot-reload.
 The AI Providers workbench supports adding, editing, disabling and deleting
