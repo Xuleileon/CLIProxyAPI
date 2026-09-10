@@ -4,8 +4,8 @@ import "testing"
 
 func TestOpenCodeGoCatalogProtocols(t *testing.T) {
 	models := GetOpenCodeGoModels()
-	if len(models) != 26 {
-		t.Fatalf("model count = %d, want 26", len(models))
+	if len(models) != 27 {
+		t.Fatalf("model count = %d, want 27", len(models))
 	}
 	if got := OpenCodeGoProtocolForModel("minimax-m3"); got != "anthropic" {
 		t.Fatalf("minimax protocol = %q", got)
