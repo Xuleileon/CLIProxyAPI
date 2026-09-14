@@ -357,8 +357,10 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 		if lower == "" {
 			continue
 		}
-		if strings.Contains(lower, "selected model is at capacity") ||
-			strings.Contains(lower, "model is at capacity. please try a different model") {
+		if strings.Contains(lower, "model is at capacity") ||
+			strings.Contains(lower, "model_at_capacity") ||
+			strings.Contains(lower, "model_is_at_capacity") ||
+			(strings.Contains(lower, "model") && strings.Contains(lower, "at capacity")) {
 			return true
 		}
 	}
@@ -451,6 +453,9 @@ func newCodexBootstrapOverloadErr(body []byte) statusErr {
 // Only these failures justify replacing the whole attempt during bootstrap; every other terminal
 // failure keeps the original in-stream delivery semantics so downstream behaviour is unchanged.
 func isCodexOverloadBootstrapFailure(body []byte) bool {
+	if isCodexModelCapacityError(body) {
+		return true
+	}
 	errorType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
 	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
 	switch {

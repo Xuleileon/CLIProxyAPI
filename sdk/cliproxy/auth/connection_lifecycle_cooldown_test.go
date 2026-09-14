@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/http2"
 )
 
 func TestManager_MarkResult_ConnectionLifecycleDoesNotCooldown(t *testing.T) {
@@ -35,6 +36,8 @@ func TestManager_MarkResult_ConnectionLifecycleDoesNotCooldown(t *testing.T) {
 		{name: "plain EOF", err: &Error{Message: "EOF"}},
 		{name: "wrapped unexpected EOF", err: &Error{Message: "read tcp 127.0.0.1:1->127.0.0.1:2: unexpected EOF"}},
 		{name: "typed canceled", err: resultErrorFromError(context.Canceled)},
+		{name: "HTTP2 protocol reset", err: resultErrorFromError(&url.Error{Op: "Post", URL: "https://example.com", Err: http2.StreamError{StreamID: 1, Code: http2.ErrCodeProtocol}})},
+		{name: "HTTP2 goaway", err: resultErrorFromError(http2.GoAwayError{LastStreamID: 1, ErrCode: http2.ErrCodeProtocol})},
 		{name: "typed deadline", err: resultErrorFromError(context.DeadlineExceeded)},
 		{name: "url canceled", err: resultErrorFromError(&url.Error{Op: "Post", URL: "https://example.com", Err: context.Canceled})},
 		{name: "url deadline", err: resultErrorFromError(&url.Error{Op: "Post", URL: "https://example.com", Err: context.DeadlineExceeded})},

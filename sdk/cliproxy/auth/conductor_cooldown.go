@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"golang.org/x/net/http2"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1386,6 +1387,13 @@ func isConnectionLifecycleError(err error) bool {
 	// Credential/auth/quota statuses must never be reclassified from response text.
 	if statusCodeFromError(err) != 0 {
 		return false
+	}
+	// HTTP/2 peer resets describe a transport failure, not account health.
+	var streamErr http2.StreamError
+	var goAwayErr http2.GoAwayError
+	var connectionErr http2.ConnectionError
+	if errors.As(err, &streamErr) || errors.As(err, &goAwayErr) || errors.As(err, &connectionErr) {
+		return true
 	}
 	// Client abort and request-scoped timeouts are not credential faults.
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {

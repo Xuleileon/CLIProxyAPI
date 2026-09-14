@@ -145,6 +145,10 @@ func enforceLogDirSizeLimit(logDir string, maxBytes int64, protectedPath string)
 		if protected != "" && filepath.Clean(file.path) == protected {
 			continue
 		}
+		// The Windows launcher holds these streams open for the process lifetime.
+		if name := strings.ToLower(filepath.Base(file.path)); name == "cliproxy-stdout.log" || name == "cliproxy-stderr.log" {
+			continue
+		}
 		if errRemove := os.Remove(file.path); errRemove != nil {
 			log.WithError(errRemove).Warnf("logging: failed to remove old log file: %s", filepath.Base(file.path))
 			continue

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/http/httptrace"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,22 @@ import (
 // DoOpenCodeGoRequest leaves retries to the manager's single request budget.
 // Only a failed connection acquisition can be replayed without ambiguity.
 func DoOpenCodeGoRequest(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error) {
+	// Responses streams must not inherit a wedged shared HTTP/2 connection.
+	// Keep proxy/TLS settings and custom transports, but isolate standard pools.
+	if strings.HasSuffix(req.URL.Path, "/responses") {
+		transport := client.Transport
+		if transport == nil {
+			transport = http.DefaultTransport
+		}
+		if standard, ok := transport.(*http.Transport); ok {
+			isolated := standard.Clone()
+			isolated.DisableKeepAlives = true
+			copyClient := *client
+			copyClient.Transport = isolated
+			client = &copyClient
+			defer isolated.CloseIdleConnections()
+		}
+	}
 	if ginCtx := ginContextFrom(ctx); ginCtx != nil {
 		ginCtx.Header("X-CPA-Retry-Handled", "true")
 	}
@@ -37,8 +54,8 @@ func DoOpenCodeGoRequest(ctx context.Context, client *http.Client, req *http.Req
 		err = openCodeGoTracedConnectionError(err, safeToRetry)
 		fields["retry_safe"] = safeToRetry
 		// Keep URLs, credentials, and arbitrary transport error text out of logs.
-		LogWithRequestID(ctx).WithFields(fields).Warnf("opencode-go: transport failed connected=%t reused=%t retry_safe=%t elapsed_ms=%d tls_done_ms=%d request_written_ms=%d first_byte_ms=%d request_bytes=%d",
-			fields["connected"], fields["reused"], safeToRetry, fields["elapsed_ms"], fields["tls_done_ms"], fields["request_written_ms"], fields["first_byte_ms"], req.ContentLength)
+		LogWithRequestID(ctx).WithFields(fields).Warnf("opencode-go: transport failed connected=%t reused=%t retry_safe=%t elapsed_ms=%d tls_done_ms=%d request_written_ms=%d first_byte_ms=%d request_bytes=%d error_type=%T context_canceled=%t",
+			fields["connected"], fields["reused"], safeToRetry, fields["elapsed_ms"], fields["tls_done_ms"], fields["request_written_ms"], fields["first_byte_ms"], req.ContentLength, err, req.Context().Err() != nil)
 	} else {
 		LogWithRequestID(ctx).WithFields(fields).Debugf("opencode-go: response headers status=%d http=%s connected=%t reused=%t elapsed_ms=%d tls_done_ms=%d request_written_ms=%d first_byte_ms=%d request_bytes=%d",
 			resp.StatusCode, resp.Proto, fields["connected"], fields["reused"], fields["elapsed_ms"], fields["tls_done_ms"], fields["request_written_ms"], fields["first_byte_ms"], req.ContentLength)

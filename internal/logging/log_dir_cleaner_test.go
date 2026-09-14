@@ -68,3 +68,19 @@ func writeLogFile(t *testing.T, path string, size int, modTime time.Time) {
 		t.Fatalf("set times: %v", err)
 	}
 }
+
+func TestEnforceLogDirSizeLimitKeepsLauncherStreams(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"cliproxy-stdout.log", "cliproxy-stderr.log", "old-request.log"} {
+		writeLogFile(t, filepath.Join(dir, name), 60, time.Unix(1, 0))
+	}
+	deleted, err := enforceLogDirSizeLimit(dir, 100, "")
+	if err != nil || deleted != 1 {
+		t.Fatalf("deleted=%d err=%v", deleted, err)
+	}
+	for _, name := range []string{"cliproxy-stdout.log", "cliproxy-stderr.log"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

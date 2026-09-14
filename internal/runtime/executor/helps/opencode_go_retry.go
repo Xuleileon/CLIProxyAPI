@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // OpenCodeGoRetryAfter preserves the provider's delay and supplies the native
@@ -65,7 +67,11 @@ func openCodeGoTracedConnectionError(err error, safeToRetry bool) error {
 		return err
 	}
 	var op *net.OpError
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &op) {
+	var streamErr http2.StreamError
+	var goAwayErr http2.GoAwayError
+	var connectionErr http2.ConnectionError
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &op) ||
+		errors.As(err, &streamErr) || errors.As(err, &goAwayErr) || errors.As(err, &connectionErr) {
 		return openCodeGoConnectionError{error: err, safeToRetry: safeToRetry}
 	}
 	return err
