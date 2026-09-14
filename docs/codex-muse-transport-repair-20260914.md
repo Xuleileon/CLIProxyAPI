@@ -30,3 +30,11 @@ Focused auth, executor, executor-helper, logging, and API-handler packages pass.
 The workspace-wide test command is not green: historical files under `tmp/` and `logs/releases/` fail compilation, the byte-write audit scans old nested worktrees, the Home cancellation test exceeds its timing expectation, and one concurrent Antigravity pool test failed under the broad run while the focused executor package passed. These areas are not modified by this repair. Live transport success is reported separately from full-suite status.
 
 The existing four modified usage-reporting files and associated untracked helpers predate this repair and are preserved. Deployment must retain that existing workspace behavior and keep this repair's commit scoped to its own files.
+
+## Production verification and follow-up
+
+- The first replacement matched the candidate hash, preserved the configuration hash and all nine auth files, and restarted through the original scheduled watchdog.
+- Production Muse completed a tool round trip in 8.05 and 3.27 seconds. Larger existing Muse requests also reached response headers over fresh HTTP/2 connections.
+- Production Codex completed a simple response in 3.86 seconds, but tool-round-trip verification exposed intermittent TLS-handshake EOF before sending the request. These failures did not produce the former credential cooldown cascade.
+- A follow-up allows at most two EOF reconnects during Codex connection acquisition, before submitting any HTTP request. It does not retry post-submission failures, alter TLS identity, or add stream deadlines. Regression tests verify the bounded attempts and that the request body remains unread.
+- Formal-source testing confirms the remaining unrelated Home cancellation and nested-directory byte-write-audit failures; the affected packages pass focused tests.

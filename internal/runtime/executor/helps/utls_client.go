@@ -111,6 +111,18 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	addr := net.JoinHostPort(hostname, port)
 
 	h2Conn, err := t.createConnection(req.Context(), hostname, addr)
+	// EOF during connection acquisition is safe to retry: no HTTP request has
+	// been submitted. Never retry RoundTrip below, which may have sent work.
+	for retry := 0; err != nil && retry < 2 && (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)); retry++ {
+		timer := time.NewTimer(time.Duration(retry+1) * 100 * time.Millisecond)
+		select {
+		case <-req.Context().Done():
+			timer.Stop()
+			return nil, req.Context().Err()
+		case <-timer.C:
+		}
+		h2Conn, err = t.createConnection(req.Context(), hostname, addr)
+	}
 	if err != nil {
 		return nil, err
 	}
