@@ -850,6 +850,15 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if isRequestInvalidError(err) || isRequestStopError(err) {
 		return 0, false
 	}
+	// Proven acquisition failures carry their own retry hint without cooling auth.
+	var lifecycle interface{ IsConnectionLifecycle() bool }
+	if errors.As(err, &lifecycle) && lifecycle.IsConnectionLifecycle() {
+		delay := retryAfterFromError(err)
+		if delay != nil && *delay > 0 && *delay <= maxWait && m.retryAllowed(attempt, providers) {
+			return *delay, true
+		}
+		return 0, false
+	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
 	if found {
 		if wait > maxWait {

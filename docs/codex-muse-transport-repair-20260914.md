@@ -85,3 +85,12 @@ Deployment of the follow-up:
 - The short post-restart observation contained five HTTP 200 completions and
   no logged OpenCode transport failures. This is an acceptance observation,
   not a long-term availability claim.
+
+
+## TLS timeout classification follow-up
+
+A real local TCP listener that accepts but never completes TLS reproduced Go's private `http.tlsHandshakeTimeoutError`. It did not match context deadline or net.OpError checks and previously made a healthy model unavailable for approximately 60 seconds.
+
+The fix recognizes typed network timeouts and socket operation failures, preserves an explicit executor transport marker across local 502 conversion, and decouples acquisition retry hints from credential cooldown state. Submitted requests remain request-scoped and cannot be replayed. Explicit upstream 401/403/429/502 responses retain existing cooldown semantics. OpenCode failure summaries now include the root error type without logging URLs, credentials, or payloads.
+
+Validation: real TLS timeout regression; raw and marked gateway classification; explicit upstream status controls; complete OpenCode executor retry-budget, cancellation/submission and no-cooldown assertions; helper and logging packages; targeted auth/Codex/OpenCode tests; server build. Existing unrelated usage changes remain present in the local binary and excluded from this commit. Codex WebSocket routing is unchanged; no claim is made that upstream protocol failures have been eliminated.

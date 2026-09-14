@@ -49,9 +49,10 @@ type openCodeGoConnectionError struct {
 	safeToRetry bool
 }
 
-func (e openCodeGoConnectionError) Unwrap() error         { return e.error }
-func (e openCodeGoConnectionError) StatusCode() int       { return http.StatusBadGateway }
-func (e openCodeGoConnectionError) IsRequestScoped() bool { return !e.safeToRetry }
+func (e openCodeGoConnectionError) Unwrap() error               { return e.error }
+func (e openCodeGoConnectionError) IsConnectionLifecycle() bool { return true }
+func (e openCodeGoConnectionError) StatusCode() int             { return http.StatusBadGateway }
+func (e openCodeGoConnectionError) IsRequestScoped() bool       { return !e.safeToRetry }
 func (e openCodeGoConnectionError) RetryAfter() *time.Duration {
 	if !e.safeToRetry {
 		return nil
@@ -67,10 +68,11 @@ func openCodeGoTracedConnectionError(err error, safeToRetry bool) error {
 		return err
 	}
 	var op *net.OpError
+	var timeout net.Error
 	var streamErr http2.StreamError
 	var goAwayErr http2.GoAwayError
 	var connectionErr http2.ConnectionError
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &op) ||
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &op) || (errors.As(err, &timeout) && timeout.Timeout()) ||
 		errors.As(err, &streamErr) || errors.As(err, &goAwayErr) || errors.As(err, &connectionErr) {
 		return openCodeGoConnectionError{error: err, safeToRetry: safeToRetry}
 	}

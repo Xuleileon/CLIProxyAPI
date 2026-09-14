@@ -10,6 +10,25 @@ import (
 	"time"
 )
 
+type handshakeTimeoutForTest struct{}
+
+func (handshakeTimeoutForTest) Error() string   { return "net/http: TLS handshake timeout" }
+func (handshakeTimeoutForTest) Timeout() bool   { return true }
+func (handshakeTimeoutForTest) Temporary() bool { return true }
+
+func TestOpenCodeTimeoutReplayBoundary(t *testing.T) {
+	for _, safe := range []bool{false, true} {
+		err := openCodeGoTracedConnectionError(&url.Error{Op: "Post", URL: "https://example.invalid", Err: handshakeTimeoutForTest{}}, safe)
+		wrapped, ok := err.(openCodeGoConnectionError)
+		if !ok || !wrapped.IsConnectionLifecycle() {
+			t.Fatalf("missing transport classification: %T", err)
+		}
+		if (wrapped.RetryAfter() != nil) != safe || wrapped.IsRequestScoped() == safe {
+			t.Fatalf("incorrect replay boundary: safe=%v", safe)
+		}
+	}
+}
+
 func TestOpenCodeGoRetryAfter(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

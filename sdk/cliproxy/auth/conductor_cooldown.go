@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -1376,6 +1377,11 @@ func isConnectionLifecycleError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Executors may expose a local gateway status for a proven transport failure.
+	var lifecycle interface{ IsConnectionLifecycle() bool }
+	if errors.As(err, &lifecycle) && lifecycle.IsConnectionLifecycle() {
+		return true
+	}
 	// Typed WebSocket close codes are an unambiguous connection lifecycle signal.
 	var closeErr *websocket.CloseError
 	if errors.As(err, &closeErr) && closeErr != nil {
@@ -1387,6 +1393,11 @@ func isConnectionLifecycleError(err error) bool {
 	// Credential/auth/quota statuses must never be reclassified from response text.
 	if statusCodeFromError(err) != 0 {
 		return false
+	}
+	var timeout net.Error
+	var op *net.OpError
+	if (errors.As(err, &timeout) && timeout.Timeout()) || errors.As(err, &op) {
+		return true
 	}
 	// HTTP/2 peer resets describe a transport failure, not account health.
 	var streamErr http2.StreamError

@@ -20,6 +20,7 @@ import (
 )
 
 type openCodeGoFaultTransport struct {
+	failure    error
 	attempts   int
 	sent       bool
 	alwaysFail bool
@@ -40,6 +41,9 @@ func (tr *openCodeGoFaultTransport) RoundTrip(req *http.Request) (*http.Response
 		trace.WroteRequest(httptrace.WroteRequestInfo{})
 	}
 	if tr.attempts == 1 || tr.alwaysFail {
+		if tr.failure != nil {
+			return nil, tr.failure
+		}
 		return nil, io.EOF
 	}
 	return &http.Response{
@@ -48,19 +52,31 @@ func (tr *openCodeGoFaultTransport) RoundTrip(req *http.Request) (*http.Response
 	}, nil
 }
 
+type openCodeHandshakeTimeout struct{}
+
+func (openCodeHandshakeTimeout) Error() string   { return "net/http: TLS handshake timeout" }
+func (openCodeHandshakeTimeout) Timeout() bool   { return true }
+func (openCodeHandshakeTimeout) Temporary() bool { return true }
+
 func TestOpenCodeGoTransportRetryBoundary(t *testing.T) {
 	for _, tc := range []struct {
 		name                string
+		timeout             bool
 		sent, alwaysFail    bool
 		retry, wantAttempts int
 	}{
-		{"unsent reconnect", false, false, 1, 2},
-		{"submitted request stops", true, false, 3, 1},
-		{"total budget", false, true, 1, 2},
-		{"disabled retries", false, false, 0, 1},
+		{"unsent reconnect", false, false, false, 1, 2},
+		{"submitted request stops", false, true, false, 3, 1},
+		{"total budget", false, false, true, 1, 2},
+		{"disabled retries", false, false, false, 0, 1},
+		{"unsent reconnect", true, false, false, 1, 2},
+		{"timeout budget", true, false, true, 1, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tr := &openCodeGoFaultTransport{sent: tc.sent, alwaysFail: tc.alwaysFail}
+			if tc.timeout {
+				tr.failure = openCodeHandshakeTimeout{}
+			}
 			writer := httptest.NewRecorder()
 			gc, _ := gin.CreateTestContext(writer)
 			ctx := context.WithValue(context.Background(), "gin", gc)
@@ -93,6 +109,10 @@ func TestOpenCodeGoTransportRetryBoundary(t *testing.T) {
 			}
 			if tr.attempts != tc.wantAttempts {
 				t.Fatalf("attempts=%d, want %d", tr.attempts, tc.wantAttempts)
+			}
+			updated, _ := manager.GetByID(auth.ID)
+			if state := updated.ModelStates[model]; state != nil && state.Unavailable {
+				t.Fatal("transport failure cooled healthy credential")
 			}
 			if tc.sent && !errors.Is(err, io.EOF) {
 				t.Fatalf("lost error cause: %v", err)

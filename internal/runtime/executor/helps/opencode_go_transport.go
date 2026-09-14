@@ -3,6 +3,8 @@ package helps
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptrace"
 	"strings"
@@ -59,11 +61,16 @@ func DoOpenCodeGoRequest(ctx context.Context, client *http.Client, req *http.Req
 		fields["http"] = resp.Proto
 	}
 	if err != nil {
+		root := err
+		for errors.Unwrap(root) != nil {
+			root = errors.Unwrap(root)
+		}
+		rootType := fmt.Sprintf("%T", root)
 		err = openCodeGoTracedConnectionError(err, safeToRetry)
 		fields["retry_safe"] = safeToRetry
 		// Keep URLs, credentials, and arbitrary transport error text out of logs.
-		LogWithRequestID(ctx).WithFields(fields).Warnf("opencode-go: transport failed connected=%t reused=%t retry_safe=%t elapsed_ms=%d tls_done_ms=%d request_written_ms=%d first_byte_ms=%d request_bytes=%d error_type=%T context_canceled=%t",
-			fields["connected"], fields["reused"], safeToRetry, fields["elapsed_ms"], fields["tls_done_ms"], fields["request_written_ms"], fields["first_byte_ms"], req.ContentLength, err, req.Context().Err() != nil)
+		LogWithRequestID(ctx).WithFields(fields).Warnf("opencode-go: transport failed connected=%t reused=%t retry_safe=%t elapsed_ms=%d tls_done_ms=%d request_written_ms=%d first_byte_ms=%d request_bytes=%d error_type=%T root_type=%s context_canceled=%t",
+			fields["connected"], fields["reused"], safeToRetry, fields["elapsed_ms"], fields["tls_done_ms"], fields["request_written_ms"], fields["first_byte_ms"], req.ContentLength, err, rootType, req.Context().Err() != nil)
 	} else {
 		LogWithRequestID(ctx).WithFields(fields).Debugf("opencode-go: response headers status=%d http=%s connected=%t reused=%t elapsed_ms=%d tls_done_ms=%d request_written_ms=%d first_byte_ms=%d request_bytes=%d",
 			resp.StatusCode, resp.Proto, fields["connected"], fields["reused"], fields["elapsed_ms"], fields["tls_done_ms"], fields["request_written_ms"], fields["first_byte_ms"], req.ContentLength)
