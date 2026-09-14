@@ -210,6 +210,7 @@ func (e *OpenCodeGoExecutor) translateStream(ctx context.Context, body io.ReadCl
 			switch gjson.GetBytes(payload, "type").String() {
 			case "response.completed", "response.incomplete", "message_stop":
 				terminal = true
+				helps.MarkOpenCodeGoResponseComplete(body)
 			}
 			if streamErr, ok := openAICompatStreamDataError(payload, ""); ok {
 				streamErr.retryAfter = helps.OpenCodeGoRetryAfter(headers, streamErr.code, payload)

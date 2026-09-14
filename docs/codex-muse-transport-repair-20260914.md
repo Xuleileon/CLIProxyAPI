@@ -40,3 +40,33 @@ The existing four modified usage-reporting files and associated untracked helper
 - Formal-source testing confirms the remaining unrelated Home cancellation and nested-directory byte-write-audit failures; the affected packages pass focused tests.
 - Final deployed code revision: `93419268` plus preserved existing usage changes. Production Codex tool turns completed in 2.50 and 2.98 seconds; Muse tool turns completed in 4.00 and 13.72 seconds. All four responses ended with `response.completed`, and both tool-result checks passed.
 - Final executable SHA-256: `14E22F85510653A05D3D95C9CA88DE3BB17B7B2A447CAA6EF4AA31871D34723D`. The original port is 18317, configuration is unchanged, and all nine production auth files remain present. The isolated staging process has been stopped.
+
+## Follow-up: reuse completed connections without sharing active streams
+
+Repeated connection acquisition EOF remained after the first repair. Always
+opening a new connection exposed every request to that unreliable handshake.
+The follow-up replaces the per-request discard policy with exclusive transport
+leases. A response that reaches EOF or a parsed terminal SSE event can return
+its transport for reuse after body close; canceled, truncated, failed, or
+prematurely closed streams discard their lease. Active requests never share
+the same HTTP/2 transport. A bounded cache keeps at most four idle transports
+per original transport and evicts old pools without interrupting active work.
+Custom transports, proxy settings, request retry budgets, and streaming
+deadlines are unchanged. No Clash routing or node configuration was changed.
+
+Validation:
+
+- A local HTTP/2 server verifies healthy reuse, concurrent stream isolation,
+  canceled/truncated body eviction, terminal-SSE close without waiting for body
+  EOF, and late lease return after pool eviction.
+- Focused executor, helper, auth, and handler packages pass. The pool tests also
+  pass Go's race detector.
+- Four old-version requests completed in 11.78, 23.14, 3.11, and 5.14 seconds.
+  Four isolated follow-up requests completed in 12.81, 2.17, 7.98, and 4.75
+  seconds. This small sequential sample is not a general latency benchmark.
+  The follow-up logs directly confirm reused HTTP/2 connections with zero new
+  TLS handshake time after the first request.
+- The isolated tool round trip completed in 4.78 and 1.91 seconds, with both
+  responses ending in `response.completed` and the returned tool value verified.
+- Initial connection acquisition can still fail; reuse reduces exposure to the
+  failure rather than proving the underlying network/provider issue is gone.

@@ -15,20 +15,21 @@ import (
 // DoOpenCodeGoRequest leaves retries to the manager's single request budget.
 // Only a failed connection acquisition can be replayed without ambiguity.
 func DoOpenCodeGoRequest(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error) {
-	// Responses streams must not inherit a wedged shared HTTP/2 connection.
-	// Keep proxy/TLS settings and custom transports, but isolate standard pools.
+	var pool *openCodeGoPool
+	var leased *http.Transport
+	// Reuse only completed connections and never multiplex active Responses
+	// requests onto the same transport. Preserve custom transports unchanged.
 	if strings.HasSuffix(req.URL.Path, "/responses") {
 		transport := client.Transport
 		if transport == nil {
 			transport = http.DefaultTransport
 		}
 		if standard, ok := transport.(*http.Transport); ok {
-			isolated := standard.Clone()
-			isolated.DisableKeepAlives = true
+			pool = openCodeGoPools.GetOrAdd(standard, func() *openCodeGoPool { return &openCodeGoPool{} })
+			leased = pool.acquire(standard)
 			copyClient := *client
-			copyClient.Transport = isolated
+			copyClient.Transport = leased
 			client = &copyClient
-			defer isolated.CloseIdleConnections()
 		}
 	}
 	if ginCtx := ginContextFrom(ctx); ginCtx != nil {
@@ -37,6 +38,13 @@ func DoOpenCodeGoRequest(ctx context.Context, client *http.Client, req *http.Req
 	trace := &openCodeGoHTTPTrace{started: time.Now()}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace.hooks()))
 	resp, err := client.Do(req)
+	if leased != nil {
+		if err != nil {
+			pool.release(leased, false)
+		} else {
+			resp.Body = &openCodeGoLeasedBody{ReadCloser: resp.Body, pool: pool, transport: leased}
+		}
+	}
 	trace.mu.Lock()
 	safeToRetry := trace.acquiring && !trace.connected
 	fields := log.Fields{
