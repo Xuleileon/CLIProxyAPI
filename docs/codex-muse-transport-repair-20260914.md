@@ -70,3 +70,18 @@ Validation:
   responses ending in `response.completed` and the returned tool value verified.
 - Initial connection acquisition can still fail; reuse reduces exposure to the
   failure rather than proving the underlying network/provider issue is gone.
+
+Deployment of the follow-up:
+
+- Code revision `ea78c5f5` plus the preserved existing usage changes is running
+  on port 18317. Executable SHA-256 is
+  `795C081FA5C6E2ECC929CDC2F03571C2CAA0EBF6198876DDBC4C23C6268DF7C3`.
+- Configuration hash is unchanged and all nine production auth files remain.
+  The isolated test process was stopped and its temporary config removed.
+- Production Muse tool turns completed in 4.53 and 1.83 seconds, with the
+  second turn logging `reused=true` and `tls_done_ms=0`. Both returned terminal
+  completion events and the tool result check passed. Codex also completed in
+  3.33 seconds.
+- The short post-restart observation contained five HTTP 200 completions and
+  no logged OpenCode transport failures. This is an acceptance observation,
+  not a long-term availability claim.
