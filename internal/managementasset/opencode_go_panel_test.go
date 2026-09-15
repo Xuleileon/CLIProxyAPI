@@ -2,6 +2,7 @@ package managementasset
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -82,5 +83,69 @@ func TestPatchManagementHTMLForOpenCodeGoCurrentBundle(t *testing.T) {
 		if errWrite := os.WriteFile(outputPath, patched, 0o644); errWrite != nil {
 			t.Fatalf("write patched management panel: %v", errWrite)
 		}
+	}
+}
+
+func TestPatchManagementHTMLForOpenCodeGoSeptemberBundle(t *testing.T) {
+	t.Setenv("MANAGEMENT_PANEL_TEST_PATH", filepath.Join("testdata", "opencode_go_september_bundle.txt"))
+	t.Setenv("MANAGEMENT_PANEL_PATCHED_OUTPUT", "")
+	TestPatchManagementHTMLForOpenCodeGoCurrentBundle(t)
+}
+
+func TestOpenCodeGoSeptemberProviderPatchIsAtomic(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "opencode_go_september_bundle.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := strings.ReplaceAll(string(data), "NE=[`kimi`,`gemini`", "NE=[`changed`,`gemini`")
+	got, ok := patchManagementHTMLForOpenCodeGoProvider(input)
+	if ok || got != input {
+		t.Fatal("unsupported provider bundle must remain unchanged")
+	}
+}
+
+// Execute the injected handler to catch scope collisions in minified bundles.
+func TestOpenCodeGoSeptemberSaveHandler(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("Node.js is required for the injected JavaScript behavioral check")
+	}
+	data, err := os.ReadFile(filepath.Join("testdata", "opencode_go_september_bundle.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	patched := patchSeptemberOpenCodeGoOAuth(string(data))
+	start := strings.Index(patched, "saveOpenCodeGo=async")
+	if start < 0 {
+		t.Fatal("missing save handler")
+	}
+	end := strings.Index(patched[start:], "},P=(r,i=!1)=>{")
+	if end < 0 {
+		t.Fatal("missing handler boundary")
+	}
+	script := `const assert = require('node:assert/strict');
+let entries = [{'api-key':'existing',name:'Keep', 'auth-index':'runtime-only'}], writes=0, clears=0, fail=false;
+let notices=[], openCodeGoState={apiKey:'new-key'}, saveOpenCodeGo;
+const e=x=>x, i=(message,type)=>notices.push({message,type}), Dc=e=>e.message;
+const setOpenCodeGoState=f=>{openCodeGoState=f(openCodeGoState)};
+const Xp={getState:()=>({clearCache:()=>clears++})};
+const Tp={get:async()=>({'opencode-go-api-key':entries}),put:async(path,value)=>{if(fail)throw Error('test failure'); entries=value;writes++}};
+` + patched[start:start+end+1] + `;
+(async()=>{
+ await saveOpenCodeGo();
+ assert.equal(openCodeGoState.status,'success');
+ assert.equal(notices.at(-1).type,'success');
+ assert.equal(entries.length,2); assert.equal(entries[0].name,'Keep');
+ assert.equal(entries[0]['auth-index'],undefined); assert.equal(clears,1);
+ openCodeGoState.apiKey='new-key'; await saveOpenCodeGo(); assert.equal(entries.length,2);
+ openCodeGoState.apiKey=''; await saveOpenCodeGo(); assert.equal(notices.at(-1).type,'warning'); assert.equal(writes,2);
+ fail=true; openCodeGoState.apiKey='failed-key'; await saveOpenCodeGo();
+ assert.equal(openCodeGoState.status,'error'); assert.equal(openCodeGoState.error,'test failure');
+ assert.equal(notices.at(-1).type,'error'); assert.equal(writes,2);
+})().catch(err=>{console.error(err);process.exitCode=1});`
+	cmd := exec.Command(node)
+	cmd.Stdin = strings.NewReader(script)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("save handler: %v\n%s", err, output)
 	}
 }

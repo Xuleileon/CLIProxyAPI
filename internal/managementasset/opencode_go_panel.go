@@ -31,6 +31,7 @@ func patchManagementHTMLForOpenCodeGo(data []byte) []byte {
 	s := string(data)
 	original := s
 
+	s = patchSeptemberOpenCodeGoOAuth(s)
 	if !strings.Contains(s, "saveOpenCodeGo=async") {
 		if strings.Count(s, openCodeGoStateAnchor) != 1 || strings.Count(s, openCodeGoHandlerAnchor) != 1 {
 			log.Debug("management panel OpenCode Go patch skipped: OAuth page anchors not found")
@@ -107,4 +108,22 @@ func EnsureOpenCodeGoOnDisk(localPath string) {
 	if errWrite := atomicWriteFile(localPath, patched); errWrite != nil {
 		log.WithError(errWrite).Warn("failed to write management panel OpenCode Go patch")
 	}
+}
+
+// patchSeptemberOpenCodeGoOAuth handles the redesigned OAuth page separately.
+func patchSeptemberOpenCodeGoOAuth(input string) string {
+	if strings.Contains(input, "saveOpenCodeGo=async") {
+		return input
+	}
+	state := "[u,d]=(0,y.useState)({fileName:``,location:``,loading:!1}),f="
+	handler := "},P=(r,i=!1)=>{"
+	cardReplace := strings.NewReplacer("SM", "DM", "$M", "aN")
+	card := cardReplace.Replace(openCodeGoCurrentCardAnchor)
+	if strings.Count(input, state) != 1 || strings.Count(input, handler) != 1 || strings.Count(input, card) != 1 {
+		return input
+	}
+	input = strings.Replace(input, state, "[u,d]=(0,y.useState)({fileName:``,location:``,loading:!1}),[openCodeGoState,setOpenCodeGoState]=(0,y.useState)({apiKey:``,loading:!1,status:``,error:``}),f=", 1)
+	save := strings.NewReplacer("async()=>{let t=openCodeGoState", "async()=>{let notifyOpenCodeGo=i,t=openCodeGoState", "r(e(", "notifyOpenCodeGo(e(", "r(`${", "notifyOpenCodeGo(`${", "},N=(n,r=!1)=>{", handler).Replace(openCodeGoCurrentHandlerPatch)
+	input = strings.Replace(input, handler, save, 1)
+	return strings.Replace(input, card, cardReplace.Replace(openCodeGoCurrentCard)+card, 1)
 }

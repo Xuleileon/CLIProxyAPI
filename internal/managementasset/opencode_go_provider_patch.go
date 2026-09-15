@@ -125,7 +125,10 @@ func patchManagementHTMLForOpenCodeGoProvider(input string) (string, bool) {
 	if result, ok := applyOpenCodeGoBundlePatches(input, legacyPatches); ok {
 		return result, true
 	}
-	return applyOpenCodeGoBundlePatches(input, currentOpenCodeGoBundlePatches())
+	if result, ok := applyOpenCodeGoBundlePatches(input, currentOpenCodeGoBundlePatches()); ok {
+		return result, true
+	}
+	return applyOpenCodeGoBundlePatches(input, septemberOpenCodeGoBundlePatches())
 }
 
 func applyOpenCodeGoBundlePatches(input string, patches []openCodeGoBundlePatch) (string, bool) {
@@ -256,6 +259,12 @@ func patchManagementHTMLForOpenCodeGoAccountCell(input string) (string, bool) {
 		},
 	}
 	for _, patch := range patches {
+		if strings.Contains(patch[0], "MT.primaryCell") {
+			old := strings.ReplaceAll(patch[0], "MT.", "NT.")
+			if strings.Count(input, old) == 1 {
+				return strings.Replace(input, old, strings.ReplaceAll(patch[1], "MT.", "NT."), 1), true
+			}
+		}
 		if strings.Count(input, patch[0]) == 1 {
 			return strings.Replace(input, patch[0], patch[1], 1), true
 		}
@@ -285,4 +294,28 @@ func patchManagementHTMLForOpenCodeGoDashboardCount(input string) (string, bool)
 		}
 	}
 	return input, false
+}
+
+// septemberOpenCodeGoBundlePatches supports the management bundle served on
+// September 15, 2026. Keep exact anchors so unknown layouts remain untouched.
+func septemberOpenCodeGoBundlePatches() []openCodeGoBundlePatch {
+	replace := strings.NewReplacer(
+		"ry", "ay", "Qv", "ey", "Yv", "Zv", "Jv", "Xv",
+		"Hv", "Wv", "Bv", "Hv", "Kv", "Jv", "Vv", "Uv",
+		"AE", "jE", "jE", "NE", "gD", "vD", "LD", "zD",
+		"AD", "MD", "RD", "BD", "QD", "eO",
+	)
+	patches := currentOpenCodeGoBundlePatches()
+	for i := range patches {
+		patches[i].old = replace.Replace(patches[i].old)
+		patches[i].new = replace.Replace(patches[i].new)
+	}
+	// The resource switch now assigns to s instead of i.
+	for i := range patches {
+		if strings.HasPrefix(patches[i].old, "case`vertex`:i=") {
+			patches[i].old = strings.ReplaceAll(patches[i].old, ":i=", ":s=")
+			patches[i].new = strings.ReplaceAll(patches[i].new, ":i=", ":s=")
+		}
+	}
+	return patches
 }
