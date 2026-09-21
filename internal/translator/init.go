@@ -28,6 +28,7 @@ import (
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/interactions/responses"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/chat-completions"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
+	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/responses/claude"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/responses/openai/chat-completions"
 
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/antigravity/claude"

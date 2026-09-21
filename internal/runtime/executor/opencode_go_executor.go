@@ -269,6 +269,12 @@ func (e *OpenCodeGoExecutor) preparePayload(payload, original []byte, req clipro
 	payload = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), opts.SourceFormat.String(), "", payload, original, helps.PayloadRequestedModel(opts, req.Model), helps.PayloadRequestPath(opts), opts.Headers)
 	payload, _ = sjson.SetBytes(payload, "model", baseModel)
 	payload, _ = sjson.SetBytes(payload, "stream", stream)
+	if protocol == config.OpenCodeGoProtocolResponses && strings.HasPrefix(strings.ToLower(baseModel), "muse-spark-") {
+		// Muse rejects the one-token availability probes used by Claude Desktop.
+		if limit := gjson.GetBytes(payload, "max_output_tokens"); limit.Type == gjson.Number && limit.Int() > 0 && limit.Int() < 16 {
+			payload, _ = sjson.SetBytes(payload, "max_output_tokens", 16)
+		}
+	}
 	if protocol == config.OpenCodeGoProtocolClaude {
 		payload = sanitizeOpenCodeGoAnthropicPayload(payload)
 		payload = ensureModelMaxTokens(payload, baseModel)
