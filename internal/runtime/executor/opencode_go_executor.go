@@ -41,6 +41,11 @@ func (e *OpenCodeGoExecutor) RequestToFormat(req cliproxyexecutor.Request, _ cli
 }
 
 func (e *OpenCodeGoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	req, opts = helps.NormalizeOpenCodeGoRequest(req, opts)
+	// Compact must use its own endpoint, never an ordinary generation request.
+	if opts.Alt == "responses/compact" {
+		return e.chat.Execute(ctx, auth, req, opts)
+	}
 	protocol := e.protocolFor(auth, req.Model)
 	if protocol == config.OpenCodeGoProtocolOpenAI {
 		return e.chat.Execute(ctx, auth, req, opts)
@@ -49,6 +54,10 @@ func (e *OpenCodeGoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Aut
 }
 
 func (e *OpenCodeGoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if opts.Alt == "responses/compact" {
+		return nil, statusErr{code: http.StatusBadRequest, msg: "responses/compact does not support streaming"}
+	}
+	req, opts = helps.NormalizeOpenCodeGoRequest(req, opts)
 	protocol := e.protocolFor(auth, req.Model)
 	if protocol == config.OpenCodeGoProtocolOpenAI {
 		return e.chat.ExecuteStream(ctx, auth, req, opts)
@@ -57,6 +66,7 @@ func (e *OpenCodeGoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyau
 }
 
 func (e *OpenCodeGoExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	req, opts = helps.NormalizeOpenCodeGoRequest(req, opts)
 	return e.chat.CountTokens(ctx, auth, req, opts)
 }
 
@@ -248,7 +258,11 @@ func (e *OpenCodeGoExecutor) translateStream(ctx context.Context, body io.ReadCl
 	if from == to && !flushNative() {
 		return
 	}
-	if errScan := scanner.Err(); errScan != nil {
+	errScan := scanner.Err()
+	if errScan == nil && !terminal {
+		errScan = io.ErrUnexpectedEOF
+	}
+	if errScan != nil {
 		select {
 		case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 		case <-ctx.Done():
@@ -385,13 +399,31 @@ func openCodeGoEndpoint(protocol string) string {
 
 func sanitizeOpenCodeGoAnthropicPayload(payload []byte) []byte {
 	var root map[string]any
-	if json.Unmarshal(payload, &root) != nil {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if decoder.Decode(&root) != nil || root == nil {
 		return payload
 	}
 	for _, key := range []string{"thinking", "reasoning", "reasoning_effort", "effort", "level", "depth", "output_config"} {
 		delete(root, key)
 	}
-	root = stripOpenCodeGoAnthropicExtensions(root).(map[string]any)
+	if system, exists := root["system"]; exists {
+		root["system"] = helps.StripOpenCodeGoAnthropicContent(system)
+	}
+	if messages, ok := root["messages"].([]any); ok {
+		for _, item := range messages {
+			if message, okMessage := item.(map[string]any); okMessage {
+				message["content"] = helps.StripOpenCodeGoAnthropicContent(message["content"])
+			}
+		}
+	}
+	if tools, ok := root["tools"].([]any); ok {
+		for _, item := range tools {
+			if tool, okTool := item.(map[string]any); okTool {
+				delete(tool, "cache_control")
+			}
+		}
+	}
 	if system, ok := root["system"].([]any); ok {
 		parts := make([]string, 0, len(system))
 		for _, item := range system {
@@ -408,32 +440,4 @@ func sanitizeOpenCodeGoAnthropicPayload(payload []byte) []byte {
 		return payload
 	}
 	return clean
-}
-
-func stripOpenCodeGoAnthropicExtensions(value any) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(typed))
-		for key, child := range typed {
-			if key == "cache_control" || key == "signature" {
-				continue
-			}
-			out[key] = stripOpenCodeGoAnthropicExtensions(child)
-		}
-		return out
-	case []any:
-		out := make([]any, 0, len(typed))
-		for _, child := range typed {
-			if block, ok := child.(map[string]any); ok {
-				typeName, _ := block["type"].(string)
-				if typeName == "thinking" || typeName == "redacted_thinking" {
-					continue
-				}
-			}
-			out = append(out, stripOpenCodeGoAnthropicExtensions(child))
-		}
-		return out
-	default:
-		return value
-	}
 }

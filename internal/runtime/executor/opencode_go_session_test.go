@@ -42,7 +42,14 @@ func TestOpenCodeGoSessionOnWire(t *testing.T) {
 					}
 					if stream {
 						w.Header().Set("Content-Type", "text/event-stream")
-						_, _ = io.WriteString(w, "data: [DONE]\n\n")
+						switch protocol.format {
+						case sdktranslator.FormatClaude:
+							_, _ = io.WriteString(w, "data: {\"type\":\"message_stop\"}\n\n")
+						case sdktranslator.FormatOpenAIResponse:
+							_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+						default:
+							_, _ = io.WriteString(w, "data: [DONE]\n\n")
+						}
 					} else {
 						w.Header().Set("Content-Type", "application/json")
 						_, _ = io.WriteString(w, `{}`)
