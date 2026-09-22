@@ -297,6 +297,9 @@ xai:
   # When true, inject the native x_search tool when the request does not declare it.
   # The injected tool is also added to tool_choice.allowed_tools when applicable.
   inject-x-search: false
+  # Opt into priority processing for xAI text requests (premium pricing).
+  # false forces standard processing, even if clients request fast/priority.
+  priority-processing: false
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true

@@ -82,6 +82,13 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	// Provider policy wins over client fast-mode flags and payload overrides.
+	tier := "default"
+	if e.cfg != nil && e.cfg.XAI.PriorityProcessing {
+		tier = "priority"
+	}
+	body = helps.SetStringIfDifferent(body, "service_tier", tier)
+	body, _ = sjson.DeleteBytes(body, "speed")
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = helps.SetBoolIfDifferent(body, "stream", stream)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")

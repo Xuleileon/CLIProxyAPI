@@ -133,6 +133,9 @@ type CodexHeaderDefaults struct {
 
 // XAIConfig configures provider-wide xAI request behavior.
 type XAIConfig struct {
+	// PriorityProcessing opts xAI text requests into the premium priority tier.
+	// Disabled by default; overrides client scheduling fields and payload rules.
+	PriorityProcessing bool `yaml:"priority-processing" json:"priority-processing"`
 	// InjectXSearch injects xAI's native x_search tool when the request does not declare it.
 	InjectXSearch bool `yaml:"inject-x-search" json:"inject-x-search"`
 }

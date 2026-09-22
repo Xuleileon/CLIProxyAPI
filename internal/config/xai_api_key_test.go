@@ -10,15 +10,22 @@ func TestParseConfigBytesXAIConfig(t *testing.T) {
 	if defaultCfg.XAI.InjectXSearch {
 		t.Fatal("xai.inject-x-search = true by default, want false")
 	}
+	if defaultCfg.XAI.PriorityProcessing {
+		t.Fatal("xai.priority-processing must default to false")
+	}
 
 	enabledCfg, errEnabled := ParseConfigBytes([]byte(`xai:
   inject-x-search: true
+  priority-processing: true
 `))
 	if errEnabled != nil {
 		t.Fatalf("ParseConfigBytes(enabled) error = %v", errEnabled)
 	}
 	if !enabledCfg.XAI.InjectXSearch {
 		t.Fatal("xai.inject-x-search = false, want true")
+	}
+	if !enabledCfg.XAI.PriorityProcessing {
+		t.Fatal("xai.priority-processing was not enabled")
 	}
 }
 
