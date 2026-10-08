@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	internalusage "github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -53,6 +54,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.applyUsageStatisticsConfig(s.cfg)
 	usage.StartDefault(ctx)
+	s.startXAIVersionUpdater(ctx)
 	homeEnabled := s.cfg != nil && s.cfg.Home.Enabled
 	if homeEnabled {
 		forceHomeRuntimeConfig(s.cfg)
@@ -242,6 +244,19 @@ func (s *Service) applyUsageStatisticsConfig(cfg *config.Config) {
 	}
 	internalusage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
+}
+
+// startXAIVersionUpdater starts the background Grok CLI version updater using the
+// configured global proxy URL. An empty proxy URL inherits the process environment.
+func (s *Service) startXAIVersionUpdater(ctx context.Context) {
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	proxyURL := ""
+	if cfg != nil {
+		proxyURL = cfg.ProxyURL
+	}
+	executor.StartXAIVersionUpdater(ctx, proxyURL)
 }
 
 // Shutdown gracefully stops background workers and the HTTP server.
